@@ -1,0 +1,680 @@
+"""HTTP layer (sync + async) with OAuth2 token refresh and multi-agent support."""
+
+from __future__ import annotations
+
+import json as _json
+import random
+import time
+from collections.abc import AsyncIterator, Iterator
+from typing import Any
+
+import httpx
+
+from rine._config import (
+    cache_token,
+    get_cached_token,
+    get_credential_entry,
+    resolve_api_url,
+)
+from rine._constants import DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT, RETRYABLE_STATUS_CODES
+from rine._logging import logger
+from rine._version import __version__
+from rine.errors import (
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    RateLimitError,
+    RineApiError,
+    raise_for_status,
+)
+
+_USER_AGENT = f"rine-python/{__version__}"
+
+
+def _backoff_delay(attempt: int, base: float = 0.5, max_delay: float = 8.0) -> float:
+    """Exponential backoff with jitter."""
+    delay = min(base * (2 ** attempt), max_delay)
+    return delay * (0.5 + random.random() * 0.5)  # noqa: S311
+
+
+def _parse_error_detail(response: httpx.Response) -> str:
+    """Extract error detail from response body."""
+    try:
+        body = response.json()
+        detail = body.get("detail", "")
+        if isinstance(detail, list):
+            return "; ".join(
+                d.get("msg", str(d)) if isinstance(d, dict) else str(d) for d in detail
+            )
+        return str(detail) if detail else response.reason_phrase or "Unknown error"
+    except Exception:
+        text = response.text[:500] if response.text else response.reason_phrase or "Unknown error"
+        return text
+
+
+def _check_response(response: httpx.Response) -> Any:
+    """Check response and raise appropriate error or return parsed body."""
+    if response.status_code == 204:
+        return None
+
+    if response.is_success:
+        if not response.content:
+            return None
+        return response.json()
+
+    detail = _parse_error_detail(response)
+
+    if response.status_code == 429:
+        retry_after = response.headers.get("Retry-After")
+        retry_val = float(retry_after) if retry_after else None
+        raise RateLimitError(detail=detail, retry_after=retry_val, raw=response.text)
+
+    raise_for_status(response.status_code, detail, raw=response.text)
+
+
+def _fetch_oauth_token(
+    http: httpx.Client, api_url: str, client_id: str, client_secret: str
+) -> tuple[str, int]:
+    """Fetch an OAuth2 token via client_credentials grant.
+
+    Returns:
+        Tuple of (access_token, expires_in).
+    """
+    resp = http.post(
+        f"{api_url}/oauth/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    if not resp.is_success:
+        detail = _parse_error_detail(resp)
+        raise AuthenticationError(detail=f"Token fetch failed: {detail}")
+    body = resp.json()
+    return body["access_token"], body.get("expires_in", 900)
+
+
+async def _fetch_oauth_token_async(
+    http: httpx.AsyncClient, api_url: str, client_id: str, client_secret: str
+) -> tuple[str, int]:
+    """Async version of OAuth2 token fetch."""
+    resp = await http.post(
+        f"{api_url}/oauth/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    if not resp.is_success:
+        detail = _parse_error_detail(resp)
+        raise AuthenticationError(detail=f"Token fetch failed: {detail}")
+    body = resp.json()
+    return body["access_token"], body.get("expires_in", 900)
+
+
+class SyncHttpClient:
+    """Synchronous HTTP client with token management.
+
+    Args:
+        config_dir: Config directory for credentials and token cache.
+        api_url: API base URL.
+        agent_id: Optional agent UUID for ``X-Rine-Agent`` header.
+        timeout: Request timeout in seconds.
+        max_retries: Max retry attempts for rate limiting.
+        http_client: Optional custom ``httpx.Client``.
+    """
+
+    def __init__(
+        self,
+        config_dir: str,
+        api_url: str | None = None,
+        agent_id: str | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        http_client: httpx.Client | None = None,
+    ) -> None:
+        self._config_dir = config_dir
+        self._api_url = api_url or resolve_api_url()
+        self._agent_id = agent_id
+        self._timeout = timeout
+        self._max_retries = max_retries
+        self._owns_client = http_client is None
+        self._http = http_client or httpx.Client(timeout=timeout)
+        self._profile = "default"
+        self._cached_token: str | None = None
+
+    def close(self) -> None:
+        """Close the underlying HTTP client."""
+        if self._owns_client:
+            self._http.close()
+
+    def _get_token(self, force: bool = False) -> str:
+        """Get a valid token, refreshing if needed."""
+        if not force and self._cached_token:
+            return self._cached_token
+        if not force:
+            cached = get_cached_token(self._config_dir, self._profile)
+            if cached:
+                self._cached_token = cached
+                return cached
+
+        entry = get_credential_entry(self._config_dir, self._profile)
+        if not entry:
+            raise AuthenticationError(
+                "No credentials found. Run: rine onboard"
+            )
+
+        token, expires_in = _fetch_oauth_token(
+            self._http, self._api_url, entry["client_id"], entry["client_secret"]
+        )
+        try:
+            cache_token(self._config_dir, self._profile, token, expires_in)
+        except Exception:
+            logger.warning("Failed to cache token", exc_info=True)
+        self._cached_token = token
+        return token
+
+    def _invalidate_token(self) -> None:
+        """Invalidate the in-memory token cache."""
+        self._cached_token = None
+
+    def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        headers: dict[str, str] = {"User-Agent": _USER_AGENT}
+        if self._agent_id:
+            headers["X-Rine-Agent"] = self._agent_id
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: Any = None,
+        extra_headers: dict[str, str] | None = None,
+        authenticated: bool = True,
+    ) -> Any:
+        """Execute an HTTP request with token management and retries.
+
+        Args:
+            method: HTTP method.
+            path: URL path (appended to api_url).
+            params: Query parameters.
+            json_body: JSON request body.
+            extra_headers: Additional headers.
+            authenticated: Whether to include auth token.
+
+        Returns:
+            Parsed JSON response, or ``None`` for 204.
+
+        Raises:
+            RineApiError: On HTTP errors.
+            APITimeoutError: On request timeout.
+            APIConnectionError: On network failure.
+        """
+        url = path if path.startswith("http") else f"{self._api_url}{path}"
+        headers = self._headers(extra_headers)
+        if authenticated:
+            headers["Authorization"] = f"Bearer {self._get_token()}"
+
+        # Filter None values from params
+        if params:
+            params = {k: v for k, v in params.items() if v is not None}
+
+        start = time.monotonic()
+        max_attempts = self._max_retries + 2  # extra slot for 401 retry
+        auth_retried = False
+        resp: httpx.Response | None = None
+
+        for attempt in range(max_attempts):
+            try:
+                resp = self._http.request(
+                    method, url, params=params, json=json_body, headers=headers,
+                )
+                logger.debug(
+                    "%s %s → %d (%.0fms)",
+                    method, path, resp.status_code,
+                    (time.monotonic() - start) * 1000,
+                )
+            except httpx.TimeoutException as exc:
+                if attempt < self._max_retries:
+                    delay = _backoff_delay(attempt)
+                    logger.warning("Timeout on %s %s, retrying in %.1fs", method, path, delay)
+                    time.sleep(delay)
+                    continue
+                raise APITimeoutError(f"Request timed out: {method} {path}") from exc
+            except httpx.ConnectError as exc:
+                if attempt < self._max_retries:
+                    delay = _backoff_delay(attempt)
+                    logger.warning("Connect error on %s %s, retrying in %.1fs", method, path, delay)
+                    time.sleep(delay)
+                    continue
+                raise APIConnectionError(f"Connection failed: {method} {path}") from exc
+
+            # Auto-refresh on 401 (once)
+            if resp.status_code == 401 and authenticated and not auth_retried:
+                logger.warning("401 received, refreshing token")
+                auth_retried = True
+                self._invalidate_token()
+                headers["Authorization"] = f"Bearer {self._get_token(force=True)}"
+                continue
+
+            # Retry on retryable status codes
+            if resp.status_code in RETRYABLE_STATUS_CODES and attempt < self._max_retries:
+                if resp.status_code == 429:
+                    retry_after = float(resp.headers.get("Retry-After", 1))
+                    logger.warning("429 rate limited, retrying in %.1fs", retry_after)
+                    time.sleep(retry_after)
+                else:
+                    delay = _backoff_delay(attempt)
+                    logger.warning("%d on %s %s, retrying in %.1fs", resp.status_code, method, path, delay)
+                    time.sleep(delay)
+                continue
+
+            return _check_response(resp)
+
+        assert resp is not None
+        return _check_response(resp)
+
+    def stream_sse(
+        self,
+        path: str,
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> Iterator[tuple[str, str, str | None]]:
+        """Stream server-sent events from a path.
+
+        Args:
+            path: URL path (appended to api_url).
+            extra_headers: Additional headers.
+
+        Yields:
+            Tuples of (event_type, event_data, event_id).
+        """
+        url = path if path.startswith("http") else f"{self._api_url}{path}"
+        token = self._get_token()
+        headers = self._headers(extra_headers)
+        headers["Authorization"] = f"Bearer {token}"
+
+        with self._http.stream("GET", url, headers=headers, timeout=None) as resp:
+            event_type = ""
+            event_data = ""
+            event_id: str | None = None
+
+            for line in resp.iter_lines():
+                if line.startswith("event:"):
+                    event_type = line[6:].strip()
+                elif line.startswith("data:"):
+                    event_data = line[5:].strip()
+                elif line.startswith("id:"):
+                    event_id = line[3:].strip()
+                elif line == "":
+                    if event_type or event_data:
+                        yield event_type, event_data, event_id
+                        event_type = ""
+                        event_data = ""
+                        event_id = None
+
+    def get_ndjson(self, path: str) -> list[dict[str, Any]]:
+        """Stream NDJSON and return parsed records.
+
+        Uses ``httpx.Client.stream()`` directly instead of ``self.request()``
+        because streaming responses cannot be replayed through the generic
+        retry loop.  Manual 401 handling mirrors ``request()``.
+
+        Args:
+            path: URL path (appended to api_url).
+
+        Returns:
+            List of parsed JSON objects (one per line).
+        """
+        url = path if path.startswith("http") else f"{self._api_url}{path}"
+
+        for auth_attempt in range(2):
+            token = self._get_token(force=auth_attempt > 0)
+            headers = self._headers()
+            headers["Authorization"] = f"Bearer {token}"
+
+            with self._http.stream("GET", url, headers=headers) as resp:
+                if resp.status_code == 401 and auth_attempt == 0:
+                    resp.read()
+                    self._invalidate_token()
+                    continue
+                if not resp.is_success:
+                    resp.read()
+                    if resp.status_code == 429:
+                        retry_after = resp.headers.get("Retry-After")
+                        retry_val = float(retry_after) if retry_after else None
+                        detail = _parse_error_detail(resp)
+                        raise RateLimitError(
+                            detail=detail, retry_after=retry_val, raw=resp.text,
+                        )
+                    detail = _parse_error_detail(resp)
+                    raise_for_status(resp.status_code, detail, raw=resp.text)
+                records: list[dict[str, Any]] = []
+                for line in resp.iter_lines():
+                    stripped = line.strip()
+                    if stripped:
+                        records.append(_json.loads(stripped))
+                return records
+
+        return []  # unreachable — satisfies type checker
+
+    def get(self, path: str, **kwargs: Any) -> Any:
+        """HTTP GET."""
+        return self.request("GET", path, **kwargs)
+
+    def post(self, path: str, **kwargs: Any) -> Any:
+        """HTTP POST."""
+        return self.request("POST", path, **kwargs)
+
+    def put(self, path: str, **kwargs: Any) -> Any:
+        """HTTP PUT."""
+        return self.request("PUT", path, **kwargs)
+
+    def patch(self, path: str, **kwargs: Any) -> Any:
+        """HTTP PATCH."""
+        return self.request("PATCH", path, **kwargs)
+
+    def delete(self, path: str, **kwargs: Any) -> Any:
+        """HTTP DELETE."""
+        return self.request("DELETE", path, **kwargs)
+
+    @staticmethod
+    def public_get(api_url: str, path: str, params: dict[str, Any] | None = None) -> Any:
+        """Unauthenticated GET for public endpoints.
+
+        Args:
+            api_url: API base URL.
+            path: URL path.
+            params: Query parameters.
+
+        Returns:
+            Parsed JSON response.
+        """
+        with httpx.Client() as http:
+            resp = http.get(
+                f"{api_url}{path}",
+                params=params,
+                headers={"User-Agent": _USER_AGENT},
+            )
+            return _check_response(resp)
+
+
+class AsyncHttpClient:
+    """Async HTTP client with token management.
+
+    Args:
+        config_dir: Config directory for credentials and token cache.
+        api_url: API base URL.
+        agent_id: Optional agent UUID for ``X-Rine-Agent`` header.
+        timeout: Request timeout in seconds.
+        max_retries: Max retry attempts for rate limiting.
+        http_client: Optional custom ``httpx.AsyncClient``.
+    """
+
+    def __init__(
+        self,
+        config_dir: str,
+        api_url: str | None = None,
+        agent_id: str | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._config_dir = config_dir
+        self._api_url = api_url or resolve_api_url()
+        self._agent_id = agent_id
+        self._timeout = timeout
+        self._max_retries = max_retries
+        self._owns_client = http_client is None
+        self._http = http_client or httpx.AsyncClient(timeout=timeout)
+        self._profile = "default"
+        self._cached_token: str | None = None
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        if self._owns_client:
+            await self._http.aclose()
+
+    async def _get_token(self, force: bool = False) -> str:
+        """Get a valid token, refreshing if needed."""
+        if not force and self._cached_token:
+            return self._cached_token
+        if not force:
+            cached = get_cached_token(self._config_dir, self._profile)
+            if cached:
+                self._cached_token = cached
+                return cached
+
+        entry = get_credential_entry(self._config_dir, self._profile)
+        if not entry:
+            raise AuthenticationError(
+                "No credentials found. Run: rine onboard"
+            )
+
+        token, expires_in = await _fetch_oauth_token_async(
+            self._http, self._api_url, entry["client_id"], entry["client_secret"]
+        )
+        try:
+            cache_token(self._config_dir, self._profile, token, expires_in)
+        except Exception:
+            logger.warning("Failed to cache token", exc_info=True)
+        self._cached_token = token
+        return token
+
+    def _invalidate_token(self) -> None:
+        """Invalidate the in-memory token cache."""
+        self._cached_token = None
+
+    def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        headers: dict[str, str] = {"User-Agent": _USER_AGENT}
+        if self._agent_id:
+            headers["X-Rine-Agent"] = self._agent_id
+        if extra:
+            headers.update(extra)
+        return headers
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: Any = None,
+        extra_headers: dict[str, str] | None = None,
+        authenticated: bool = True,
+    ) -> Any:
+        """Execute an async HTTP request with token management and retries.
+
+        Args:
+            method: HTTP method.
+            path: URL path (appended to api_url).
+            params: Query parameters.
+            json_body: JSON request body.
+            extra_headers: Additional headers.
+            authenticated: Whether to include auth token.
+
+        Returns:
+            Parsed JSON response, or ``None`` for 204.
+
+        Raises:
+            RineApiError: On HTTP errors.
+            APITimeoutError: On request timeout.
+            APIConnectionError: On network failure.
+        """
+        import asyncio
+
+        url = path if path.startswith("http") else f"{self._api_url}{path}"
+        headers = self._headers(extra_headers)
+        if authenticated:
+            headers["Authorization"] = f"Bearer {await self._get_token()}"
+
+        if params:
+            params = {k: v for k, v in params.items() if v is not None}
+
+        start = time.monotonic()
+        max_attempts = self._max_retries + 2  # extra slot for 401 retry
+        auth_retried = False
+        resp: httpx.Response | None = None
+
+        for attempt in range(max_attempts):
+            try:
+                resp = await self._http.request(
+                    method, url, params=params, json=json_body, headers=headers,
+                )
+                logger.debug(
+                    "%s %s → %d (%.0fms)",
+                    method, path, resp.status_code,
+                    (time.monotonic() - start) * 1000,
+                )
+            except httpx.TimeoutException as exc:
+                if attempt < self._max_retries:
+                    delay = _backoff_delay(attempt)
+                    logger.warning("Timeout on %s %s, retrying in %.1fs", method, path, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                raise APITimeoutError(f"Request timed out: {method} {path}") from exc
+            except httpx.ConnectError as exc:
+                if attempt < self._max_retries:
+                    delay = _backoff_delay(attempt)
+                    logger.warning("Connect error on %s %s, retrying in %.1fs", method, path, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                raise APIConnectionError(f"Connection failed: {method} {path}") from exc
+
+            # Auto-refresh on 401 (once)
+            if resp.status_code == 401 and authenticated and not auth_retried:
+                logger.warning("401 received, refreshing token")
+                auth_retried = True
+                self._invalidate_token()
+                headers["Authorization"] = f"Bearer {await self._get_token(force=True)}"
+                continue
+
+            # Retry on retryable status codes
+            if resp.status_code in RETRYABLE_STATUS_CODES and attempt < self._max_retries:
+                if resp.status_code == 429:
+                    retry_after = float(resp.headers.get("Retry-After", 1))
+                    logger.warning("429 rate limited, retrying in %.1fs", retry_after)
+                    await asyncio.sleep(retry_after)
+                else:
+                    delay = _backoff_delay(attempt)
+                    logger.warning("%d on %s %s, retrying in %.1fs", resp.status_code, method, path, delay)
+                    await asyncio.sleep(delay)
+                continue
+
+            return _check_response(resp)
+
+        assert resp is not None
+        return _check_response(resp)
+
+    async def stream_sse(
+        self,
+        path: str,
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> AsyncIterator[tuple[str, str, str | None]]:
+        """Stream server-sent events from a path (async).
+
+        Args:
+            path: URL path (appended to api_url).
+            extra_headers: Additional headers.
+
+        Yields:
+            Tuples of (event_type, event_data, event_id).
+        """
+        url = path if path.startswith("http") else f"{self._api_url}{path}"
+        token = await self._get_token()
+        headers = self._headers(extra_headers)
+        headers["Authorization"] = f"Bearer {token}"
+
+        async with self._http.stream("GET", url, headers=headers, timeout=None) as resp:
+            event_type = ""
+            event_data = ""
+            event_id: str | None = None
+
+            async for line in resp.aiter_lines():
+                if line.startswith("event:"):
+                    event_type = line[6:].strip()
+                elif line.startswith("data:"):
+                    event_data = line[5:].strip()
+                elif line.startswith("id:"):
+                    event_id = line[3:].strip()
+                elif line == "":
+                    if event_type or event_data:
+                        yield event_type, event_data, event_id
+                        event_type = ""
+                        event_data = ""
+                        event_id = None
+
+    async def get_ndjson(self, path: str) -> list[dict[str, Any]]:
+        """Stream NDJSON and return parsed records (async).
+
+        Uses ``httpx.AsyncClient.stream()`` directly instead of
+        ``self.request()`` because streaming responses cannot be replayed
+        through the generic retry loop.  Manual 401 handling mirrors
+        ``request()``.
+
+        Args:
+            path: URL path (appended to api_url).
+
+        Returns:
+            List of parsed JSON objects (one per line).
+        """
+        url = path if path.startswith("http") else f"{self._api_url}{path}"
+
+        for auth_attempt in range(2):
+            token = await self._get_token(force=auth_attempt > 0)
+            headers = self._headers()
+            headers["Authorization"] = f"Bearer {token}"
+
+            async with self._http.stream("GET", url, headers=headers) as resp:
+                if resp.status_code == 401 and auth_attempt == 0:
+                    await resp.aread()
+                    self._invalidate_token()
+                    continue
+                if not resp.is_success:
+                    await resp.aread()
+                    if resp.status_code == 429:
+                        retry_after = resp.headers.get("Retry-After")
+                        retry_val = float(retry_after) if retry_after else None
+                        detail = _parse_error_detail(resp)
+                        raise RateLimitError(
+                            detail=detail, retry_after=retry_val, raw=resp.text,
+                        )
+                    detail = _parse_error_detail(resp)
+                    raise_for_status(resp.status_code, detail, raw=resp.text)
+                records: list[dict[str, Any]] = []
+                async for line in resp.aiter_lines():
+                    stripped = line.strip()
+                    if stripped:
+                        records.append(_json.loads(stripped))
+                return records
+
+        return []  # unreachable — satisfies type checker
+
+    async def get(self, path: str, **kwargs: Any) -> Any:
+        """HTTP GET."""
+        return await self.request("GET", path, **kwargs)
+
+    async def post(self, path: str, **kwargs: Any) -> Any:
+        """HTTP POST."""
+        return await self.request("POST", path, **kwargs)
+
+    async def put(self, path: str, **kwargs: Any) -> Any:
+        """HTTP PUT."""
+        return await self.request("PUT", path, **kwargs)
+
+    async def patch(self, path: str, **kwargs: Any) -> Any:
+        """HTTP PATCH."""
+        return await self.request("PATCH", path, **kwargs)
+
+    async def delete(self, path: str, **kwargs: Any) -> Any:
+        """HTTP DELETE."""
+        return await self.request("DELETE", path, **kwargs)

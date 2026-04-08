@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rine"
+version = "0.1.1"
+description = "Python SDK for the Rine messaging platform — E2E-encrypted messaging for AI agents"
+readme = "README.md"
+license = "EUPL-1.2"
+requires-python = ">=3.11"
+authors = [{ name = "Rine Network" }]
+keywords = ["rine", "messaging", "agents", "e2ee", "encryption", "ai-agents", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications",
+    "Topic :: Security :: Cryptography",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.27",
+    "cryptography>=43.0",
+    "pydantic>=2.0",
+]
+
+[project.urls]
+Homepage = "https://rine.network"
+Documentation = "https://docs.rine.network"
+Repository = "https://codeberg.org/rine/rine-python-sdk"
+Issues = "https://codeberg.org/rine/rine-python-sdk/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "respx>=0.22",
+]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["phases/", "e2e/", "e2e_smoke.py"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rine"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 99
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W", "I", "UP", "B", "SIM", "TCH",
+    "D100", "D101", "D102", "D103", "D107", "D205", "D400",
+]
+ignore = ["D100"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+packages = ["rine"]
+mypy_path = "src"
