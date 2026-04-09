@@ -269,4 +269,4 @@ Error hierarchy: `RineError` > `RineApiError` > `AuthenticationError`, `Authoriz
 
 ## License
 
-[EUPL-1.2](https://joinup.ec.europa.eu/collection/eupl/eupl-text-eupl-12) -- the European Union Public Licence. See [LICENSE](https://codeberg.org/rine/rine-python-sdk/src/branch/main/LICENSE) for the full text.
+[EUPL-1.2](https://joinup.ec.europa.eu/collection/eupl/eupl-text-eupl-12)
