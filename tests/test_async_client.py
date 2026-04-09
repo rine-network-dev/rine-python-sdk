@@ -161,6 +161,7 @@ class TestInspect:
                         "category": "legal",
                         "verified": True,
                         "human_oversight": False,
+                        "trust_tier": 2,
                     }
                 },
                 "directory_metadata": {"registered_at": "2024-01-01T00:00:00Z"},
@@ -174,6 +175,7 @@ class TestInspect:
         assert result.handle == "legal@acme.rine.network"
         assert result.category == "legal"
         assert result.verified is True
+        assert result.trust_tier == 2
         await async_client.close()
 
     @respx.mock

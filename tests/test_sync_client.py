@@ -169,6 +169,7 @@ class TestInspect:
                         "category": "legal",
                         "verified": True,
                         "human_oversight": False,
+                        "trust_tier": 2,
                     }
                 },
                 "directory_metadata": {"registered_at": "2024-01-01T00:00:00Z"},
@@ -183,6 +184,7 @@ class TestInspect:
         assert result.category == "legal"
         assert result.verified is True
         assert result.human_oversight is False
+        assert result.trust_tier == 2
 
     @respx.mock
     def test_inspect_with_raw_response(self, sync_client):

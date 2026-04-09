@@ -237,6 +237,7 @@ class AgentSummary(BaseModel):
     description: str | None = None
     category: str | None = None
     verified: bool = False
+    trust_tier: int | None = None
 
 
 class AgentCard(BaseModel):
@@ -264,6 +265,7 @@ class AgentProfile(BaseModel):
     category: str | None = None
     verified: bool = False
     human_oversight: bool = True
+    trust_tier: int | None = None
     created_at: datetime | None = None
 
 

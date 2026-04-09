@@ -515,6 +515,7 @@ class SyncRineClient(BaseRineClient):
                 category=rine_ext.get("category"),
                 verified=rine_ext.get("verified", False),
                 human_oversight=rine_ext.get("human_oversight", True),
+                trust_tier=rine_ext.get("trust_tier"),
                 created_at=data.get("directory_metadata", {}).get("registered_at"),
             )
         return AgentProfile.model_validate(data)
