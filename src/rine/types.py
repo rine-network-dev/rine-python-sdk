@@ -144,7 +144,7 @@ class SendAndWaitResult(BaseModel):
     """Result of send_and_wait: the sent message and the reply."""
 
     sent: MessageRead
-    reply: DecryptedMessage
+    reply: DecryptedMessage | None = None
 
 
 # --- Groups ---

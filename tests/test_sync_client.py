@@ -303,13 +303,13 @@ class TestInbox:
 
 
 class TestSendAndWaitTimeout:
-    """Test timeout conversion in send_and_wait (float -> ms)."""
+    """Test timeout conversion and atomic /messages/sync in send_and_wait."""
 
     @respx.mock
-    def test_send_and_wait_converts_timeout_to_ms(
+    def test_send_and_wait_posts_directly_to_sync_with_timeout_ms(
         self, sync_client, tmp_config_dir, agent_id, saved_agent_keys
     ):
-        """Verify timeout seconds are converted to ms integer when calling /messages/sync."""
+        """Verify send_and_wait posts the encrypted body to /messages/sync (not /messages)."""
         _mock_token()
         _mock_agents()
 
@@ -332,17 +332,21 @@ class TestSendAndWaitTimeout:
             })
         )
 
-        # Mock send
-        respx.post("https://rine.network/messages").mock(
-            return_value=httpx.Response(200, json=_MESSAGE_PAYLOAD)
-        )
+        # No /messages mock — send_and_wait should NOT call it.
 
-        # Mock sync endpoint — capture the query params
+        # Mock sync endpoint — returns SyncMessageResponse envelope
+        reply_msg = {
+            **_MESSAGE_PAYLOAD,
+            "id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+            "from_agent_id": OTHER_AGENT_ID,
+            "to_agent_id": AGENT_ID,
+        }
         sync_route = respx.post("https://rine.network/messages/sync").mock(
             return_value=httpx.Response(200, json={
-                **_MESSAGE_PAYLOAD,
-                "from_agent_id": OTHER_AGENT_ID,
-                "to_agent_id": AGENT_ID,
+                "message": _MESSAGE_PAYLOAD,
+                "reply": reply_msg,
+                "conversation_id": _MESSAGE_PAYLOAD["conversation_id"],
+                "status": "completed",
             })
         )
 
@@ -356,9 +360,23 @@ class TestSendAndWaitTimeout:
             # May fail on decrypt — we only care about the HTTP call params
             pass
 
-        if sync_route.called:
-            request = sync_route.calls[0].request
-            assert b"timeout_ms=2500" in request.url.query
+        assert sync_route.called
+        request = sync_route.calls[0].request
+        assert b"timeout_ms=2500" in request.url.query
+        # Body should be the full encrypted payload, not {conversation_id}
+        import json as _json
+        body = _json.loads(request.content)
+        assert "encrypted_payload" in body
+        assert "type" in body
+
+    def test_send_and_wait_rejects_group_handles(self, sync_client):
+        """Group handles are rejected client-side (server doesn't support them on sync)."""
+        import pytest
+        with pytest.raises(ValueError, match="group handles"):
+            sync_client.send_and_wait(
+                "#team@acme.rine.network",
+                {"task": "nope"},
+            )
 
 
 def generate_other_keys(tmp_config_dir: str, other_agent_id: str):

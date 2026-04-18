@@ -7,6 +7,7 @@ import pytest
 from rine._resolve import (
     is_bare_agent_name,
     is_uuid,
+    normalize_handle,
     resolve_agent,
     resolve_bare_name,
 )
@@ -81,3 +82,33 @@ class TestResolveAgent:
             {"id": "uuid-2", "name": "bot2"},
         ]
         assert resolve_agent(agents, as_flag="bot1") == "uuid-1"
+
+
+class TestNormalizeHandle:
+    def test_short_agent_handle(self):
+        assert normalize_handle("agent@org") == "agent@org.rine.network"
+
+    def test_short_group_handle(self):
+        assert normalize_handle("#group@org") == "#group@org.rine.network"
+
+    def test_full_agent_handle_unchanged(self):
+        assert normalize_handle("agent@org.rine.network") == "agent@org.rine.network"
+
+    def test_full_group_handle_unchanged(self):
+        assert normalize_handle("#group@org.rine.network") == "#group@org.rine.network"
+
+    def test_federated_handle_unchanged(self):
+        assert normalize_handle("agent@org.other-provider.com") == "agent@org.other-provider.com"
+
+    def test_bare_name_unchanged(self):
+        assert normalize_handle("not-a-handle") == "not-a-handle"
+
+    def test_uuid_unchanged(self):
+        uuid = "550e8400-e29b-41d4-a716-446655440000"
+        assert normalize_handle(uuid) == uuid
+
+    def test_empty_string(self):
+        assert normalize_handle("") == ""
+
+    def test_multiple_at_uses_last(self):
+        assert normalize_handle("a@b@org") == "a@b@org.rine.network"

@@ -25,7 +25,7 @@ from rine._crypto.sender_keys_helpers import load_sender_key_states, save_sender
 from rine._http import SyncHttpClient
 from rine._logging import logger
 from rine._onboard import create_agent as _create_agent
-from rine._resolve import is_uuid, resolve_agent, resolve_to_uuid_sync
+from rine._resolve import is_uuid, normalize_handle, resolve_agent, resolve_to_uuid_sync
 from rine.errors import ConfigError, CryptoError, NotFoundError
 from rine.types import (
     AgentCardRead,
@@ -191,8 +191,9 @@ class SyncRineClient(BaseRineClient):
 
         Example::
 
-            msg = client.send("agent@org.rine.network", {"task": "summarize"})
+            msg = client.send("agent@org", {"task": "summarize"})
         """
+        to = normalize_handle(to)
         agent_id = self._resolve_agent_id(agent)
         extra = self._agent_header(agent)
         headers = dict(extra) if extra else {}
@@ -423,28 +424,48 @@ class SyncRineClient(BaseRineClient):
     ) -> SendAndWaitResult:
         """Send a message and wait for a reply.
 
+        Posts the full encrypted body to ``/messages/sync`` — the server
+        creates the message AND long-polls for a reply in one atomic call.
+        Returns ``SendAndWaitResult`` with ``reply=None`` on timeout.
+
+        Note: group handles are not supported by the sync endpoint.
+
         Args:
-            to: Recipient handle or UUID.
+            to: Recipient handle or UUID (not a group handle).
             payload: Message payload.
             message_type: Message type.
             timeout: Max wait time in seconds (1-300).
             agent: Agent to send as.
 
         Returns:
-            SendAndWaitResult with sent message and reply.
+            SendAndWaitResult with sent message and reply (or None on timeout).
         """
-        sent = self.send(to, payload, message_type=message_type, agent=agent)
+        if to.startswith("#"):
+            raise ValueError(
+                "send_and_wait() does not support group handles — "
+                "the /messages/sync endpoint is 1:1 only."
+            )
+
+        agent_id = self._resolve_agent_id(agent)
         extra = self._agent_header(agent)
+
+        # Build the full encrypted body (same as send() does).
+        _, body = self._encrypt_dm(agent_id, to, payload, message_type)
+
         data = self._http.post(
             "/messages/sync",
-            json_body={"conversation_id": str(sent.conversation_id)},
+            json_body=body,
             params={"timeout_ms": int(timeout * 1000)},
             extra_headers=extra,
         )
-        agent_id = self._resolve_agent_id(agent)
-        reply_msg = DecryptedMessage.model_validate(data)
-        reply_msg = self._decrypt_message(agent_id, reply_msg)
-        return SendAndWaitResult(sent=sent, reply=reply_msg)
+        # Server returns SyncMessageResponse = {message, reply, conversation_id, status}.
+        sent = MessageRead.model_validate(data["message"])
+        raw_reply = data.get("reply")
+        if raw_reply is not None:
+            reply_msg = DecryptedMessage.model_validate(raw_reply)
+            reply_msg = self._decrypt_message(agent_id, reply_msg)
+            return SendAndWaitResult(sent=sent, reply=reply_msg)
+        return SendAndWaitResult(sent=sent, reply=None)
 
     # --- Discovery ---
 

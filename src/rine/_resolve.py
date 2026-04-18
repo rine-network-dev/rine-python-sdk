@@ -2,7 +2,7 @@
 
 Resolves agent identifiers in multiple formats:
 - UUID: passed through directly
-- Handle (``name@org.rine.network``): resolved via WebFinger
+- Handle (``name@org`` or ``name@org.rine.network``): resolved via WebFinger
 - Bare name: matched case-insensitively against org's agents
 """
 
@@ -13,6 +13,20 @@ from typing import Any
 
 from rine._logging import logger
 from rine.errors import ConfigError, NotFoundError
+
+_DEFAULT_DOMAIN = ".rine.network"
+
+
+def normalize_handle(handle: str) -> str:
+    """Append .rine.network when the domain part has no dots (short-form handle)."""
+    at_idx = handle.rfind("@")
+    if at_idx == -1:
+        return handle
+    domain = handle[at_idx + 1:]
+    if "." in domain:
+        return handle
+    return handle + _DEFAULT_DOMAIN
+
 
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
@@ -46,13 +60,14 @@ def resolve_handle_sync(api_url: str, handle: str) -> str:
 
     Args:
         api_url: API base URL.
-        handle: Agent handle (``name@org.rine.network``).
+        handle: Agent handle (e.g. ``name@org`` or ``name@org.rine.network``).
 
     Returns:
         Agent UUID string, or original handle if WebFinger fails.
     """
     import httpx
 
+    handle = normalize_handle(handle)
     try:
         resp = httpx.get(
             f"{api_url}/.well-known/webfinger",
@@ -73,13 +88,14 @@ async def resolve_handle_async(api_url: str, handle: str) -> str:
 
     Args:
         api_url: API base URL.
-        handle: Agent handle (``name@org.rine.network``).
+        handle: Agent handle (e.g. ``name@org`` or ``name@org.rine.network``).
 
     Returns:
         Agent UUID string, or original handle if WebFinger fails.
     """
     import httpx
 
+    handle = normalize_handle(handle)
     try:
         async with httpx.AsyncClient(timeout=10) as http:
             resp = await http.get(
@@ -111,10 +127,10 @@ def resolve_to_uuid_sync(api_url: str, value: str) -> str:
     if is_uuid(value):
         return value
     if "@" in value:
-        return resolve_handle_sync(api_url, value)
+        return resolve_handle_sync(api_url, normalize_handle(value))
     raise NotFoundError(
         f"Invalid agent identifier '{value}': expected a UUID or handle "
-        "(e.g., 'agent@org.rine.network')"
+        "(e.g., 'agent@org')"
     )
 
 
@@ -134,10 +150,10 @@ async def resolve_to_uuid_async(api_url: str, value: str) -> str:
     if is_uuid(value):
         return value
     if "@" in value:
-        return await resolve_handle_async(api_url, value)
+        return await resolve_handle_async(api_url, normalize_handle(value))
     raise NotFoundError(
         f"Invalid agent identifier '{value}': expected a UUID or handle "
-        "(e.g., 'agent@org.rine.network')"
+        "(e.g., 'agent@org')"
     )
 
 
