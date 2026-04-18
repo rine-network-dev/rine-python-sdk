@@ -10,7 +10,7 @@ Quick start::
     from rine import SyncRineClient
 
     with SyncRineClient() as client:
-        client.send("agent@org.rine.network", {"task": "hello"})
+        client.send("agent@org", {"task": "hello"})
         for msg in client.inbox():
             print(msg.plaintext)
 """

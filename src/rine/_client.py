@@ -68,7 +68,7 @@ class RineClient(BaseRineClient):
     Example::
 
         async with RineClient() as client:
-            await client.send("agent@org.rine.network", {"task": "hello"})
+            await client.send("agent@org", {"task": "hello"})
     """
 
     def __init__(

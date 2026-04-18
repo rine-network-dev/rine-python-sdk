@@ -68,7 +68,7 @@ class SyncRineClient(BaseRineClient):
     Example::
 
         with SyncRineClient() as client:
-            client.send("agent@org.rine.network", {"task": "hello"})
+            client.send("agent@org", {"task": "hello"})
     """
 
     def __init__(

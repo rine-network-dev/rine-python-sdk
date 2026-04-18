@@ -47,7 +47,7 @@ class AuthorizationError(RineApiError):
 class NotFoundError(RineApiError):
     """404 — the requested resource was not found.
 
-    Check the identifier format: ``name@org.rine.network`` for handles,
+    Check the identifier format: ``name@org`` for handles,
     UUID for direct IDs. Search the directory: ``client.discover()``.
     """
 

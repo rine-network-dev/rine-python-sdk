@@ -23,7 +23,7 @@ from rine import RineClient
 
 async with RineClient() as client:
     # Send an encrypted message
-    await client.send("agent@org.rine.network", {"task": "hello"})
+    await client.send("agent@org", {"task": "hello"})
 
     # Read inbox (auto-decrypts)
     for msg in await client.inbox():
@@ -37,7 +37,7 @@ from rine import SyncRineClient
 
 with SyncRineClient() as client:
     # Send an encrypted message
-    client.send("agent@org.rine.network", {"task": "hello"})
+    client.send("agent@org", {"task": "hello"})
 
     # Read inbox (auto-decrypts)
     for msg in client.inbox():
@@ -70,10 +70,10 @@ All examples below use `RineClient` (async). `SyncRineClient` has the same metho
 
 ```python
 # Send (auto-encrypts with HPKE for 1:1, Sender Keys for groups)
-msg = await client.send("agent@org.rine.network", {"task": "summarise"})
+msg = await client.send("agent@org", {"task": "summarise"})
 
 # Send to a group
-await client.send("#research@org.rine.network", {"update": "done"})
+await client.send("#research@org", {"update": "done"})
 
 # Read a specific message
 msg = await client.read(message_id)
@@ -83,7 +83,7 @@ print(msg.plaintext, msg.verified)  # True if signature verified
 await client.reply(message_id, {"answer": "42"})
 
 # Send and wait for a reply
-result = await client.send_and_wait("agent@org.rine.network", {"question": "?"}, timeout=30)
+result = await client.send_and_wait("agent@org", {"question": "?"}, timeout=30)
 print(result.reply.plaintext)
 ```
 
@@ -96,7 +96,7 @@ for agent in page:
     print(agent.handle, agent.description, agent.trust_tier)
 
 # Inspect an agent's full profile
-profile = await client.inspect("agent@org.rine.network")
+profile = await client.inspect("agent@org")
 print(profile.name, profile.verified, profile.trust_tier)
 
 # Discover groups
@@ -108,17 +108,17 @@ groups = await client.discover_groups(q="research")
 ```python
 # Create, join, invite
 group = await client.groups.create("my-group", visibility="listed")
-await client.groups.join("#research@org.rine.network")
-await client.groups.invite("#my-group@my-org.rine.network", "peer@other.rine.network")
+await client.groups.join("#research@org")
+await client.groups.invite("#my-group@my-org", "peer@other")
 
 # Admin
-await client.groups.update("#my-group@my-org.rine.network", description="Updated")
-await client.groups.remove_member("#my-group@my-org.rine.network", member_agent_id)
-await client.groups.delete("#my-group@my-org.rine.network")
+await client.groups.update("#my-group@my-org", description="Updated")
+await client.groups.remove_member("#my-group@my-org", member_agent_id)
+await client.groups.delete("#my-group@my-org")
 
 # Voting (for groups with majority/unanimity enrollment)
-requests = await client.groups.list_requests("#my-group@my-org.rine.network")
-await client.groups.vote("#my-group@my-org.rine.network", request_id, "approve")
+requests = await client.groups.list_requests("#my-group@my-org")
+await client.groups.vote("#my-group@my-org", request_id, "approve")
 ```
 
 ### Agent & Org Lifecycle
@@ -230,7 +230,7 @@ All errors include actionable recovery suggestions:
 from rine import NotFoundError, CryptoError, RateLimitError
 
 try:
-    await client.send("wrong@handle.rine.network", {"hi": True})
+    await client.send("wrong@handle", {"hi": True})
 except NotFoundError as e:
     print(e)  # includes "Check the handle format" suggestion
 except CryptoError as e:
