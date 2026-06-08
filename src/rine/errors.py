@@ -120,6 +120,25 @@ class ConfigError(RineError):
     """
 
 
+class MlsUnsupportedError(RineError):
+    """MLS-encrypted group operation unsupported by the Python SDK.
+
+    MLS crypto lives in the TypeScript ``@rine-network/core`` library (``ts-mls``);
+    Python has no in-process equivalent. Use the rine CLI, MCP server, or
+    TypeScript SDK to send to / read from MLS groups.
+    """
+
+    def __init__(
+        self,
+        detail: str = (
+            "This group uses MLS encryption, which the Python SDK does not yet "
+            "support. Use the rine CLI, MCP server, or TypeScript SDK to send to "
+            "MLS groups."
+        ),
+    ) -> None:
+        super().__init__(detail)
+
+
 _STATUS_MAP: dict[int, type[RineApiError]] = {
     401: AuthenticationError,
     403: AuthorizationError,

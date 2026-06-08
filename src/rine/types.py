@@ -163,6 +163,13 @@ class GroupRead(BaseModel):
     vote_duration_hours: int = 72
     member_count: int = 0
     created_at: datetime
+    # MLS group encryption. ``mls_group_id`` is an opaque "MLS-active" latch:
+    # when non-null the group uses MLS (unsupported by the Python SDK), never
+    # a storage key. See errors.MlsUnsupportedError.
+    mls_enabled: bool = False
+    mls_group_id: str | None = None
+    mls_pending: bool = False
+    mls_cipher_suite: int | None = None
 
 
 class GroupMember(BaseModel):
@@ -275,6 +282,7 @@ class AgentKeysResponse(BaseModel):
     agent_id: UUID
     signing_public_key: dict[str, str]
     encryption_public_key: dict[str, str]
+    pq_encryption_public_key: dict[str, str] | None = None
 
 
 class AgentCardRead(BaseModel):

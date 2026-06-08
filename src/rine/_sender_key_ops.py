@@ -97,13 +97,21 @@ def get_or_create_sender_key_sync(
         Tuple of (SenderKeyState, group_id).
     """
     # Resolve group — targeted handle lookup
-    from rine.errors import NotFoundError
+    from rine.errors import MlsUnsupportedError, NotFoundError
     target_handle = group_handle if group_handle.startswith("#") else f"#{group_handle}"
     group_data = client.get("/groups", params={"handle": target_handle})
     items = group_data.get("items", []) if isinstance(group_data, dict) else group_data
     if not items:
         raise NotFoundError(f"Group not found: {group_handle}")
-    group_id = str(items[0]["id"])
+    group = items[0]
+    group_id = str(group["id"])
+
+    # MLS latch: a non-null mls_group_id means the group uses MLS encryption.
+    # The Python SDK has no MLS crypto, and the server rejects sender-key-v1
+    # sends to MLS groups (409), so fail loudly BEFORE attempting sender-key
+    # crypto rather than silently producing an undeliverable message.
+    if group.get("mls_group_id") is not None:
+        raise MlsUnsupportedError()
 
     # Get members
     members_data = client.get(f"/groups/{group_id}/members")

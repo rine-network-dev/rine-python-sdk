@@ -43,6 +43,7 @@ class EncryptionVersion:
 
     HPKE_V1 = "hpke-v1"
     SENDER_KEY_V1 = "sender-key-v1"
+    MLS_V1 = "mls-v1"
 
 
 class MessageType:

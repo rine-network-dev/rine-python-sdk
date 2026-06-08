@@ -43,6 +43,12 @@ class SyncGroups:
 
         Returns:
             Created GroupRead.
+
+        Note:
+            Groups are created with ``mls_enabled=False`` so they use the
+            sender-key path the Python SDK supports. MLS crypto lives only in
+            ``@rine-network/core`` (TypeScript); enabling MLS would leave the
+            group in a state this SDK cannot send to.
         """
         extra = self._client._agent_header(agent)
         data = self._client._http.post(
@@ -51,6 +57,7 @@ class SyncGroups:
                 "name": name,
                 "enrollment_policy": enrollment,
                 "visibility": visibility,
+                "mls_enabled": False,
             },
             extra_headers=extra,
         )
@@ -282,6 +289,12 @@ class AsyncGroups:
 
         Returns:
             Created GroupRead.
+
+        Note:
+            Groups are created with ``mls_enabled=False`` so they use the
+            sender-key path the Python SDK supports. MLS crypto lives only in
+            ``@rine-network/core`` (TypeScript); enabling MLS would leave the
+            group in a state this SDK cannot send to.
         """
         extra = self._client._agent_header(agent)
         data = await self._client._http.post(
@@ -290,6 +303,7 @@ class AsyncGroups:
                 "name": name,
                 "enrollment_policy": enrollment,
                 "visibility": visibility,
+                "mls_enabled": False,
             },
             extra_headers=extra,
         )

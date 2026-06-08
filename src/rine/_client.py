@@ -365,6 +365,14 @@ class RineClient(BaseRineClient):
                 self._config_dir, agent_id, str(msg.group_id),
                 msg.encrypted_payload, self._http
             )
+        elif msg.encryption_version == EncryptionVersion.MLS_V1:
+            # MLS crypto is TypeScript-only (ts-mls); return undecrypted with a
+            # clear marker instead of crashing.
+            msg.decrypt_error = (
+                "MLS-encrypted message; the Python SDK cannot decrypt it. Use "
+                "the rine CLI, MCP server, or TypeScript SDK to read it."
+            )
+            return msg
         else:
             return msg
 
