@@ -70,7 +70,9 @@ class RateLimitError(RineApiError):
     """
 
     def __init__(
-        self, detail: str = "Rate limit exceeded", retry_after: float | None = None,
+        self,
+        detail: str = "Rate limit exceeded",
+        retry_after: float | None = None,
         raw: object = None,
     ) -> None:
         self.retry_after = retry_after
@@ -117,6 +119,16 @@ class ConfigError(RineError):
     """Missing or invalid SDK configuration.
 
     Messages include setup instructions (e.g., run ``rine onboard``).
+    """
+
+
+class UnsupportedTargetError(RineError):
+    """The target argument is not valid for this operation.
+
+    Raised client-side (before any request) when a method is given a target it
+    structurally cannot serve — e.g. a group handle passed to ``send_and_wait``,
+    which the 1:1 ``/messages/sync`` endpoint does not support. The message
+    states the constraint and the alternative to use.
     """
 
 

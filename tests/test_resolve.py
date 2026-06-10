@@ -7,6 +7,7 @@ import pytest
 from rine._resolve import (
     is_bare_agent_name,
     is_uuid,
+    match_group_by_local_name,
     normalize_handle,
     resolve_agent,
     resolve_bare_name,
@@ -84,6 +85,31 @@ class TestResolveAgent:
         assert resolve_agent(agents, as_flag="bot1") == "uuid-1"
 
 
+class TestMatchGroupByLocalName:
+    _GROUPS = [
+        {"id": "g-1", "handle": "#ops@myorg.rine.network"},
+        {"id": "g-2", "handle": "#research@myorg.rine.network"},
+    ]
+
+    def test_bare_name_matches_local_part(self):
+        assert match_group_by_local_name(self._GROUPS, "ops") == "g-1"
+
+    def test_leading_hash_is_ignored(self):
+        assert match_group_by_local_name(self._GROUPS, "#research") == "g-2"
+
+    def test_no_match_raises_not_found(self):
+        with pytest.raises(NotFoundError, match="Group not found: missing"):
+            match_group_by_local_name(self._GROUPS, "missing")
+
+    def test_ambiguous_name_raises_config_error(self):
+        groups = [
+            {"id": "g-1", "handle": "#ops@org-a.rine.network"},
+            {"id": "g-2", "handle": "#ops@org-b.rine.network"},
+        ]
+        with pytest.raises(ConfigError, match="ambiguous"):
+            match_group_by_local_name(groups, "ops")
+
+
 class TestNormalizeHandle:
     def test_short_agent_handle(self):
         assert normalize_handle("agent@org") == "agent@org.rine.network"
@@ -112,3 +138,31 @@ class TestNormalizeHandle:
 
     def test_multiple_at_uses_last(self):
         assert normalize_handle("a@b@org") == "a@b@org.rine.network"
+
+
+class TestPublicSurface:
+    """Resolver + config helpers are importable from the top-level ``rine`` package.
+
+    These were promoted from private modules (``rine._resolve``/``rine._config``)
+    so consumers (e.g. crewai-rine) import stable public names, not privates.
+    """
+
+    def test_resolver_helpers_importable_from_rine(self):
+        from rine import is_uuid as public_is_uuid
+        from rine import normalize_handle as public_normalize_handle
+
+        assert public_is_uuid("550e8400-e29b-41d4-a716-446655440000")
+        assert public_normalize_handle("agent@org") == "agent@org.rine.network"
+
+    def test_config_helpers_importable_from_rine(self):
+        from rine import resolve_api_url, resolve_config_dir
+
+        assert callable(resolve_api_url)
+        assert callable(resolve_config_dir)
+
+    def test_promoted_names_in_dunder_all(self):
+        import rine
+
+        for name in ("is_uuid", "normalize_handle", "resolve_api_url", "resolve_config_dir"):
+            assert name in rine.__all__
+            assert hasattr(rine, name)

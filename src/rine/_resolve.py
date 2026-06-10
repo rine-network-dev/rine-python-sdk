@@ -22,15 +22,13 @@ def normalize_handle(handle: str) -> str:
     at_idx = handle.rfind("@")
     if at_idx == -1:
         return handle
-    domain = handle[at_idx + 1:]
+    domain = handle[at_idx + 1 :]
     if "." in domain:
         return handle
     return handle + _DEFAULT_DOMAIN
 
 
-UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
-)
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 _UUID_ALIAS_RE = re.compile(
     r"/agents/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", re.I
 )
@@ -129,8 +127,7 @@ def resolve_to_uuid_sync(api_url: str, value: str) -> str:
     if "@" in value:
         return resolve_handle_sync(api_url, normalize_handle(value))
     raise NotFoundError(
-        f"Invalid agent identifier '{value}': expected a UUID or handle "
-        "(e.g., 'agent@org')"
+        f"Invalid agent identifier '{value}': expected a UUID or handle (e.g., 'agent@org')"
     )
 
 
@@ -152,8 +149,7 @@ async def resolve_to_uuid_async(api_url: str, value: str) -> str:
     if "@" in value:
         return await resolve_handle_async(api_url, normalize_handle(value))
     raise NotFoundError(
-        f"Invalid agent identifier '{value}': expected a UUID or handle "
-        "(e.g., 'agent@org')"
+        f"Invalid agent identifier '{value}': expected a UUID or handle (e.g., 'agent@org')"
     )
 
 
@@ -178,6 +174,41 @@ def resolve_bare_name(agents: list[dict[str, Any]], name: str) -> str:
         f"- {a.get('name', '?')} ({a.get('handle', a.get('id', '?'))})" for a in agents
     )
     raise NotFoundError(f"No agent named '{name}'. Available agents:\n  {agent_list}")
+
+
+def match_group_by_local_name(groups: list[dict[str, Any]], name: str) -> str:
+    """Resolve a bare group name against the caller's groups by local part.
+
+    A bare name (no ``@``, not a UUID, optional leading ``#``) is matched against
+    each group's handle local part — ``handle.split("@")[0].lstrip("#")`` — because
+    the server's ``GET /groups?handle=`` only matches a *full* ``#name@org`` handle,
+    so a bare ``#name`` returns nothing. Listing the caller's own groups and
+    comparing the local part lets ``invite``/``remove``/etc. accept a bare name,
+    matching ``client.groups.list()`` and the crewai inspect tool.
+
+    Args:
+        groups: List of group dicts with ``id`` and ``handle`` fields (the
+            caller's own groups, fetched with the acting agent's header).
+        name: Bare group name to match (leading ``#`` is ignored).
+
+    Returns:
+        Group UUID.
+
+    Raises:
+        NotFoundError: If no group matches.
+        ConfigError: If the name matches more than one group (ambiguous).
+    """
+    want = name.lstrip("#")
+    matches = [g for g in groups if str(g.get("handle", "")).split("@")[0].lstrip("#") == want]
+    if len(matches) == 1:
+        return str(matches[0]["id"])
+    if len(matches) > 1:
+        handles = ", ".join(str(g.get("handle", g.get("id", "?"))) for g in matches)
+        raise ConfigError(
+            f"Group name '{name}' is ambiguous — it matches multiple groups: "
+            f"{handles}. Use the full handle (#name@org) or the group UUID."
+        )
+    raise NotFoundError(f"Group not found: {name}")
 
 
 def resolve_agent(

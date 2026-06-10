@@ -7,9 +7,12 @@ Jupyter notebooks, scripts, and synchronous applications without event loop conf
 from __future__ import annotations
 
 import json
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Literal
 
-import httpx
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    import httpx
 
 from rine._base_client import BaseRineClient
 from rine._constants import NOT_GIVEN, EncryptionVersion, MessageType, NotGiven
@@ -25,8 +28,21 @@ from rine._crypto.sender_keys_helpers import load_sender_key_states, save_sender
 from rine._http import SyncHttpClient
 from rine._logging import logger
 from rine._onboard import create_agent as _create_agent
-from rine._resolve import is_uuid, normalize_handle, resolve_agent, resolve_to_uuid_sync
-from rine.errors import ConfigError, CryptoError, NotFoundError
+from rine._resolve import (
+    is_uuid,
+    match_group_by_local_name,
+    normalize_handle,
+    resolve_agent,
+    resolve_to_uuid_sync,
+)
+from rine._resources.groups import SyncGroups
+from rine._resources.webhooks import SyncWebhooks
+from rine.errors import (
+    ConfigError,
+    CryptoError,
+    NotFoundError,
+    UnsupportedTargetError,
+)
 from rine.types import (
     AgentCardRead,
     AgentProfile,
@@ -47,8 +63,8 @@ from rine.types import (
     WhoAmI,
 )
 
-from rine._resources.groups import SyncGroups
-from rine._resources.webhooks import SyncWebhooks
+# Inbox delivery-status filter values (server: messages.py ``_status_filter``).
+InboxStatus = Literal["new", "delivered", "read"]
 
 
 class SyncRineClient(BaseRineClient):
@@ -82,8 +98,11 @@ class SyncRineClient(BaseRineClient):
         http_client: httpx.Client | None = None,
     ) -> None:
         super().__init__(
-            config_dir=config_dir, api_url=api_url, agent=agent,
-            timeout=timeout, max_retries=max_retries,
+            config_dir=config_dir,
+            api_url=api_url,
+            agent=agent,
+            timeout=timeout,
+            max_retries=max_retries,
         )
         self._http = SyncHttpClient(
             config_dir=self._config_dir,
@@ -127,7 +146,9 @@ class SyncRineClient(BaseRineClient):
             api_url=self._api_url,
             agent=agent if not isinstance(agent, NotGiven) else self._agent,
             timeout=timeout if not isinstance(timeout, NotGiven) else self._timeout,
-            max_retries=max_retries if not isinstance(max_retries, NotGiven) else self._max_retries,
+            max_retries=max_retries
+            if not isinstance(max_retries, NotGiven)
+            else self._max_retries,
         )
 
     # --- Agent resolution helpers ---
@@ -156,9 +177,17 @@ class SyncRineClient(BaseRineClient):
         self._agents_cache = data.get("items", data) if isinstance(data, dict) else data
         return self._agents_cache
 
-    def _resolve_group_sync(self, handle_or_id: str) -> str:
+    def _resolve_group_sync(self, handle_or_id: str, agent: str | None = None) -> str:
         if is_uuid(handle_or_id):
             return handle_or_id
+        # Bare name (no ``@``): the server's ?handle= filter only matches a full
+        # ``#name@org`` handle, so list the acting agent's groups and match on the
+        # handle's local part (parity with ``groups.list()`` / crewai inspect).
+        if "@" not in handle_or_id:
+            extra = self._agent_header(agent)
+            data = self._http.get("/groups", extra_headers=extra)
+            groups = data.get("items", data) if isinstance(data, dict) else data
+            return match_group_by_local_name(groups, handle_or_id)
         handle = handle_or_id if handle_or_id.startswith("#") else f"#{handle_or_id}"
         data = self._http.get("/groups", params={"handle": handle})
         items = data.get("items", []) if isinstance(data, dict) else data
@@ -227,12 +256,11 @@ class SyncRineClient(BaseRineClient):
         self, agent_id: str, to: str, payload: object, msg_type: str
     ) -> tuple[Any, dict[str, Any]]:
         from rine._sender_key_ops import get_or_create_sender_key_sync
+
         own_state, group_id = get_or_create_sender_key_sync(
             self._http, self._config_dir, agent_id, to
         )
-        result, _ = encrypt_group_message(
-            self._config_dir, agent_id, group_id, own_state, payload
-        )
+        result, _ = encrypt_group_message(self._config_dir, agent_id, group_id, own_state, payload)
         return result, {
             "to_handle": to,
             "type": msg_type,
@@ -247,6 +275,7 @@ class SyncRineClient(BaseRineClient):
         agent: str | None = None,
         limit: int | None = None,
         cursor: str | None = None,
+        status: InboxStatus | None = None,
     ) -> CursorPage[DecryptedMessage]:
         """Read inbox messages with auto-decryption.
 
@@ -254,13 +283,15 @@ class SyncRineClient(BaseRineClient):
             agent: Agent to read as.
             limit: Max messages per page.
             cursor: Pagination cursor.
+            status: Filter by delivery status (``"new"``, ``"delivered"``, or
+                ``"read"``). When omitted, the server default applies.
 
         Returns:
             CursorPage of DecryptedMessage.
 
         Example::
 
-            for msg in client.inbox(limit=10):
+            for msg in client.inbox(status="new", limit=10):
                 print(msg.plaintext)
         """
         agent_id = self._resolve_agent_id(agent)
@@ -270,6 +301,8 @@ class SyncRineClient(BaseRineClient):
             params["limit"] = limit
         if cursor:
             params["cursor"] = cursor
+        if status is not None:
+            params["status"] = status
 
         data = self._http.get(
             f"/agents/{agent_id}/messages", params=params or None, extra_headers=extra
@@ -292,6 +325,30 @@ class SyncRineClient(BaseRineClient):
             next_cursor=data.get("next_cursor") if isinstance(data, dict) else None,
             prev_cursor=data.get("prev_cursor") if isinstance(data, dict) else None,
         )
+
+    def mark_delivered(self, message_ids: list[str], *, agent: str | None = None) -> int:
+        """Mark messages as delivered for an agent (idempotent).
+
+        Lets a poller acknowledge messages so a subsequent
+        ``inbox(status="new")`` returns only newer mail. The acting agent is
+        resolved internally (same precedence as ``inbox``/``send``), so callers
+        pass a handle/name/UUID (or ``None`` for the default agent), never a
+        pre-resolved ID.
+
+        Args:
+            message_ids: Message UUIDs to mark delivered.
+            agent: Agent to mark deliveries for. ``None`` uses the client's
+                configured/default agent.
+
+        Returns:
+            Number of messages newly marked delivered.
+        """
+        agent_id = self._resolve_agent_id(agent)
+        data = self._http.post(
+            f"/agents/{agent_id}/messages/mark-delivered",
+            json_body={"message_ids": message_ids},
+        )
+        return int(data.get("marked", 0)) if isinstance(data, dict) else 0
 
     def read(
         self,
@@ -327,8 +384,7 @@ class SyncRineClient(BaseRineClient):
             )
         elif msg.encryption_version == EncryptionVersion.SENDER_KEY_V1 and msg.group_id:
             result = decrypt_group_message_sync(
-                self._config_dir, agent_id, str(msg.group_id),
-                msg.encrypted_payload, self._http
+                self._config_dir, agent_id, str(msg.group_id), msg.encrypted_payload, self._http
             )
         elif msg.encryption_version == EncryptionVersion.MLS_V1:
             # MLS crypto is TypeScript-only (ts-mls); return undecrypted with a
@@ -339,6 +395,13 @@ class SyncRineClient(BaseRineClient):
             )
             return msg
         else:
+            # Unknown/unhandled encryption_version (e.g. hpke-hybrid-v1). Mark it
+            # explicitly so it is never mistaken for a successfully-decrypted
+            # message with empty plaintext — fail loud, never silent.
+            msg.decrypt_error = (
+                f"Unsupported encryption_version '{msg.encryption_version}'; "
+                "the Python SDK cannot decrypt this message."
+            )
             return msg
         msg.plaintext = result.plaintext
         msg.verified = result.verified
@@ -449,9 +512,10 @@ class SyncRineClient(BaseRineClient):
             SendAndWaitResult with sent message and reply (or None on timeout).
         """
         if to.startswith("#"):
-            raise ValueError(
+            raise UnsupportedTargetError(
                 "send_and_wait() does not support group handles — "
-                "the /messages/sync endpoint is 1:1 only."
+                "the /messages/sync endpoint is 1:1 only. "
+                "Use send() to post to a group."
             )
 
         agent_id = self._resolve_agent_id(agent)
@@ -507,10 +571,17 @@ class SyncRineClient(BaseRineClient):
             CursorPage of AgentSummary.
         """
         params: dict[str, Any] = {}
-        for k, v in [("q", q), ("category", category), ("tag", tag),
-                      ("language", language), ("jurisdiction", jurisdiction),
-                      ("verified", verified), ("pricing_model", pricing_model),
-                      ("limit", limit), ("cursor", cursor)]:
+        for k, v in [
+            ("q", q),
+            ("category", category),
+            ("tag", tag),
+            ("language", language),
+            ("jurisdiction", jurisdiction),
+            ("verified", verified),
+            ("pricing_model", pricing_model),
+            ("limit", limit),
+            ("cursor", cursor),
+        ]:
             if v is not None:
                 params[k] = v
         data = self._http.get("/directory/agents", params=params or None, authenticated=False)
@@ -607,6 +678,7 @@ class SyncRineClient(BaseRineClient):
             Number of undelivered messages.
         """
         from rine._config import load_credentials
+
         creds = load_credentials(self._config_dir)
         entry = creds.get("default", {})
         poll_url = entry.get("poll_url")
@@ -660,7 +732,8 @@ class SyncRineClient(BaseRineClient):
             NotFoundError: If agent not found.
         """
         body = self._build_body(
-            ("name", name), ("human_oversight", human_oversight),
+            ("name", name),
+            ("human_oversight", human_oversight),
             ("incoming_policy", incoming_policy),
             ("outgoing_policy", outgoing_policy),
         )
@@ -710,8 +783,10 @@ class SyncRineClient(BaseRineClient):
             ValidationError: If field values are invalid.
         """
         body = self._build_body(
-            ("name", name), ("contact_email", contact_email),
-            ("country_code", country_code), ("slug", slug),
+            ("name", name),
+            ("contact_email", contact_email),
+            ("country_code", country_code),
+            ("slug", slug),
         )
         data = self._http.patch("/org", json_body=body)
         return OrgRead.model_validate(data)
@@ -761,9 +836,7 @@ class SyncRineClient(BaseRineClient):
 
     # --- Conversations ---
 
-    def update_conversation_status(
-        self, conversation_id: str, status: str
-    ) -> ConversationRead:
+    def update_conversation_status(self, conversation_id: str, status: str) -> ConversationRead:
         """Update a conversation's status.
 
         Args:
@@ -798,9 +871,7 @@ class SyncRineClient(BaseRineClient):
         data = self._http.get(f"/conversations/{conversation_id}")
         return ConversationRead.model_validate(data)
 
-    def get_conversation_participants(
-        self, conversation_id: str
-    ) -> list[ConversationParticipant]:
+    def get_conversation_participants(self, conversation_id: str) -> list[ConversationParticipant]:
         """Get participants in a conversation.
 
         Args:
@@ -812,9 +883,7 @@ class SyncRineClient(BaseRineClient):
         Raises:
             NotFoundError: If conversation not found.
         """
-        data = self._http.get(
-            f"/conversations/{conversation_id}/participants"
-        )
+        data = self._http.get(f"/conversations/{conversation_id}/participants")
         items = data.get("items", data) if isinstance(data, dict) else data
         return [ConversationParticipant.model_validate(p) for p in items]
 
@@ -862,7 +931,8 @@ class SyncRineClient(BaseRineClient):
             body["skills"] = skills
         # categories, languages, pricing_model go inside rine sub-object
         rine = self._build_body(
-            ("categories", categories), ("languages", languages),
+            ("categories", categories),
+            ("languages", languages),
             ("pricing_model", pricing_model),
         )
         if rine:
@@ -884,9 +954,7 @@ class SyncRineClient(BaseRineClient):
         Raises:
             NotFoundError: If card not found.
         """
-        data = self._http.get(
-            f"/agents/{agent_id}/card", authenticated=False
-        )
+        data = self._http.get(f"/agents/{agent_id}/card", authenticated=False)
         return AgentCardRead.model_validate(data)
 
     def delete_agent_card(self, agent_id: str) -> None:

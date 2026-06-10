@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -9,20 +11,35 @@ import respx
 from rine import SyncRineClient
 from rine._config import save_credentials
 from rine._constants import MessageType
-import json
-
 from rine.errors import (
-    AuthorizationError, ConfigError, ConflictError,
-    NotFoundError, RateLimitError, ValidationError,
+    AuthorizationError,
+    ConfigError,
+    ConflictError,
+    NotFoundError,
+    RateLimitError,
+    ValidationError,
 )
 from rine.types import (
-    AgentCardRead, AgentProfile, AgentRead, AgentSummary,
-    ConversationParticipant, ConversationRead, CursorPage,
-    ErasureResult, GroupRead, JoinRequestRead, OrgQuotas, OrgRead,
-    PollTokenResponse, VoteResponse,
-    WebhookCreated, WebhookJobRead, WebhookJobSummary, WebhookRead, WhoAmI,
+    AgentCardRead,
+    AgentProfile,
+    AgentRead,
+    AgentSummary,
+    ConversationParticipant,
+    ConversationRead,
+    CursorPage,
+    ErasureResult,
+    GroupRead,
+    JoinRequestRead,
+    OrgQuotas,
+    OrgRead,
+    PollTokenResponse,
+    VoteResponse,
+    WebhookCreated,
+    WebhookJobRead,
+    WebhookJobSummary,
+    WebhookRead,
+    WhoAmI,
 )
-
 
 # --- Fixtures shared across tests ---
 
@@ -33,7 +50,7 @@ GROUP_ID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 _AGENT_PAYLOAD = {
     "id": AGENT_ID,
     "name": "test-agent",
-    "handle": f"test-agent@myorg.rine.network",
+    "handle": "test-agent@myorg.rine.network",
     "human_oversight": True,
     "incoming_policy": "accept_all",
     "outgoing_policy": "send_all",
@@ -110,18 +127,21 @@ class TestDiscover:
     @respx.mock
     def test_discover_returns_cursor_page(self, sync_client):
         respx.get("https://rine.network/directory/agents").mock(
-            return_value=httpx.Response(200, json={
-                "items": [
-                    {
-                        "id": OTHER_AGENT_ID,
-                        "name": "Other Agent",
-                        "handle": "other@org.rine.network",
-                        "verified": False,
-                    }
-                ],
-                "total": 1,
-                "next_cursor": None,
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "id": OTHER_AGENT_ID,
+                            "name": "Other Agent",
+                            "handle": "other@org.rine.network",
+                            "verified": False,
+                        }
+                    ],
+                    "total": 1,
+                    "next_cursor": None,
+                },
+            )
         )
 
         result = sync_client.discover()
@@ -159,21 +179,24 @@ class TestInspect:
     def test_inspect_with_a2a_envelope(self, sync_client):
         """inspect() should unwrap the A2A agent card envelope."""
         respx.get(f"https://rine.network/directory/agents/{OTHER_AGENT_ID}").mock(
-            return_value=httpx.Response(200, json={
-                "card": {
-                    "name": "Legal Bot",
-                    "description": "An AI legal assistant",
-                    "rine": {
-                        "agent_id": OTHER_AGENT_ID,
-                        "handle": "legal@acme.rine.network",
-                        "category": "legal",
-                        "verified": True,
-                        "human_oversight": False,
-                        "trust_tier": 2,
-                    }
+            return_value=httpx.Response(
+                200,
+                json={
+                    "card": {
+                        "name": "Legal Bot",
+                        "description": "An AI legal assistant",
+                        "rine": {
+                            "agent_id": OTHER_AGENT_ID,
+                            "handle": "legal@acme.rine.network",
+                            "category": "legal",
+                            "verified": True,
+                            "human_oversight": False,
+                            "trust_tier": 2,
+                        },
+                    },
+                    "directory_metadata": {"registered_at": "2024-01-01T00:00:00Z"},
                 },
-                "directory_metadata": {"registered_at": "2024-01-01T00:00:00Z"},
-            })
+            )
         )
 
         result = sync_client.inspect(OTHER_AGENT_ID)
@@ -190,13 +213,16 @@ class TestInspect:
     def test_inspect_with_raw_response(self, sync_client):
         """inspect() should fall through to direct parse when no 'card' key."""
         respx.get(f"https://rine.network/directory/agents/{OTHER_AGENT_ID}").mock(
-            return_value=httpx.Response(200, json={
-                "id": OTHER_AGENT_ID,
-                "name": "Raw Agent",
-                "handle": "raw@org.rine.network",
-                "verified": False,
-                "human_oversight": True,
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": OTHER_AGENT_ID,
+                    "name": "Raw Agent",
+                    "handle": "raw@org.rine.network",
+                    "verified": False,
+                    "human_oversight": True,
+                },
+            )
         )
 
         result = sync_client.inspect(OTHER_AGENT_ID)
@@ -209,14 +235,17 @@ class TestInspect:
 class TestPoll:
     @respx.mock
     def test_poll_returns_count(self, tmp_config_dir, saved_agent_keys, agent_id):
-        from rine._config import save_credentials
-        save_credentials(tmp_config_dir, {
-            "default": {
-                "client_id": "cid",
-                "client_secret": "csecret",
-                "poll_url": "https://rine.network/poll/some-token",
-            }
-        })
+
+        save_credentials(
+            tmp_config_dir,
+            {
+                "default": {
+                    "client_id": "cid",
+                    "client_secret": "csecret",
+                    "poll_url": "https://rine.network/poll/some-token",
+                }
+            },
+        )
 
         respx.get("https://rine.network/poll/some-token").mock(
             return_value=httpx.Response(200, json={"count": 5})
@@ -273,14 +302,18 @@ class TestInbox:
         _mock_token()
         _mock_agents()
         respx.get(f"https://rine.network/agents/{AGENT_ID}/messages").mock(
-            return_value=httpx.Response(200, json={
-                "items": [],
-                "total": 0,
-                "next_cursor": None,
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "items": [],
+                    "total": 0,
+                    "next_cursor": None,
+                },
+            )
         )
 
-        from rine.types import CursorPage, DecryptedMessage
+        from rine.types import CursorPage
+
         result = sync_client.inbox()
 
         assert isinstance(result, CursorPage)
@@ -315,21 +348,25 @@ class TestSendAndWaitTimeout:
 
         # Mock WebFinger for recipient resolution
         respx.get("https://rine.network/.well-known/webfinger").mock(
-            return_value=httpx.Response(200, json={
-                "aliases": [f"https://rine.network/agents/{OTHER_AGENT_ID}"]
-            })
+            return_value=httpx.Response(
+                200, json={"aliases": [f"https://rine.network/agents/{OTHER_AGENT_ID}"]}
+            )
         )
 
         # Mock recipient keys endpoint
-        from rine._crypto.keys import load_agent_keys, encryption_public_key_to_jwk
+        from rine._crypto.keys import encryption_public_key_to_jwk
+
         other_keys = generate_other_keys(tmp_config_dir, OTHER_AGENT_ID)
         enc_jwk = encryption_public_key_to_jwk(other_keys.encryption.public_key)
         respx.get(f"https://rine.network/agents/{OTHER_AGENT_ID}/keys").mock(
-            return_value=httpx.Response(200, json={
-                "agent_id": OTHER_AGENT_ID,
-                "encryption_public_key": enc_jwk,
-                "signing_public_key": {"kty": "OKP", "crv": "Ed25519", "x": "AAAA"},
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "agent_id": OTHER_AGENT_ID,
+                    "encryption_public_key": enc_jwk,
+                    "signing_public_key": {"kty": "OKP", "crv": "Ed25519", "x": "AAAA"},
+                },
+            )
         )
 
         # No /messages mock — send_and_wait should NOT call it.
@@ -342,17 +379,20 @@ class TestSendAndWaitTimeout:
             "to_agent_id": AGENT_ID,
         }
         sync_route = respx.post("https://rine.network/messages/sync").mock(
-            return_value=httpx.Response(200, json={
-                "message": _MESSAGE_PAYLOAD,
-                "reply": reply_msg,
-                "conversation_id": _MESSAGE_PAYLOAD["conversation_id"],
-                "status": "completed",
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "message": _MESSAGE_PAYLOAD,
+                    "reply": reply_msg,
+                    "conversation_id": _MESSAGE_PAYLOAD["conversation_id"],
+                    "status": "completed",
+                },
+            )
         )
 
         try:
             sync_client.send_and_wait(
-                f"other@acme.rine.network",
+                "other@acme.rine.network",
                 {"task": "hi"},
                 timeout=2.5,
             )
@@ -365,14 +405,18 @@ class TestSendAndWaitTimeout:
         assert b"timeout_ms=2500" in request.url.query
         # Body should be the full encrypted payload, not {conversation_id}
         import json as _json
+
         body = _json.loads(request.content)
         assert "encrypted_payload" in body
         assert "type" in body
 
     def test_send_and_wait_rejects_group_handles(self, sync_client):
-        """Group handles are rejected client-side (server doesn't support them on sync)."""
+        """Group handles raise the typed UnsupportedTargetError (sync endpoint is 1:1 only)."""
         import pytest
-        with pytest.raises(ValueError, match="group handles"):
+
+        from rine.errors import UnsupportedTargetError
+
+        with pytest.raises(UnsupportedTargetError, match="group handles"):
             sync_client.send_and_wait(
                 "#team@acme.rine.network",
                 {"task": "nope"},
@@ -382,6 +426,7 @@ class TestSendAndWaitTimeout:
 def generate_other_keys(tmp_config_dir: str, other_agent_id: str):
     """Helper: generate and save keys for a second agent."""
     from rine._crypto.keys import generate_agent_keys, save_agent_keys
+
     keys = generate_agent_keys()
     save_agent_keys(tmp_config_dir, other_agent_id, keys)
     return keys
@@ -390,14 +435,12 @@ def generate_other_keys(tmp_config_dir: str, other_agent_id: str):
 class TestContextManager:
     @respx.mock
     def test_sync_client_context_manager(self, tmp_config_dir, saved_agent_keys, agent_id):
-        from rine._config import save_credentials
-        save_credentials(tmp_config_dir, {
-            "default": {"client_id": "cid", "client_secret": "csecret"}
-        })
 
-        with SyncRineClient(
-            config_dir=tmp_config_dir, api_url="https://rine.network"
-        ) as client:
+        save_credentials(
+            tmp_config_dir, {"default": {"client_id": "cid", "client_secret": "csecret"}}
+        )
+
+        with SyncRineClient(config_dir=tmp_config_dir, api_url="https://rine.network") as client:
             assert client is not None
         # Verify it closed without error
 
@@ -410,14 +453,17 @@ class TestUpdateAgent:
     def test_update_agent_all_fields(self, sync_client):
         _mock_token()
         route = respx.patch(f"https://rine.network/agents/{AGENT_ID}").mock(
-            return_value=httpx.Response(200, json={
-                **_AGENT_PAYLOAD,
-                "name": "renamed",
-                "human_oversight": False,
-                "incoming_policy": "groups_only",
-                "outgoing_policy": "groups_only",
-                "warnings": ["groups_only policy will block all messages"],
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    **_AGENT_PAYLOAD,
+                    "name": "renamed",
+                    "human_oversight": False,
+                    "incoming_policy": "groups_only",
+                    "outgoing_policy": "groups_only",
+                    "warnings": ["groups_only policy will block all messages"],
+                },
+            )
         )
 
         result = sync_client.update_agent(
@@ -481,7 +527,8 @@ class TestUpdateAgent:
         _mock_token()
         respx.patch(f"https://rine.network/agents/{AGENT_ID}").mock(
             return_value=httpx.Response(
-                409, json={"detail": "Cannot rename agent after handle assignment"},
+                409,
+                json={"detail": "Cannot rename agent after handle assignment"},
             )
         )
 
@@ -514,10 +561,13 @@ class TestRevokeAgent:
     def test_revoke_agent_returns_agent_with_revoked_at(self, sync_client):
         _mock_token()
         respx.delete(f"https://rine.network/agents/{AGENT_ID}").mock(
-            return_value=httpx.Response(200, json={
-                **_AGENT_PAYLOAD,
-                "revoked_at": "2024-06-01T00:00:00Z",
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    **_AGENT_PAYLOAD,
+                    "revoked_at": "2024-06-01T00:00:00Z",
+                },
+            )
         )
 
         result = sync_client.revoke_agent(AGENT_ID)
@@ -554,11 +604,14 @@ class TestUpdateOrg:
     def test_update_org_success(self, sync_client):
         _mock_token()
         route = respx.patch("https://rine.network/org").mock(
-            return_value=httpx.Response(200, json={
-                **_ORG_PAYLOAD,
-                "name": "New Name",
-                "contact_email": "new@example.com",
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    **_ORG_PAYLOAD,
+                    "name": "New Name",
+                    "contact_email": "new@example.com",
+                },
+            )
         )
 
         result = sync_client.update_org(name="New Name", contact_email="new@example.com")
@@ -625,14 +678,17 @@ class TestEraseOrg:
             return_value=httpx.Response(200, json=_ORG_PAYLOAD)
         )
         respx.delete(f"https://rine.network/orgs/{_ORG_PAYLOAD['id']}").mock(
-            return_value=httpx.Response(200, json={
-                "org_id": _ORG_PAYLOAD["id"],
-                "erased_at": "2024-06-01T00:00:00Z",
-                "messages_deleted": 42,
-                "agents_deleted": 3,
-                "conversations_deleted": 10,
-                "groups_deleted": 1,
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "org_id": _ORG_PAYLOAD["id"],
+                    "erased_at": "2024-06-01T00:00:00Z",
+                    "messages_deleted": 42,
+                    "agents_deleted": 3,
+                    "conversations_deleted": 10,
+                    "groups_deleted": 1,
+                },
+            )
         )
 
         result = sync_client.erase_org(confirm=True)
@@ -783,9 +839,13 @@ class TestUpdateConversationStatus:
     def test_update_conversation_status_success(self, sync_client):
         _mock_token()
         route = respx.patch(f"https://rine.network/conversations/{CONVERSATION_ID}/status").mock(
-            return_value=httpx.Response(200, json={
-                **_CONVERSATION_PAYLOAD, "status": "completed",
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    **_CONVERSATION_PAYLOAD,
+                    "status": "completed",
+                },
+            )
         )
 
         result = sync_client.update_conversation_status(CONVERSATION_ID, "completed")
@@ -846,9 +906,15 @@ class TestGetConversationParticipants:
     def test_get_conversation_participants_success(self, sync_client):
         _mock_token()
         respx.get(f"https://rine.network/conversations/{CONVERSATION_ID}/participants").mock(
-            return_value=httpx.Response(200, json={
-                "items": [_PARTICIPANT_PAYLOAD, {**_PARTICIPANT_PAYLOAD, "role": "responder", "agent_id": OTHER_AGENT_ID}],
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "items": [
+                        _PARTICIPANT_PAYLOAD,
+                        {**_PARTICIPANT_PAYLOAD, "role": "responder", "agent_id": OTHER_AGENT_ID},
+                    ],
+                },
+            )
         )
 
         result = sync_client.get_conversation_participants(CONVERSATION_ID)
@@ -988,9 +1054,13 @@ class TestWebhookCreate:
     def test_webhook_create_success(self, sync_client):
         _mock_token()
         respx.post("https://rine.network/webhooks").mock(
-            return_value=httpx.Response(201, json={
-                **_WEBHOOK_PAYLOAD, "secret": "whsec_test123",
-            })
+            return_value=httpx.Response(
+                201,
+                json={
+                    **_WEBHOOK_PAYLOAD,
+                    "secret": "whsec_test123",
+                },
+            )
         )
 
         result = sync_client.webhooks.create(AGENT_ID, "https://example.com/webhook")
@@ -1003,13 +1073,18 @@ class TestWebhookCreate:
     def test_webhook_create_with_events(self, sync_client):
         _mock_token()
         route = respx.post("https://rine.network/webhooks").mock(
-            return_value=httpx.Response(201, json={
-                **_WEBHOOK_PAYLOAD, "secret": "whsec_test123",
-            })
+            return_value=httpx.Response(
+                201,
+                json={
+                    **_WEBHOOK_PAYLOAD,
+                    "secret": "whsec_test123",
+                },
+            )
         )
 
         sync_client.webhooks.create(
-            AGENT_ID, "https://example.com/webhook",
+            AGENT_ID,
+            "https://example.com/webhook",
             events=["message.received"],
         )
 
@@ -1132,9 +1207,13 @@ class TestRotateKeys:
     def test_rotate_keys_success(self, sync_client):
         _mock_token()
         route = respx.post(f"https://rine.network/agents/{AGENT_ID}/keys").mock(
-            return_value=httpx.Response(200, json={
-                **_AGENT_PAYLOAD, "verification_words": "alpha bravo charlie",
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    **_AGENT_PAYLOAD,
+                    "verification_words": "alpha bravo charlie",
+                },
+            )
         )
 
         result = sync_client.rotate_keys(AGENT_ID)
@@ -1160,6 +1239,7 @@ class TestRotateKeys:
         sync_client.rotate_keys(AGENT_ID)
 
         import os
+
         key_dir = os.path.join(tmp_config_dir, "keys", AGENT_ID)
         assert os.path.isfile(os.path.join(key_dir, "signing.key"))
         assert os.path.isfile(os.path.join(key_dir, "encryption.key"))
@@ -1193,13 +1273,16 @@ class TestGetQuotas:
     def test_get_quotas_success(self, sync_client):
         _mock_token()
         respx.get("https://rine.network/org/quotas").mock(
-            return_value=httpx.Response(200, json={
-                "tier": 1,
-                "quotas": {
-                    "agents": {"limit": 10, "used": 3},
-                    "webhooks": {"limit": 5, "used": 1},
+            return_value=httpx.Response(
+                200,
+                json={
+                    "tier": 1,
+                    "quotas": {
+                        "agents": {"limit": 10, "used": 3},
+                        "webhooks": {"limit": 5, "used": 1},
+                    },
                 },
-            })
+            )
         )
 
         result = sync_client.get_quotas()
@@ -1213,12 +1296,15 @@ class TestGetQuotas:
     def test_get_quotas_parses_unlimited(self, sync_client):
         _mock_token()
         respx.get("https://rine.network/org/quotas").mock(
-            return_value=httpx.Response(200, json={
-                "tier": 3,
-                "quotas": {
-                    "agents": {"limit": None, "used": 50},
+            return_value=httpx.Response(
+                200,
+                json={
+                    "tier": 3,
+                    "quotas": {
+                        "agents": {"limit": None, "used": 50},
+                    },
                 },
-            })
+            )
         )
 
         result = sync_client.get_quotas()
@@ -1382,9 +1468,9 @@ class TestGroupRemoveMember:
     def test_group_remove_member_success(self, sync_client):
         _mock_token()
         _mock_agents()
-        respx.delete(
-            f"https://rine.network/groups/{GROUP_ID}/members/{OTHER_AGENT_ID}"
-        ).mock(return_value=httpx.Response(204))
+        respx.delete(f"https://rine.network/groups/{GROUP_ID}/members/{OTHER_AGENT_ID}").mock(
+            return_value=httpx.Response(204)
+        )
 
         result = sync_client.groups.remove_member(GROUP_ID, OTHER_AGENT_ID)
 
@@ -1394,9 +1480,9 @@ class TestGroupRemoveMember:
     def test_group_remove_member_not_found(self, sync_client):
         _mock_token()
         _mock_agents()
-        respx.delete(
-            f"https://rine.network/groups/{GROUP_ID}/members/{OTHER_AGENT_ID}"
-        ).mock(return_value=httpx.Response(404, json={"detail": "Not found"}))
+        respx.delete(f"https://rine.network/groups/{GROUP_ID}/members/{OTHER_AGENT_ID}").mock(
+            return_value=httpx.Response(404, json={"detail": "Not found"})
+        )
 
         with pytest.raises(NotFoundError):
             sync_client.groups.remove_member(GROUP_ID, OTHER_AGENT_ID)
@@ -1405,9 +1491,9 @@ class TestGroupRemoveMember:
     def test_group_remove_member_not_admin(self, sync_client):
         _mock_token()
         _mock_agents()
-        respx.delete(
-            f"https://rine.network/groups/{GROUP_ID}/members/{OTHER_AGENT_ID}"
-        ).mock(return_value=httpx.Response(403, json={"detail": "Not admin"}))
+        respx.delete(f"https://rine.network/groups/{GROUP_ID}/members/{OTHER_AGENT_ID}").mock(
+            return_value=httpx.Response(403, json={"detail": "Not admin"})
+        )
 
         with pytest.raises(AuthorizationError):
             sync_client.groups.remove_member(GROUP_ID, OTHER_AGENT_ID)
@@ -1416,9 +1502,9 @@ class TestGroupRemoveMember:
     def test_group_remove_member_last_admin(self, sync_client):
         _mock_token()
         _mock_agents()
-        respx.delete(
-            f"https://rine.network/groups/{GROUP_ID}/members/{AGENT_ID}"
-        ).mock(return_value=httpx.Response(422, json={"detail": "Last admin"}))
+        respx.delete(f"https://rine.network/groups/{GROUP_ID}/members/{AGENT_ID}").mock(
+            return_value=httpx.Response(422, json={"detail": "Last admin"})
+        )
 
         with pytest.raises(ValidationError):
             sync_client.groups.remove_member(GROUP_ID, AGENT_ID)
@@ -1430,9 +1516,7 @@ class TestGroupVoting:
         _mock_token()
         _mock_agents()
         respx.get(f"https://rine.network/groups/{GROUP_ID}/requests").mock(
-            return_value=httpx.Response(
-                200, json={"items": [_JOIN_REQUEST_PAYLOAD], "total": 1}
-            )
+            return_value=httpx.Response(200, json={"items": [_JOIN_REQUEST_PAYLOAD], "total": 1})
         )
 
         result = sync_client.groups.list_requests(GROUP_ID)
@@ -1470,9 +1554,9 @@ class TestGroupVoting:
         _mock_token()
         _mock_agents()
         req_id = _JOIN_REQUEST_PAYLOAD["id"]
-        respx.post(
-            f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote"
-        ).mock(return_value=httpx.Response(200, json=_VOTE_RESPONSE_PAYLOAD))
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote").mock(
+            return_value=httpx.Response(200, json=_VOTE_RESPONSE_PAYLOAD)
+        )
 
         result = sync_client.groups.vote(GROUP_ID, req_id, "approve")
 
@@ -1486,9 +1570,9 @@ class TestGroupVoting:
         _mock_agents()
         req_id = _JOIN_REQUEST_PAYLOAD["id"]
         deny_payload = {**_VOTE_RESPONSE_PAYLOAD, "your_vote": "deny", "status": "pending"}
-        respx.post(
-            f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote"
-        ).mock(return_value=httpx.Response(200, json=deny_payload))
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote").mock(
+            return_value=httpx.Response(200, json=deny_payload)
+        )
 
         result = sync_client.groups.vote(GROUP_ID, req_id, "deny")
 
@@ -1499,9 +1583,9 @@ class TestGroupVoting:
         _mock_token()
         _mock_agents()
         req_id = _JOIN_REQUEST_PAYLOAD["id"]
-        respx.post(
-            f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote"
-        ).mock(return_value=httpx.Response(409, json={"detail": "Already voted"}))
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote").mock(
+            return_value=httpx.Response(409, json={"detail": "Already voted"})
+        )
 
         with pytest.raises(ConflictError):
             sync_client.groups.vote(GROUP_ID, req_id, "approve")
@@ -1511,9 +1595,9 @@ class TestGroupVoting:
         _mock_token()
         _mock_agents()
         req_id = _JOIN_REQUEST_PAYLOAD["id"]
-        respx.post(
-            f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote"
-        ).mock(return_value=httpx.Response(422, json={"detail": "Request not pending"}))
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote").mock(
+            return_value=httpx.Response(422, json={"detail": "Request not pending"})
+        )
 
         with pytest.raises(ValidationError):
             sync_client.groups.vote(GROUP_ID, req_id, "approve")
@@ -1523,9 +1607,9 @@ class TestGroupVoting:
         _mock_token()
         _mock_agents()
         req_id = _JOIN_REQUEST_PAYLOAD["id"]
-        respx.post(
-            f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote"
-        ).mock(return_value=httpx.Response(404, json={"detail": "Not found"}))
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote").mock(
+            return_value=httpx.Response(404, json={"detail": "Not found"})
+        )
 
         with pytest.raises(NotFoundError):
             sync_client.groups.vote(GROUP_ID, req_id, "approve")
@@ -1584,9 +1668,7 @@ class TestListAgents:
     def test_list_agents_default(self, sync_client):
         _mock_token()
         route = respx.get("https://rine.network/agents").mock(
-            return_value=httpx.Response(
-                200, json={"items": [_AGENT_PAYLOAD], "total": 1}
-            )
+            return_value=httpx.Response(200, json={"items": [_AGENT_PAYLOAD], "total": 1})
         )
 
         result = sync_client.list_agents()
@@ -1599,9 +1681,7 @@ class TestListAgents:
     def test_list_agents_include_revoked(self, sync_client):
         _mock_token()
         route = respx.get("https://rine.network/agents").mock(
-            return_value=httpx.Response(
-                200, json={"items": [_AGENT_PAYLOAD], "total": 1}
-            )
+            return_value=httpx.Response(200, json={"items": [_AGENT_PAYLOAD], "total": 1})
         )
 
         sync_client.list_agents(include_revoked=True)
@@ -1614,9 +1694,7 @@ class TestRegeneratePollToken:
     def test_regenerate_poll_token_success(self, sync_client):
         _mock_token()
         respx.post(f"https://rine.network/agents/{AGENT_ID}/poll-token").mock(
-            return_value=httpx.Response(
-                200, json={"poll_url": "https://rine.network/poll/abc123"}
-            )
+            return_value=httpx.Response(200, json={"poll_url": "https://rine.network/poll/abc123"})
         )
 
         result = sync_client.regenerate_poll_token(AGENT_ID)
@@ -1673,9 +1751,7 @@ class TestWebhookDeliveries:
     def test_webhook_deliveries_default(self, sync_client):
         _mock_token()
         respx.get(f"https://rine.network/webhooks/{WEBHOOK_ID}/deliveries").mock(
-            return_value=httpx.Response(
-                200, json={"items": [_WEBHOOK_JOB_PAYLOAD], "total": 1}
-            )
+            return_value=httpx.Response(200, json={"items": [_WEBHOOK_JOB_PAYLOAD], "total": 1})
         )
 
         result = sync_client.webhooks.deliveries(WEBHOOK_ID)
@@ -1687,9 +1763,7 @@ class TestWebhookDeliveries:
     @respx.mock
     def test_webhook_deliveries_with_status_filter(self, sync_client):
         _mock_token()
-        route = respx.get(
-            f"https://rine.network/webhooks/{WEBHOOK_ID}/deliveries"
-        ).mock(
+        route = respx.get(f"https://rine.network/webhooks/{WEBHOOK_ID}/deliveries").mock(
             return_value=httpx.Response(200, json={"items": [], "total": 0})
         )
 
@@ -1700,9 +1774,7 @@ class TestWebhookDeliveries:
     @respx.mock
     def test_webhook_deliveries_with_pagination(self, sync_client):
         _mock_token()
-        route = respx.get(
-            f"https://rine.network/webhooks/{WEBHOOK_ID}/deliveries"
-        ).mock(
+        route = respx.get(f"https://rine.network/webhooks/{WEBHOOK_ID}/deliveries").mock(
             return_value=httpx.Response(200, json={"items": [], "total": 0})
         )
 
@@ -1737,12 +1809,10 @@ class TestWebhookDeliverySummary:
     @respx.mock
     def test_webhook_delivery_summary_success(self, sync_client):
         _mock_token()
-        respx.get(
-            f"https://rine.network/webhooks/{WEBHOOK_ID}/deliveries/summary"
-        ).mock(
-            return_value=httpx.Response(200, json={
-                "total": 100, "delivered": 90, "failed": 5, "dead": 2, "pending": 3
-            })
+        respx.get(f"https://rine.network/webhooks/{WEBHOOK_ID}/deliveries/summary").mock(
+            return_value=httpx.Response(
+                200, json={"total": 100, "delivered": 90, "failed": 5, "dead": 2, "pending": 3}
+            )
         )
 
         result = sync_client.webhooks.delivery_summary(WEBHOOK_ID)
@@ -1755,9 +1825,7 @@ class TestWebhookDeliverySummary:
     @respx.mock
     def test_webhook_delivery_summary_not_found(self, sync_client):
         _mock_token()
-        respx.get(
-            f"https://rine.network/webhooks/{WEBHOOK_ID}/deliveries/summary"
-        ).mock(
+        respx.get(f"https://rine.network/webhooks/{WEBHOOK_ID}/deliveries/summary").mock(
             return_value=httpx.Response(404, json={"detail": "Webhook not found"})
         )
 

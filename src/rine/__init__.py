@@ -16,6 +16,7 @@ Quick start::
 """
 
 from rine._client import RineClient
+from rine._config import resolve_api_url, resolve_config_dir
 from rine._constants import (
     NOT_GIVEN,
     ConversationStatus,
@@ -28,6 +29,7 @@ from rine._constants import (
 )
 from rine._onboard import async_register as async_onboard
 from rine._onboard import register as onboard
+from rine._resolve import is_uuid, normalize_handle
 from rine._sync_client import SyncRineClient
 from rine._version import __version__
 from rine.errors import (
@@ -45,6 +47,7 @@ from rine.errors import (
     RineApiError,
     RineError,
     ServiceUnavailableError,
+    UnsupportedTargetError,
     ValidationError,
     format_error,
 )
@@ -91,6 +94,11 @@ __all__ = [
     # Onboarding
     "async_onboard",
     "onboard",
+    # Resolution & config helpers
+    "is_uuid",
+    "normalize_handle",
+    "resolve_api_url",
+    "resolve_config_dir",
     # Types - Output models
     "AgentCard",
     "AgentCardRead",
@@ -147,6 +155,7 @@ __all__ = [
     "RineApiError",
     "RineError",
     "ServiceUnavailableError",
+    "UnsupportedTargetError",
     "ValidationError",
     "format_error",
     # Sentinel

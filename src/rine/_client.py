@@ -7,9 +7,12 @@ proper connection lifecycle management.
 from __future__ import annotations
 
 import json
-from typing import Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 from rine._base_client import BaseRineClient
 from rine._constants import NOT_GIVEN, EncryptionVersion, MessageType, NotGiven
@@ -25,8 +28,21 @@ from rine._crypto.sender_keys_helpers import load_sender_key_states, save_sender
 from rine._http import AsyncHttpClient
 from rine._logging import logger
 from rine._onboard import create_agent as _create_agent
-from rine._resolve import is_uuid, normalize_handle, resolve_agent, resolve_to_uuid_async
-from rine.errors import ConfigError, CryptoError, NotFoundError
+from rine._resolve import (
+    is_uuid,
+    match_group_by_local_name,
+    normalize_handle,
+    resolve_agent,
+    resolve_to_uuid_async,
+)
+from rine._resources.groups import AsyncGroups
+from rine._resources.webhooks import AsyncWebhooks
+from rine.errors import (
+    ConfigError,
+    CryptoError,
+    NotFoundError,
+    UnsupportedTargetError,
+)
 from rine.types import (
     AgentCardRead,
     AgentProfile,
@@ -47,8 +63,8 @@ from rine.types import (
     WhoAmI,
 )
 
-from rine._resources.groups import AsyncGroups
-from rine._resources.webhooks import AsyncWebhooks
+# Inbox delivery-status filter values (server: messages.py ``_status_filter``).
+InboxStatus = Literal["new", "delivered", "read"]
 
 
 class RineClient(BaseRineClient):
@@ -82,8 +98,11 @@ class RineClient(BaseRineClient):
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         super().__init__(
-            config_dir=config_dir, api_url=api_url, agent=agent,
-            timeout=timeout, max_retries=max_retries,
+            config_dir=config_dir,
+            api_url=api_url,
+            agent=agent,
+            timeout=timeout,
+            max_retries=max_retries,
         )
         self._http = AsyncHttpClient(
             config_dir=self._config_dir,
@@ -127,7 +146,9 @@ class RineClient(BaseRineClient):
             api_url=self._api_url,
             agent=agent if not isinstance(agent, NotGiven) else self._agent,
             timeout=timeout if not isinstance(timeout, NotGiven) else self._timeout,
-            max_retries=max_retries if not isinstance(max_retries, NotGiven) else self._max_retries,
+            max_retries=max_retries
+            if not isinstance(max_retries, NotGiven)
+            else self._max_retries,
         )
 
     # --- Agent resolution helpers ---
@@ -159,10 +180,22 @@ class RineClient(BaseRineClient):
         self._agents_cache = data.get("items", data) if isinstance(data, dict) else data
         return self._agents_cache
 
-    async def _resolve_group_async(self, handle_or_id: str) -> str:
-        """Resolve group handle to ID."""
+    async def _resolve_group_async(self, handle_or_id: str, agent: str | None = None) -> str:
+        """Resolve a group UUID, full handle, or bare name to a group ID.
+
+        ``agent`` selects which agent's group list is searched when ``handle_or_id``
+        is a bare name (multi-agent orgs).
+        """
         if is_uuid(handle_or_id):
             return handle_or_id
+        # Bare name (no ``@``): the server's ?handle= filter only matches a full
+        # ``#name@org`` handle, so list the acting agent's groups and match on the
+        # handle's local part (parity with ``groups.list()`` / crewai inspect).
+        if "@" not in handle_or_id:
+            extra = self._agent_header(agent)
+            data = await self._http.get("/groups", extra_headers=extra)
+            groups = data.get("items", data) if isinstance(data, dict) else data
+            return match_group_by_local_name(groups, handle_or_id)
         handle = handle_or_id if handle_or_id.startswith("#") else f"#{handle_or_id}"
         data = await self._http.get("/groups", params={"handle": handle})
         items = data.get("items", []) if isinstance(data, dict) else data
@@ -237,14 +270,17 @@ class RineClient(BaseRineClient):
     ) -> tuple[Any, dict[str, Any]]:
         """Encrypt and build body for group message."""
         import asyncio
-        from rine._sender_key_ops import get_or_create_sender_key_sync
+
         from rine._http import SyncHttpClient
+        from rine._sender_key_ops import get_or_create_sender_key_sync
 
         resolved_agent_id = await self._resolve_agent_id()
 
         def _sync_sk_ops() -> tuple[Any, str]:
             sync_http = SyncHttpClient(
-                config_dir=self._config_dir, api_url=self._api_url, timeout=self._timeout,
+                config_dir=self._config_dir,
+                api_url=self._api_url,
+                timeout=self._timeout,
             )
             try:
                 return get_or_create_sender_key_sync(
@@ -255,9 +291,7 @@ class RineClient(BaseRineClient):
 
         own_state, group_id = await asyncio.to_thread(_sync_sk_ops)
 
-        result, _ = encrypt_group_message(
-            self._config_dir, agent_id, group_id, own_state, payload
-        )
+        result, _ = encrypt_group_message(self._config_dir, agent_id, group_id, own_state, payload)
         return result, {
             "to_handle": to,
             "type": msg_type,
@@ -272,6 +306,7 @@ class RineClient(BaseRineClient):
         agent: str | None = None,
         limit: int | None = None,
         cursor: str | None = None,
+        status: InboxStatus | None = None,
     ) -> CursorPage[DecryptedMessage]:
         """Read inbox messages with auto-decryption.
 
@@ -281,13 +316,15 @@ class RineClient(BaseRineClient):
             agent: Agent to read as.
             limit: Max messages per page.
             cursor: Pagination cursor.
+            status: Filter by delivery status (``"new"``, ``"delivered"``, or
+                ``"read"``). When omitted, the server default applies.
 
         Returns:
             CursorPage of DecryptedMessage.
 
         Example::
 
-            page = await client.inbox(limit=10)
+            page = await client.inbox(status="new", limit=10)
             for msg in page:
                 print(msg.plaintext)
         """
@@ -298,6 +335,8 @@ class RineClient(BaseRineClient):
             params["limit"] = limit
         if cursor:
             params["cursor"] = cursor
+        if status is not None:
+            params["status"] = status
 
         data = await self._http.get(
             f"/agents/{agent_id}/messages", params=params or None, extra_headers=extra
@@ -320,6 +359,30 @@ class RineClient(BaseRineClient):
             next_cursor=data.get("next_cursor") if isinstance(data, dict) else None,
             prev_cursor=data.get("prev_cursor") if isinstance(data, dict) else None,
         )
+
+    async def mark_delivered(self, message_ids: list[str], *, agent: str | None = None) -> int:
+        """Mark messages as delivered for an agent (idempotent).
+
+        Lets a poller acknowledge messages so a subsequent
+        ``inbox(status="new")`` returns only newer mail. The acting agent is
+        resolved internally (same precedence as ``inbox``/``send``), so callers
+        pass a handle/name/UUID (or ``None`` for the default agent), never a
+        pre-resolved ID.
+
+        Args:
+            message_ids: Message UUIDs to mark delivered.
+            agent: Agent to mark deliveries for. ``None`` uses the client's
+                configured/default agent.
+
+        Returns:
+            Number of messages newly marked delivered.
+        """
+        agent_id = await self._resolve_agent_id(agent)
+        data = await self._http.post(
+            f"/agents/{agent_id}/messages/mark-delivered",
+            json_body={"message_ids": message_ids},
+        )
+        return int(data.get("marked", 0)) if isinstance(data, dict) else 0
 
     async def read(
         self,
@@ -352,9 +415,7 @@ class RineClient(BaseRineClient):
                 return await self._decrypt_message(agent_id, msg)
             raise
 
-    async def _decrypt_message(
-        self, agent_id: str, msg: DecryptedMessage
-    ) -> DecryptedMessage:
+    async def _decrypt_message(self, agent_id: str, msg: DecryptedMessage) -> DecryptedMessage:
         """Decrypt a message in-place."""
         if msg.encryption_version == EncryptionVersion.HPKE_V1:
             result = await decrypt_message_async(
@@ -362,8 +423,7 @@ class RineClient(BaseRineClient):
             )
         elif msg.encryption_version == EncryptionVersion.SENDER_KEY_V1 and msg.group_id:
             result = await decrypt_group_message_async(
-                self._config_dir, agent_id, str(msg.group_id),
-                msg.encrypted_payload, self._http
+                self._config_dir, agent_id, str(msg.group_id), msg.encrypted_payload, self._http
             )
         elif msg.encryption_version == EncryptionVersion.MLS_V1:
             # MLS crypto is TypeScript-only (ts-mls); return undecrypted with a
@@ -374,6 +434,13 @@ class RineClient(BaseRineClient):
             )
             return msg
         else:
+            # Unknown/unhandled encryption_version (e.g. hpke-hybrid-v1). Mark it
+            # explicitly so it is never mistaken for a successfully-decrypted
+            # message with empty plaintext — fail loud, never silent.
+            msg.decrypt_error = (
+                f"Unsupported encryption_version '{msg.encryption_version}'; "
+                "the Python SDK cannot decrypt this message."
+            )
             return msg
 
         msg.plaintext = result.plaintext
@@ -384,9 +451,6 @@ class RineClient(BaseRineClient):
     async def _fetch_pending_sk_distributions(self, agent_id: str) -> int:
         """Fetch and ingest pending sender key distributions."""
         from rine._crypto.message import decrypt_message_async
-        from rine._crypto.keys import agent_id_from_kid
-        from rine._crypto.sender_keys import SenderKeyState
-        from rine._crypto.sender_keys_helpers import load_sender_key_states, save_sender_key_state
         from rine._utils import from_base64url
 
         data = await self._http.get(
@@ -490,9 +554,10 @@ class RineClient(BaseRineClient):
             SendAndWaitResult with sent message and reply (or None on timeout).
         """
         if to.startswith("#"):
-            raise ValueError(
+            raise UnsupportedTargetError(
                 "send_and_wait() does not support group handles — "
-                "the /messages/sync endpoint is 1:1 only."
+                "the /messages/sync endpoint is 1:1 only. "
+                "Use send() to post to a group."
             )
 
         agent_id = await self._resolve_agent_id(agent)
@@ -548,10 +613,17 @@ class RineClient(BaseRineClient):
             CursorPage of AgentSummary.
         """
         params: dict[str, Any] = {}
-        for k, v in [("q", q), ("category", category), ("tag", tag),
-                      ("language", language), ("jurisdiction", jurisdiction),
-                      ("verified", verified), ("pricing_model", pricing_model),
-                      ("limit", limit), ("cursor", cursor)]:
+        for k, v in [
+            ("q", q),
+            ("category", category),
+            ("tag", tag),
+            ("language", language),
+            ("jurisdiction", jurisdiction),
+            ("verified", verified),
+            ("pricing_model", pricing_model),
+            ("limit", limit),
+            ("cursor", cursor),
+        ]:
             if v is not None:
                 params[k] = v
 
@@ -575,9 +647,7 @@ class RineClient(BaseRineClient):
             AgentProfile.
         """
         agent_id = await resolve_to_uuid_async(self._api_url, handle_or_id)
-        data = await self._http.get(
-            f"/directory/agents/{agent_id}", authenticated=False
-        )
+        data = await self._http.get(f"/directory/agents/{agent_id}", authenticated=False)
         # Unwrap A2A agent card envelope
         if "card" in data:
             card = data["card"]
@@ -657,6 +727,7 @@ class RineClient(BaseRineClient):
             Number of undelivered messages.
         """
         from rine._config import load_credentials
+
         creds = load_credentials(self._config_dir)
         entry = creds.get("default", {})
         poll_url = entry.get("poll_url")
@@ -684,6 +755,7 @@ class RineClient(BaseRineClient):
         """
         # Use sync http for key upload (crypto is sync)
         from rine._http import SyncHttpClient
+
         sync_http = SyncHttpClient(
             config_dir=self._config_dir,
             api_url=self._api_url,
@@ -720,7 +792,8 @@ class RineClient(BaseRineClient):
             NotFoundError: If agent not found.
         """
         body = self._build_body(
-            ("name", name), ("human_oversight", human_oversight),
+            ("name", name),
+            ("human_oversight", human_oversight),
             ("incoming_policy", incoming_policy),
             ("outgoing_policy", outgoing_policy),
         )
@@ -770,8 +843,10 @@ class RineClient(BaseRineClient):
             ValidationError: If field values are invalid.
         """
         body = self._build_body(
-            ("name", name), ("contact_email", contact_email),
-            ("country_code", country_code), ("slug", slug),
+            ("name", name),
+            ("contact_email", contact_email),
+            ("country_code", country_code),
+            ("slug", slug),
         )
         data = await self._http.patch("/org", json_body=body)
         return OrgRead.model_validate(data)
@@ -872,9 +947,7 @@ class RineClient(BaseRineClient):
         Raises:
             NotFoundError: If conversation not found.
         """
-        data = await self._http.get(
-            f"/conversations/{conversation_id}/participants"
-        )
+        data = await self._http.get(f"/conversations/{conversation_id}/participants")
         items = data.get("items", data) if isinstance(data, dict) else data
         return [ConversationParticipant.model_validate(p) for p in items]
 
@@ -922,7 +995,8 @@ class RineClient(BaseRineClient):
             body["skills"] = skills
         # categories, languages, pricing_model go inside rine sub-object
         rine = self._build_body(
-            ("categories", categories), ("languages", languages),
+            ("categories", categories),
+            ("languages", languages),
             ("pricing_model", pricing_model),
         )
         if rine:
@@ -944,9 +1018,7 @@ class RineClient(BaseRineClient):
         Raises:
             NotFoundError: If card not found.
         """
-        data = await self._http.get(
-            f"/agents/{agent_id}/card", authenticated=False
-        )
+        data = await self._http.get(f"/agents/{agent_id}/card", authenticated=False)
         return AgentCardRead.model_validate(data)
 
     async def delete_agent_card(self, agent_id: str) -> None:
@@ -1074,27 +1146,28 @@ class RineClient(BaseRineClient):
         if agent_id:
             headers["X-Rine-Agent"] = agent_id
 
-        async with httpx.AsyncClient() as http:
-            async with http.stream(
+        async with (
+            httpx.AsyncClient() as http,
+            http.stream(
                 "GET",
                 f"{self._api_url}/agents/{agent_id}/stream",
                 headers=headers,
                 timeout=None,
-            ) as resp:
-                event_type = ""
-                event_data = ""
-                event_id: str | None = None
+            ) as resp,
+        ):
+            event_type = ""
+            event_data = ""
+            event_id: str | None = None
 
-                async for line in resp.aiter_lines():
-                    if line.startswith("event:"):
-                        event_type = line[6:].strip()
-                    elif line.startswith("data:"):
-                        event_data = line[5:].strip()
-                    elif line.startswith("id:"):
-                        event_id = line[3:].strip()
-                    elif line == "":
-                        if event_type or event_data:
-                            yield Event(event=event_type, data=event_data, id=event_id)
-                            event_type = ""
-                            event_data = ""
-                            event_id = None
+            async for line in resp.aiter_lines():
+                if line.startswith("event:"):
+                    event_type = line[6:].strip()
+                elif line.startswith("data:"):
+                    event_data = line[5:].strip()
+                elif line.startswith("id:"):
+                    event_id = line[3:].strip()
+                elif line == "" and (event_type or event_data):
+                    yield Event(event=event_type, data=event_data, id=event_id)
+                    event_type = ""
+                    event_data = ""
+                    event_id = None

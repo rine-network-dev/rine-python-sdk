@@ -29,6 +29,7 @@ class SyncGroups:
         self,
         name: str,
         *,
+        description: str | None = None,
         enrollment: str = "closed",
         visibility: str = "private",
         agent: str | None = None,
@@ -37,6 +38,7 @@ class SyncGroups:
 
         Args:
             name: Group name (1-63 chars, DNS-safe).
+            description: Optional group description.
             enrollment: Enrollment policy (``open``, ``closed``, ``majority``, ``unanimity``).
             visibility: Visibility (``public`` or ``private``).
             agent: Agent to act as (for multi-agent orgs).
@@ -51,16 +53,15 @@ class SyncGroups:
             group in a state this SDK cannot send to.
         """
         extra = self._client._agent_header(agent)
-        data = self._client._http.post(
-            "/groups",
-            json_body={
-                "name": name,
-                "enrollment_policy": enrollment,
-                "visibility": visibility,
-                "mls_enabled": False,
-            },
-            extra_headers=extra,
-        )
+        body: dict[str, Any] = {
+            "name": name,
+            "enrollment_policy": enrollment,
+            "visibility": visibility,
+            "mls_enabled": False,
+        }
+        if description is not None:
+            body["description"] = description
+        data = self._client._http.post("/groups", json_body=body, extra_headers=extra)
         return GroupRead.model_validate(data)
 
     def join(
@@ -73,14 +74,14 @@ class SyncGroups:
         """Join a group or request to join.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
             message: Optional message for join request.
             agent: Agent to act as.
 
         Returns:
             JoinResult with status.
         """
-        group_id = self._client._resolve_group_sync(handle_or_id)
+        group_id = self._client._resolve_group_sync(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         body: dict[str, Any] = {}
         if message:
@@ -90,17 +91,19 @@ class SyncGroups:
         )
         return JoinResult.model_validate(data)
 
-    def members(self, handle_or_id: str) -> list[GroupMember]:
+    def members(self, handle_or_id: str, *, agent: str | None = None) -> list[GroupMember]:
         """List group members.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
+            agent: Agent to act as (resolves bare group names for the right agent).
 
         Returns:
             List of GroupMember.
         """
-        group_id = self._client._resolve_group_sync(handle_or_id)
-        data = self._client._http.get(f"/groups/{group_id}/members")
+        group_id = self._client._resolve_group_sync(handle_or_id, agent)
+        extra = self._client._agent_header(agent)
+        data = self._client._http.get(f"/groups/{group_id}/members", extra_headers=extra)
         items = data.get("items", data) if isinstance(data, dict) else data
         return [GroupMember.model_validate(m) for m in items]
 
@@ -115,7 +118,7 @@ class SyncGroups:
         """Invite an agent to a group.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
             agent_to_invite: Handle or UUID of agent to invite.
             message: Optional invitation message.
             agent: Agent to act as.
@@ -124,7 +127,8 @@ class SyncGroups:
             InviteResult with status.
         """
         from rine._resolve import resolve_to_uuid_sync
-        group_id = self._client._resolve_group_sync(handle_or_id)
+
+        group_id = self._client._resolve_group_sync(handle_or_id, agent)
         invitee_id = resolve_to_uuid_sync(self._client._api_url, agent_to_invite)
         extra = self._client._agent_header(agent)
         body: dict[str, Any] = {"agent_id": invitee_id}
@@ -162,7 +166,7 @@ class SyncGroups:
         """Update group settings.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
             description: Group description.
             enrollment: ``open``, ``closed``, ``majority``, ``unanimity``.
             visibility: ``public`` or ``private``.
@@ -172,7 +176,7 @@ class SyncGroups:
         Returns:
             Updated GroupRead.
         """
-        group_id = self._client._resolve_group_sync(handle_or_id)
+        group_id = self._client._resolve_group_sync(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         body = self._client._build_body(
             ("description", description),
@@ -180,19 +184,17 @@ class SyncGroups:
             ("visibility", visibility),
             ("vote_duration_hours", vote_duration_hours),
         )
-        data = self._client._http.patch(
-            f"/groups/{group_id}", json_body=body, extra_headers=extra
-        )
+        data = self._client._http.patch(f"/groups/{group_id}", json_body=body, extra_headers=extra)
         return GroupRead.model_validate(data)
 
     def delete(self, handle_or_id: str, *, agent: str | None = None) -> None:
         """Delete a group.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
             agent: Agent to act as.
         """
-        group_id = self._client._resolve_group_sync(handle_or_id)
+        group_id = self._client._resolve_group_sync(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         self._client._http.delete(f"/groups/{group_id}", extra_headers=extra)
 
@@ -206,15 +208,13 @@ class SyncGroups:
         """Remove a member from a group.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
             agent_id: UUID of the member to remove.
             agent: Agent to act as.
         """
-        group_id = self._client._resolve_group_sync(handle_or_id)
+        group_id = self._client._resolve_group_sync(handle_or_id, agent)
         extra = self._client._agent_header(agent)
-        self._client._http.delete(
-            f"/groups/{group_id}/members/{agent_id}", extra_headers=extra
-        )
+        self._client._http.delete(f"/groups/{group_id}/members/{agent_id}", extra_headers=extra)
 
     def list_requests(
         self, handle_or_id: str, *, agent: str | None = None
@@ -222,17 +222,15 @@ class SyncGroups:
         """List pending join requests for a group.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
             agent: Agent to act as.
 
         Returns:
             List of JoinRequestRead.
         """
-        group_id = self._client._resolve_group_sync(handle_or_id)
+        group_id = self._client._resolve_group_sync(handle_or_id, agent)
         extra = self._client._agent_header(agent)
-        data = self._client._http.get(
-            f"/groups/{group_id}/requests", extra_headers=extra
-        )
+        data = self._client._http.get(f"/groups/{group_id}/requests", extra_headers=extra)
         items = data.get("items", data) if isinstance(data, dict) else data
         return [JoinRequestRead.model_validate(r) for r in items]
 
@@ -247,7 +245,7 @@ class SyncGroups:
         """Cast a vote on a join request.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
             request_id: UUID of the join request.
             choice: ``approve`` or ``deny``.
             agent: Agent to act as.
@@ -255,7 +253,7 @@ class SyncGroups:
         Returns:
             VoteResponse with updated status.
         """
-        group_id = self._client._resolve_group_sync(handle_or_id)
+        group_id = self._client._resolve_group_sync(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         data = self._client._http.post(
             f"/groups/{group_id}/requests/{request_id}/vote",
@@ -275,6 +273,7 @@ class AsyncGroups:
         self,
         name: str,
         *,
+        description: str | None = None,
         enrollment: str = "closed",
         visibility: str = "private",
         agent: str | None = None,
@@ -283,6 +282,7 @@ class AsyncGroups:
 
         Args:
             name: Group name (1-63 chars, DNS-safe).
+            description: Optional group description.
             enrollment: Enrollment policy.
             visibility: Visibility.
             agent: Agent to act as.
@@ -297,16 +297,15 @@ class AsyncGroups:
             group in a state this SDK cannot send to.
         """
         extra = self._client._agent_header(agent)
-        data = await self._client._http.post(
-            "/groups",
-            json_body={
-                "name": name,
-                "enrollment_policy": enrollment,
-                "visibility": visibility,
-                "mls_enabled": False,
-            },
-            extra_headers=extra,
-        )
+        body: dict[str, Any] = {
+            "name": name,
+            "enrollment_policy": enrollment,
+            "visibility": visibility,
+            "mls_enabled": False,
+        }
+        if description is not None:
+            body["description"] = description
+        data = await self._client._http.post("/groups", json_body=body, extra_headers=extra)
         return GroupRead.model_validate(data)
 
     async def join(
@@ -319,14 +318,14 @@ class AsyncGroups:
         """Join a group or request to join.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
             message: Optional message for join request.
             agent: Agent to act as.
 
         Returns:
             JoinResult with status.
         """
-        group_id = await self._client._resolve_group_async(handle_or_id)
+        group_id = await self._client._resolve_group_async(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         body: dict[str, Any] = {}
         if message:
@@ -336,17 +335,19 @@ class AsyncGroups:
         )
         return JoinResult.model_validate(data)
 
-    async def members(self, handle_or_id: str) -> list[GroupMember]:
+    async def members(self, handle_or_id: str, *, agent: str | None = None) -> list[GroupMember]:
         """List group members.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
+            agent: Agent to act as (resolves bare group names for the right agent).
 
         Returns:
             List of GroupMember.
         """
-        group_id = await self._client._resolve_group_async(handle_or_id)
-        data = await self._client._http.get(f"/groups/{group_id}/members")
+        group_id = await self._client._resolve_group_async(handle_or_id, agent)
+        extra = self._client._agent_header(agent)
+        data = await self._client._http.get(f"/groups/{group_id}/members", extra_headers=extra)
         items = data.get("items", data) if isinstance(data, dict) else data
         return [GroupMember.model_validate(m) for m in items]
 
@@ -361,7 +362,7 @@ class AsyncGroups:
         """Invite an agent to a group.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
             agent_to_invite: Handle or UUID of agent to invite.
             message: Optional invitation message.
             agent: Agent to act as.
@@ -370,7 +371,8 @@ class AsyncGroups:
             InviteResult with status.
         """
         from rine._resolve import resolve_to_uuid_async
-        group_id = await self._client._resolve_group_async(handle_or_id)
+
+        group_id = await self._client._resolve_group_async(handle_or_id, agent)
         invitee_id = await resolve_to_uuid_async(self._client._api_url, agent_to_invite)
         extra = self._client._agent_header(agent)
         body: dict[str, Any] = {"agent_id": invitee_id}
@@ -408,7 +410,7 @@ class AsyncGroups:
         """Update group settings.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
             description: Group description.
             enrollment: ``open``, ``closed``, ``majority``, ``unanimity``.
             visibility: ``public`` or ``private``.
@@ -418,7 +420,7 @@ class AsyncGroups:
         Returns:
             Updated GroupRead.
         """
-        group_id = await self._client._resolve_group_async(handle_or_id)
+        group_id = await self._client._resolve_group_async(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         body = self._client._build_body(
             ("description", description),
@@ -435,10 +437,10 @@ class AsyncGroups:
         """Delete a group.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
             agent: Agent to act as.
         """
-        group_id = await self._client._resolve_group_async(handle_or_id)
+        group_id = await self._client._resolve_group_async(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         await self._client._http.delete(f"/groups/{group_id}", extra_headers=extra)
 
@@ -452,11 +454,11 @@ class AsyncGroups:
         """Remove a member from a group.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
             agent_id: UUID of the member to remove.
             agent: Agent to act as.
         """
-        group_id = await self._client._resolve_group_async(handle_or_id)
+        group_id = await self._client._resolve_group_async(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         await self._client._http.delete(
             f"/groups/{group_id}/members/{agent_id}", extra_headers=extra
@@ -468,17 +470,15 @@ class AsyncGroups:
         """List pending join requests for a group.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
             agent: Agent to act as.
 
         Returns:
             List of JoinRequestRead.
         """
-        group_id = await self._client._resolve_group_async(handle_or_id)
+        group_id = await self._client._resolve_group_async(handle_or_id, agent)
         extra = self._client._agent_header(agent)
-        data = await self._client._http.get(
-            f"/groups/{group_id}/requests", extra_headers=extra
-        )
+        data = await self._client._http.get(f"/groups/{group_id}/requests", extra_headers=extra)
         items = data.get("items", data) if isinstance(data, dict) else data
         return [JoinRequestRead.model_validate(r) for r in items]
 
@@ -493,7 +493,7 @@ class AsyncGroups:
         """Cast a vote on a join request.
 
         Args:
-            handle_or_id: Group handle or UUID.
+            handle_or_id: Group handle, bare name, or UUID.
             request_id: UUID of the join request.
             choice: ``approve`` or ``deny``.
             agent: Agent to act as.
@@ -501,7 +501,7 @@ class AsyncGroups:
         Returns:
             VoteResponse with updated status.
         """
-        group_id = await self._client._resolve_group_async(handle_or_id)
+        group_id = await self._client._resolve_group_async(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         data = await self._client._http.post(
             f"/groups/{group_id}/requests/{request_id}/vote",

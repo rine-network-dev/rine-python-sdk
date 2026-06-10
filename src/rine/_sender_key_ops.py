@@ -9,7 +9,6 @@ from __future__ import annotations
 from typing import Any
 
 from rine._constants import MessageType
-from rine._crypto.keys import make_kid
 from rine._crypto.message import encrypt_message, fetch_recipient_encryption_key_sync
 from rine._crypto.sender_keys import (
     SenderKeyState,
@@ -98,6 +97,7 @@ def get_or_create_sender_key_sync(
     """
     # Resolve group — targeted handle lookup
     from rine.errors import MlsUnsupportedError, NotFoundError
+
     target_handle = group_handle if group_handle.startswith("#") else f"#{group_handle}"
     group_data = client.get("/groups", params={"handle": target_handle})
     items = group_data.get("items", []) if isinstance(group_data, dict) else group_data
@@ -106,17 +106,23 @@ def get_or_create_sender_key_sync(
     group = items[0]
     group_id = str(group["id"])
 
-    # MLS latch: a non-null mls_group_id means the group uses MLS encryption.
+    # MLS latch: a non-null mls_group_id means the group uses MLS encryption,
+    # and mls_pending means the server has frozen the group during MLS init.
     # The Python SDK has no MLS crypto, and the server rejects sender-key-v1
-    # sends to MLS groups (409), so fail loudly BEFORE attempting sender-key
-    # crypto rather than silently producing an undeliverable message.
-    if group.get("mls_group_id") is not None:
+    # sends to MLS (or MLS-initializing) groups (409), so fail loudly BEFORE
+    # attempting sender-key crypto rather than silently producing an
+    # undeliverable message.
+    if group.get("mls_group_id") is not None or group.get("mls_pending"):
         raise MlsUnsupportedError()
 
     # Get members
     members_data = client.get(f"/groups/{group_id}/members")
-    member_items = members_data.get("items", members_data) if isinstance(members_data, dict) else members_data
-    member_ids = [str(m["agent_id"]) for m in member_items if str(m["agent_id"]) != sender_agent_id]
+    member_items = (
+        members_data.get("items", members_data) if isinstance(members_data, dict) else members_data
+    )
+    member_ids = [
+        str(m["agent_id"]) for m in member_items if str(m["agent_id"]) != sender_agent_id
+    ]
 
     # Load existing states
     states = load_sender_key_states(config_dir, sender_agent_id, group_id)
@@ -150,7 +156,9 @@ def get_or_create_sender_key_sync(
         new_state.distributed_to = succeeded
 
         # Replace or append state
-        other_states = [s for s in states if s.sender_key_id != (own_state.sender_key_id if own_state else "")]
+        other_states = [
+            s for s in states if s.sender_key_id != (own_state.sender_key_id if own_state else "")
+        ]
         other_states.append(new_state)
         save_sender_key_state(config_dir, sender_agent_id, group_id, other_states)
         return new_state, group_id
