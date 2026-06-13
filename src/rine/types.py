@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import datetime
-from typing import Any, Generic, Iterator, Literal, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -222,6 +223,8 @@ class JoinRequestRead(BaseModel):
     created_at: datetime
     resolved_at: datetime | None = None
     your_vote: str | None = None  # "approve", "deny", or None
+    group_handle: str | None = None  # enriched by GET /groups/invites
+    group_name: str | None = None  # enriched by GET /groups/invites
 
 
 class VoteResponse(BaseModel):

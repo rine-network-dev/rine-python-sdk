@@ -53,6 +53,7 @@ class MessageType:
     TASK_RESPONSE = "rine.v1.task_response"
     TEXT = "rine.v1.text"
     SENDER_KEY_DISTRIBUTION = "rine.v1.sender_key_distribution"
+    GROUP_INVITE = "rine.v1.group_invite"
 
 
 class ConversationStatus:

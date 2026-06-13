@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from rine._constants import NOT_GIVEN, NotGiven
+from rine._constants import NOT_GIVEN, MessageType, NotGiven
+from rine._logging import logger
 from rine.types import (
     GroupMember,
     GroupRead,
@@ -137,7 +138,34 @@ class SyncGroups:
         data = self._client._http.post(
             f"/groups/{group_id}/invite", json_body=body, extra_headers=extra
         )
+        self._notify_invitee(group_id, invitee_id, message, agent)
         return InviteResult.model_validate(data)
+
+    def _notify_invitee(
+        self, group_id: str, invitee_id: str, message: str | None, agent: str | None
+    ) -> None:
+        """Best-effort: seal a ``rine.v1.group_invite`` DM so the invitee is alerted.
+
+        Authoritative discovery is ``list_invites()`` / ``GET /groups/invites``; this
+        push is a convenience nudge, so any failure (missing keys, ``groups_only``
+        policy, network) is swallowed and must never fail the invite.
+        """
+        try:
+            extra = self._client._agent_header(agent)
+            group = self._client._http.get(f"/groups/{group_id}", extra_headers=extra)
+            payload = {
+                "group_id": group_id,
+                "group_handle": group["handle"],
+                "invited_by": self._client._resolve_agent_id(agent),
+                "message": message,
+            }
+            self._client.send(
+                invitee_id, payload, message_type=MessageType.GROUP_INVITE, agent=agent
+            )
+        except Exception:
+            logger.warning(
+                "Failed to notify invitee %s of group invite", invitee_id, exc_info=True
+            )
 
     def list(self, *, agent: str | None = None) -> list[GroupRead]:
         """List groups the agent belongs to.
@@ -231,6 +259,25 @@ class SyncGroups:
         group_id = self._client._resolve_group_sync(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         data = self._client._http.get(f"/groups/{group_id}/requests", extra_headers=extra)
+        items = data.get("items", data) if isinstance(data, dict) else data
+        return [JoinRequestRead.model_validate(r) for r in items]
+
+    def list_invites(self, *, agent: str | None = None) -> list[JoinRequestRead]:
+        """List open invites addressed to the calling agent (across all groups).
+
+        Unlike ``list_requests`` (admin-scoped, one group), this is agent-scoped: it
+        returns the caller's own pending invites and is the authoritative way to
+        discover an invite when the inviter's notification did not arrive.
+
+        Args:
+            agent: Agent to act as.
+
+        Returns:
+            List of JoinRequestRead (status ``invited``), enriched with
+            ``group_handle``/``group_name``.
+        """
+        extra = self._client._agent_header(agent)
+        data = self._client._http.get("/groups/invites", extra_headers=extra)
         items = data.get("items", data) if isinstance(data, dict) else data
         return [JoinRequestRead.model_validate(r) for r in items]
 
@@ -381,7 +428,34 @@ class AsyncGroups:
         data = await self._client._http.post(
             f"/groups/{group_id}/invite", json_body=body, extra_headers=extra
         )
+        await self._notify_invitee(group_id, invitee_id, message, agent)
         return InviteResult.model_validate(data)
+
+    async def _notify_invitee(
+        self, group_id: str, invitee_id: str, message: str | None, agent: str | None
+    ) -> None:
+        """Best-effort: seal a ``rine.v1.group_invite`` DM so the invitee is alerted.
+
+        Authoritative discovery is ``list_invites()`` / ``GET /groups/invites``; this
+        push is a convenience nudge, so any failure (missing keys, ``groups_only``
+        policy, network) is swallowed and must never fail the invite.
+        """
+        try:
+            extra = self._client._agent_header(agent)
+            group = await self._client._http.get(f"/groups/{group_id}", extra_headers=extra)
+            payload = {
+                "group_id": group_id,
+                "group_handle": group["handle"],
+                "invited_by": await self._client._resolve_agent_id(agent),
+                "message": message,
+            }
+            await self._client.send(
+                invitee_id, payload, message_type=MessageType.GROUP_INVITE, agent=agent
+            )
+        except Exception:
+            logger.warning(
+                "Failed to notify invitee %s of group invite", invitee_id, exc_info=True
+            )
 
     async def list(self, *, agent: str | None = None) -> list[GroupRead]:
         """List groups the agent belongs to.
@@ -479,6 +553,25 @@ class AsyncGroups:
         group_id = await self._client._resolve_group_async(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         data = await self._client._http.get(f"/groups/{group_id}/requests", extra_headers=extra)
+        items = data.get("items", data) if isinstance(data, dict) else data
+        return [JoinRequestRead.model_validate(r) for r in items]
+
+    async def list_invites(self, *, agent: str | None = None) -> list[JoinRequestRead]:
+        """List open invites addressed to the calling agent (across all groups).
+
+        Unlike ``list_requests`` (admin-scoped, one group), this is agent-scoped: it
+        returns the caller's own pending invites and is the authoritative way to
+        discover an invite when the inviter's notification did not arrive.
+
+        Args:
+            agent: Agent to act as.
+
+        Returns:
+            List of JoinRequestRead (status ``invited``), enriched with
+            ``group_handle``/``group_name``.
+        """
+        extra = self._client._agent_header(agent)
+        data = await self._client._http.get("/groups/invites", extra_headers=extra)
         items = data.get("items", data) if isinstance(data, dict) else data
         return [JoinRequestRead.model_validate(r) for r in items]
 
