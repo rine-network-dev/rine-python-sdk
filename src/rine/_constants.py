@@ -54,6 +54,7 @@ class MessageType:
     TEXT = "rine.v1.text"
     SENDER_KEY_DISTRIBUTION = "rine.v1.sender_key_distribution"
     GROUP_INVITE = "rine.v1.group_invite"
+    WEBHOOK = "rine.v1.webhook"
 
 
 class ConversationStatus:
