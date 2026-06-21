@@ -65,8 +65,16 @@ class MessageRead(BaseModel):
     to_agent_id: UUID | None = None
     type: str
     encrypted_payload: str
+    # Sender self-read copy, sealed to the sender's own key. Returned only to the
+    # caller that sent the message (``from_agent_id == caller``); ``None`` for a
+    # recipient read and for non-1:1 (group) rows.
+    self_encrypted_payload: str | None = None
+    # Viewer-relative tag: ``"sent"`` when ``from_agent_id == caller``, else
+    # ``"received"``. Populated by the thread/history endpoint.
+    direction: Literal["sent", "received"] | None = None
     encryption_version: str = "hpke-v1"
     sender_signing_kid: str | None = None
+    parent_conversation_id: UUID | None = None
     content_type: str | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
     created_at: datetime
@@ -85,6 +93,31 @@ class DecryptedMessage(MessageRead):
     verified: bool = False
     verification_status: Literal["verified", "invalid", "unverifiable"] = "unverifiable"
     decrypt_error: str | None = None
+
+
+class ThreadEntry(BaseModel):
+    """One rendered turn in a conversation thread.
+
+    ``text`` is the decoded human-readable body — the ``{"text": ...}`` payload
+    shape connectors use is unwrapped to its string; any other plaintext is
+    stringified — or ``"[unavailable]"`` for a row the caller cannot decrypt (a
+    legacy sent message with no self-blob, or a decrypt failure). Mirrors the
+    TypeScript SDK ``ThreadEntry`` so every surface renders identically. Entries
+    are ordered oldest→newest.
+
+    ``verification_status`` reports the sender-signature outcome for the row. A
+    received turn with an ``"invalid"`` signature is fail-closed to
+    ``"[unavailable]"`` (a forged/tampered turn never renders as trusted
+    content), so consumers that inject the transcript into a model's context can
+    also mark or exclude ``"unverifiable"`` turns.
+    """
+
+    direction: Literal["sent", "received"]
+    sender_handle: str | None = None
+    text: str
+    verification_status: Literal["verified", "invalid", "unverifiable"] = "unverifiable"
+    type: str
+    created_at: datetime
 
 
 class ConversationRead(BaseModel):

@@ -115,6 +115,16 @@ class CryptoError(RineError):
     """
 
 
+class SignatureVerificationError(CryptoError):
+    """The sender's signature failed verification (``verification_status == "invalid"``).
+
+    A :class:`CryptoError` subclass so existing ``except CryptoError`` sites still
+    catch it, but typed distinctly so callers (e.g. the thread renderer) can tell a
+    *forged/tampered* turn from an honestly-unverifiable one (network failure
+    fetching the sender key) without string-matching the message.
+    """
+
+
 class ConfigError(RineError):
     """Missing or invalid SDK configuration.
 

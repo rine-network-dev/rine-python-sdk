@@ -32,7 +32,13 @@ from rine._crypto.sender_keys_helpers import load_sender_key_states, save_sender
 from rine._crypto.sign import sign_payload, verify_signature
 from rine._logging import logger
 from rine._utils import from_base64url, to_base64url
-from rine.errors import APIConnectionError, APITimeoutError, CryptoError, RineApiError
+from rine.errors import (
+    APIConnectionError,
+    APITimeoutError,
+    CryptoError,
+    RineApiError,
+    SignatureVerificationError,
+)
 
 if TYPE_CHECKING:
     from rine._http import AsyncHttpClient, SyncHttpClient
@@ -41,14 +47,34 @@ VerificationStatus = Literal["verified", "invalid", "unverifiable"]
 
 
 class EncryptResult:
-    """Result of encrypting a message."""
+    """Result of encrypting a message.
 
-    __slots__ = ("encrypted_payload", "encryption_version", "sender_signing_kid")
+    ``self_encrypted_payload`` is a second ciphertext of the same envelope sealed
+    to the SENDER's own key, set only for 1:1 sends (``encrypt_message``) so the
+    sender can later self-read its own message via ``thread()``. It is ``None``
+    for group sends (groups self-read via the sender-key cache, not a self-blob).
+    The Python SDK self-seals CLASSICALLY (HPKE to the sender's X25519 key) —
+    consistent with the SDK only decrypting ``hpke-v1``/sender-key.
+    """
 
-    def __init__(self, encrypted_payload: str, encryption_version: str, kid: str) -> None:
+    __slots__ = (
+        "encrypted_payload",
+        "encryption_version",
+        "sender_signing_kid",
+        "self_encrypted_payload",
+    )
+
+    def __init__(
+        self,
+        encrypted_payload: str,
+        encryption_version: str,
+        kid: str,
+        self_encrypted_payload: str | None = None,
+    ) -> None:
         self.encrypted_payload = encrypted_payload
         self.encryption_version = encryption_version
         self.sender_signing_kid = kid
+        self.self_encrypted_payload = self_encrypted_payload
 
 
 class DecryptResult:
@@ -120,7 +146,9 @@ def encrypt_message(
         payload: JSON-serializable message payload.
 
     Returns:
-        EncryptResult with base64url-encoded encrypted payload.
+        EncryptResult with base64url-encoded encrypted payload and a
+        ``self_encrypted_payload`` copy sealed to the sender's own X25519 key
+        (classical HPKE) so the sender can self-read its own message later.
     """
     keys = load_agent_keys(config_dir, sender_agent_id)
     plaintext = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -129,10 +157,17 @@ def encrypt_message(
     envelope = encode_envelope(kid, signature, plaintext)
     encrypted = hpke_seal(recipient_encryption_pk, envelope)
 
+    # Self-seal: a second ciphertext of the same envelope sealed to the SENDER's
+    # own encryption key. Classical-only (the Python SDK has no hybrid path), so
+    # a sender with a PQ key still self-seals to its X25519 key — additive, the
+    # recipient ciphertext above is unchanged.
+    self_sealed = hpke_seal(keys.encryption.public_key, envelope)
+
     return EncryptResult(
         encrypted_payload=to_base64url(encrypted),
         encryption_version=EncryptionVersion.HPKE_V1,
         kid=kid,
+        self_encrypted_payload=to_base64url(self_sealed),
     )
 
 
@@ -163,7 +198,7 @@ def decrypt_message_sync(
         decoded.kid, decoded.payload, decoded.signature, client
     )
     if status == "invalid":
-        raise CryptoError("Sender signature verification failed")
+        raise SignatureVerificationError("Sender signature verification failed")
     return DecryptResult(plaintext, decoded.kid, verified, status)
 
 
@@ -194,7 +229,7 @@ async def decrypt_message_async(
         decoded.kid, decoded.payload, decoded.signature, client
     )
     if status == "invalid":
-        raise CryptoError("Sender signature verification failed")
+        raise SignatureVerificationError("Sender signature verification failed")
     return DecryptResult(plaintext, decoded.kid, verified, status)
 
 
@@ -301,21 +336,20 @@ def decrypt_group_message_sync(
     )
 
     if status == "invalid":
-        raise CryptoError("Sender signature verification failed")
+        raise SignatureVerificationError("Sender signature verification failed")
 
     # Preserve self-read keys for own sender key
     if updated.sender_agent_id == recipient_agent_id:
-        prev = {s.sender_key_id: s for s in load_sender_key_states(
-            config_dir, recipient_agent_id, group_id
-        )}.get(updated.sender_key_id)
+        prev = {
+            s.sender_key_id: s
+            for s in load_sender_key_states(config_dir, recipient_agent_id, group_id)
+        }.get(updated.sender_key_id)
         if prev and message_index in (prev.skipped_keys or {}):
             cached = prev.skipped_keys[message_index]
             if message_index not in updated.skipped_keys:
                 updated.skipped_keys[message_index] = cached
 
-    save_sender_key_state(
-        config_dir, recipient_agent_id, group_id, list(state_map.values())
-    )
+    save_sender_key_state(config_dir, recipient_agent_id, group_id, list(state_map.values()))
     return DecryptResult(plaintext, decoded.kid, verified, status)
 
 
@@ -353,7 +387,7 @@ async def decrypt_group_message_async(
     )
 
     if status == "invalid":
-        raise CryptoError("Sender signature verification failed")
+        raise SignatureVerificationError("Sender signature verification failed")
 
     if updated.sender_agent_id == recipient_agent_id:
         prev_states = load_sender_key_states(config_dir, recipient_agent_id, group_id)
@@ -363,9 +397,7 @@ async def decrypt_group_message_async(
             if message_index not in updated.skipped_keys:
                 updated.skipped_keys[message_index] = cached
 
-    save_sender_key_state(
-        config_dir, recipient_agent_id, group_id, list(state_map.values())
-    )
+    save_sender_key_state(config_dir, recipient_agent_id, group_id, list(state_map.values()))
     return DecryptResult(plaintext, decoded.kid, verified, status)
 
 
@@ -383,9 +415,7 @@ def fetch_recipient_encryption_key_sync(client: SyncHttpClient, agent_id: str) -
     return jwk_to_public_key(data["encryption_public_key"], expected_crv="X25519")
 
 
-async def fetch_recipient_encryption_key_async(
-    client: AsyncHttpClient, agent_id: str
-) -> bytes:
+async def fetch_recipient_encryption_key_async(client: AsyncHttpClient, agent_id: str) -> bytes:
     """Fetch recipient's encryption public key (async).
 
     Args:
@@ -399,9 +429,7 @@ async def fetch_recipient_encryption_key_async(
     return jwk_to_public_key(data["encryption_public_key"], expected_crv="X25519")
 
 
-def get_agent_public_keys(
-    config_dir: str, agent_id: str
-) -> dict[str, dict[str, str]]:
+def get_agent_public_keys(config_dir: str, agent_id: str) -> dict[str, dict[str, str]]:
     """Get an agent's public keys as JWK dicts.
 
     Args:

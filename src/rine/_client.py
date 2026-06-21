@@ -37,10 +37,12 @@ from rine._resolve import (
 )
 from rine._resources.groups import AsyncGroups
 from rine._resources.webhooks import AsyncWebhooks
+from rine._thread import to_thread_entry
 from rine.errors import (
     ConfigError,
     CryptoError,
     NotFoundError,
+    SignatureVerificationError,
     UnsupportedTargetError,
 )
 from rine.types import (
@@ -60,6 +62,7 @@ from rine.types import (
     OrgRead,
     PollTokenResponse,
     SendAndWaitResult,
+    ThreadEntry,
     WhoAmI,
 )
 
@@ -257,13 +260,19 @@ class RineClient(BaseRineClient):
         recipient_id = await resolve_to_uuid_async(self._api_url, to)
         recipient_pk = await fetch_recipient_encryption_key_async(self._http, recipient_id)
         result = encrypt_message(self._config_dir, agent_id, recipient_pk, payload)
-        return result, {
+        body: dict[str, Any] = {
             "to_agent_id": recipient_id,
             "type": msg_type,
             "encrypted_payload": result.encrypted_payload,
             "encryption_version": result.encryption_version,
             "sender_signing_kid": result.sender_signing_kid,
         }
+        # Sender self-read copy (1:1 only) so the sender can later read this
+        # message back via thread(). Group sends leave it None (self-read via
+        # the sender-key cache).
+        if result.self_encrypted_payload is not None:
+            body["self_encrypted_payload"] = result.self_encrypted_payload
+        return result, body
 
     async def _encrypt_group(
         self, agent_id: str, to: str, payload: object, msg_type: str
@@ -514,14 +523,17 @@ class RineClient(BaseRineClient):
         result = encrypt_message(self._config_dir, agent_id, recipient_pk, payload)
 
         extra = self._agent_header(agent)
+        reply_body: dict[str, Any] = {
+            "type": message_type,
+            "encrypted_payload": result.encrypted_payload,
+            "encryption_version": result.encryption_version,
+            "sender_signing_kid": result.sender_signing_kid,
+        }
+        if result.self_encrypted_payload is not None:
+            reply_body["self_encrypted_payload"] = result.self_encrypted_payload
         data = await self._http.post(
             f"/messages/{message_id}/reply",
-            json_body={
-                "type": message_type,
-                "encrypted_payload": result.encrypted_payload,
-                "encryption_version": result.encryption_version,
-                "sender_signing_kid": result.sender_signing_kid,
-            },
+            json_body=reply_body,
             extra_headers=extra,
         )
         return MessageRead.model_validate(data)
@@ -950,6 +962,116 @@ class RineClient(BaseRineClient):
         data = await self._http.get(f"/conversations/{conversation_id}/participants")
         items = data.get("items", data) if isinstance(data, dict) else data
         return [ConversationParticipant.model_validate(p) for p in items]
+
+    async def get_conversation_messages(
+        self, conversation_id: str, *, agent: str | None = None, limit: int | None = None
+    ) -> list[DecryptedMessage]:
+        """Get the both-sided thread of a conversation, decrypted in place.
+
+        Returns every message in the conversation — both sent and received,
+        ordered oldest→newest — each decrypted with the caller's OWN keys: a
+        ``direction == "sent"`` row is opened from its ``self_encrypted_payload``
+        (sealed to self), a received row from ``encrypted_payload``, a group row
+        via the normal group decrypt. A row the caller cannot decrypt (a legacy
+        sent message with no self-blob, or any failure) comes back with
+        ``decrypt_error`` set and ``plaintext is None`` — this method never
+        raises on a single bad row.
+
+        Note: a message sealed with hybrid PQ (``hpke-hybrid-v1``) cannot be
+        self-read by the Python SDK (no hybrid path); such a row degrades to
+        ``decrypt_error`` like any other unsupported version.
+
+        Args:
+            conversation_id: Conversation UUID.
+            agent: Agent to read as.
+            limit: Max messages (most-recent window). Server default applies when
+                omitted.
+
+        Returns:
+            List of DecryptedMessage, ascending.
+
+        Raises:
+            NotFoundError: If the conversation is not found or not accessible.
+        """
+        agent_id = await self._resolve_agent_id(agent)
+        extra = self._agent_header(agent)
+        params = {"limit": limit} if limit else None
+        data = await self._http.get(
+            f"/conversations/{conversation_id}/messages",
+            params=params,
+            extra_headers=extra,
+        )
+        # The endpoint returns `{messages, truncated}` (ConversationMessagesPage,
+        # REQ-SRV-04), NOT a cursor `{items}` page. Read the `messages` key.
+        raw_items = data.get("messages", []) if isinstance(data, dict) else data
+
+        messages: list[DecryptedMessage] = []
+        for raw in raw_items:
+            msg = DecryptedMessage.model_validate(raw)
+            messages.append(await self._decrypt_thread_row(agent_id, msg))
+        return messages
+
+    async def _decrypt_thread_row(self, agent_id: str, msg: DecryptedMessage) -> DecryptedMessage:
+        """Decrypt a thread row direction-aware, never raising.
+
+        For a ``direction == "sent"`` 1:1 row, swap in the ``self_encrypted_payload``
+        before delegating to the existing ``_decrypt_message`` (no new crypto).
+        A sent row with no self-blob, or any decrypt failure, sets
+        ``decrypt_error``/``plaintext = None`` instead of raising.
+        """
+        is_group = msg.group_id is not None
+        if msg.direction == "sent" and not is_group:
+            if msg.self_encrypted_payload is None:
+                msg.decrypt_error = "No self-seal blob for this sent message."
+                return msg
+            # The caller can only open the self-sealed copy of its own send.
+            # The self-blob is ALWAYS a classical ``hpke-v1`` seal (the sender's
+            # own X25519 key — see ``encrypt_message``), even on a row whose
+            # ``encryption_version`` is ``hpke-hybrid-v1`` (that version reflects
+            # the *recipient* negotiation). Pin the version to the blob's actual
+            # scheme so ``_decrypt_message`` dispatches classically instead of
+            # falling into the unsupported-version branch and degrading a
+            # recoverable row.
+            msg.encrypted_payload = msg.self_encrypted_payload
+            msg.encryption_version = EncryptionVersion.HPKE_V1
+        try:
+            return await self._decrypt_message(agent_id, msg)
+        except SignatureVerificationError as e:
+            # A forged/tampered sender signature: fail-closed (no plaintext leak)
+            # but PRESERVE the "invalid" status so consumers can distinguish a
+            # forged turn from an honestly-unverifiable one. ``_decrypt_message``
+            # never assigns verification_status when the decrypt call raises, so
+            # set it here — mirrors the TS SDK, which tags such a row "invalid".
+            msg.decrypt_error = str(e)
+            msg.verification_status = "invalid"
+            logger.debug("Thread decrypt failed for %s", msg.id, exc_info=True)
+            return msg
+        except Exception as e:  # noqa: BLE001 — degrade, never raise (inbox pattern)
+            msg.decrypt_error = str(e)
+            logger.debug("Thread decrypt failed for %s", msg.id, exc_info=True)
+            return msg
+
+    async def thread(
+        self, conversation_id: str, *, agent: str | None = None, limit: int | None = None
+    ) -> list[ThreadEntry]:
+        """Get the both-sided, role-tagged transcript of a conversation.
+
+        Calls :meth:`get_conversation_messages` then renders each row to a
+        :class:`ThreadEntry`. A row with ``decrypt_error`` or no plaintext
+        renders ``text = "[unavailable]"``; otherwise the ``{"text": ...}``
+        payload shape is unwrapped to its string and any other plaintext is
+        stringified (mirroring the TypeScript SDK render contract).
+
+        Args:
+            conversation_id: Conversation UUID.
+            agent: Agent to read as.
+            limit: Max turns (most-recent window).
+
+        Returns:
+            List of ThreadEntry, ordered oldest→newest.
+        """
+        messages = await self.get_conversation_messages(conversation_id, agent=agent, limit=limit)
+        return [to_thread_entry(m) for m in messages]
 
     # --- Agent Cards ---
 
