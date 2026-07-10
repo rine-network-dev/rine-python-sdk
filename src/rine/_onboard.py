@@ -17,10 +17,11 @@ from rine._crypto.keys import (
     save_agent_keys,
     signing_public_key_to_jwk,
 )
-from rine._http import SyncHttpClient, _USER_AGENT, _parse_error_detail
+from rine._http import _USER_AGENT, SyncHttpClient, _parse_error_detail
 from rine._logging import logger
 from rine._timelock import solve_timelock
-from rine.errors import RateLimitError, RineApiError, RineError, raise_for_status
+from rine._verify import apply_identity_verification
+from rine.errors import RateLimitError, RineError, raise_for_status
 from rine.types import AgentRead, RegistrationResult
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$")
@@ -249,6 +250,10 @@ def create_agent(
     name: str,
     human_oversight: bool = True,
     unlisted: bool = False,
+    *,
+    verify_identity: bool = False,
+    svid: str | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> AgentRead:
     """Create an agent with generated keypairs.
 
@@ -258,9 +263,15 @@ def create_agent(
         name: Agent name.
         human_oversight: Whether agent requires human oversight.
         unlisted: Whether agent is unlisted.
+        verify_identity: Run SPIFFE identity verification after creation.
+        svid: Caller-supplied JWT-SVID for the verification step. Supplying it
+            implies verification even when ``verify_identity`` is False.
+        log: Optional sink for verification diagnostics.
 
     Returns:
-        Created AgentRead.
+        Created AgentRead. When verification runs, ``identity`` (success) or
+        ``identity_error`` (failure) is populated — a verify failure never undoes
+        creation.
     """
     keys = generate_agent_keys()
 
@@ -284,5 +295,7 @@ def create_agent(
         entry["poll_url"] = agent.poll_url  # type: ignore[typeddict-unknown-key]
         creds[client._profile] = entry  # type: ignore[assignment]
         save_credentials(config_dir, creds)
+
+    apply_identity_verification(client, agent, verify=verify_identity, svid=svid, log=log)
 
     return agent

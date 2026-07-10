@@ -5,6 +5,8 @@ All errors include three components: what failed, why, and what to try.
 
 from __future__ import annotations
 
+from typing import Literal
+
 
 class RineError(Exception):
     """Base exception for all Rine SDK errors."""
@@ -158,6 +160,23 @@ class MlsUnsupportedError(RineError):
             "MLS groups."
         ),
     ) -> None:
+        super().__init__(detail)
+
+
+class SpiffeVerificationError(RineError):
+    """SPIFFE identity verification could not obtain a JWT-SVID.
+
+    Raised client-side (before the verify request) when no SVID is available —
+    never a silent no-op. ``reason`` is machine-readable so callers branch
+    without string-matching:
+
+    - ``"no-svid"`` — no ``svid`` given and no SPIFFE Workload API endpoint.
+    - ``"autofetch-unavailable"`` — a ``SPIFFE_ENDPOINT_SOCKET`` is present but
+      automatic fetch is not supported in this build; supply ``svid`` explicitly.
+    """
+
+    def __init__(self, detail: str, reason: Literal["no-svid", "autofetch-unavailable"]) -> None:
+        self.reason = reason
         super().__init__(detail)
 
 

@@ -38,6 +38,7 @@ from rine._resolve import (
 from rine._resources.groups import AsyncGroups
 from rine._resources.webhooks import AsyncWebhooks
 from rine._thread import to_thread_entry
+from rine._verify import async_verify_identity as _async_verify_identity
 from rine.errors import (
     ConfigError,
     CryptoError,
@@ -63,6 +64,7 @@ from rine.types import (
     PollTokenResponse,
     SendAndWaitResult,
     ThreadEntry,
+    VerifyIdentityResult,
     WhoAmI,
 )
 
@@ -754,6 +756,8 @@ class RineClient(BaseRineClient):
         *,
         human_oversight: bool = True,
         unlisted: bool = False,
+        verify_identity: bool = False,
+        svid: str | None = None,
     ) -> AgentRead:
         """Create a new agent with generated keypairs.
 
@@ -761,9 +765,13 @@ class RineClient(BaseRineClient):
             name: Agent name.
             human_oversight: Whether agent requires human oversight.
             unlisted: Whether agent is unlisted in directory.
+            verify_identity: Run SPIFFE identity verification after creation.
+            svid: Caller-supplied JWT-SVID for verification (implies verify).
 
         Returns:
-            Created AgentRead.
+            Created AgentRead. When verification runs, ``identity`` (success) or
+            ``identity_error`` (failure) is populated; a verify failure never
+            undoes creation.
         """
         # Use sync http for key upload (crypto is sync)
         from rine._http import SyncHttpClient
@@ -774,9 +782,40 @@ class RineClient(BaseRineClient):
             timeout=self._timeout,
         )
         try:
-            return _create_agent(sync_http, self._config_dir, name, human_oversight, unlisted)
+            return _create_agent(
+                sync_http,
+                self._config_dir,
+                name,
+                human_oversight,
+                unlisted,
+                verify_identity=verify_identity,
+                svid=svid,
+            )
         finally:
             sync_http.close()
+
+    async def verify_identity(
+        self,
+        agent_id: str,
+        *,
+        svid: str | None = None,
+    ) -> VerifyIdentityResult:
+        """Prove control of a SPIFFE identity for an agent → org trust tier 2.
+
+        Args:
+            agent_id: Agent UUID to verify.
+            svid: A SPIFFE JWT-SVID (compact JWS) for the challenge audience.
+
+        Returns:
+            VerifyIdentityResult with the recorded spiffe_id and trust tier.
+
+        Raises:
+            SpiffeVerificationError: If no ``svid`` is provided (auto-fetch is
+                unavailable — there is no dependency-free Workload API client).
+            NotFoundError / ConflictError / ValidationError / RateLimitError: On
+                the corresponding challenge/verify HTTP failures.
+        """
+        return await _async_verify_identity(self._http, agent_id, svid=svid)
 
     async def update_agent(
         self,

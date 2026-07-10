@@ -28,6 +28,21 @@ class OrgRead(BaseModel):
     created_at: datetime
 
 
+class VerifyIdentityResult(BaseModel):
+    """Result of SPIFFE identity verification for an agent.
+
+    Returned by ``verify_identity()`` and attached to :class:`AgentRead` by the
+    ``create_agent`` auto-verify hook. Mirrors the backend ``VerifySvidResponse``.
+    A successful verification elevates the org to trust tier 2.
+    """
+
+    agent_id: UUID
+    spiffe_id: str
+    trust_domain: str
+    trust_tier: int
+    verified_at: str
+
+
 class AgentRead(BaseModel):
     """Agent details returned by the API."""
 
@@ -43,6 +58,12 @@ class AgentRead(BaseModel):
     verification_words: str | None = None
     warnings: list[str] | None = None
     poll_url: str | None = None
+    # SPIFFE identity-verification outcome — populated client-side (never by the
+    # server) by the ``create_agent`` auto-verify hook or ``verify_identity()``.
+    # A verification FAILURE is captured in ``identity_error`` so it never undoes
+    # agent creation.
+    identity: VerifyIdentityResult | None = None
+    identity_error: str | None = None
 
 
 class WhoAmI(BaseModel):
