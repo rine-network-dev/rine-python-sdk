@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from rine._crypto._key_cache import KeyCache
 from rine._crypto.keys import (
     generate_agent_keys,
     make_kid,
@@ -72,6 +73,9 @@ class TestEncryptMessage:
         )
 
         class MockClient:
+            def __init__(self):
+                self._keys_cache = KeyCache(600.0, 256)
+
             def get(self, path, **kwargs):
                 return {
                     "signing_public_key": signing_public_key_to_jwk(
@@ -112,6 +116,9 @@ class TestEncryptMessage:
 
         # Mock HTTP client that returns sender's public keys
         class MockClient:
+            def __init__(self):
+                self._keys_cache = KeyCache(600.0, 256)
+
             def get(self, path, **kwargs):
                 return {
                     "signing_public_key": signing_public_key_to_jwk(

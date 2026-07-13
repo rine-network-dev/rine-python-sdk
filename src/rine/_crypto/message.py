@@ -95,15 +95,71 @@ class DecryptResult:
         self.verification_status = verification_status
 
 
+def get_agent_keys_sync(
+    client: SyncHttpClient, agent_id: str, *, bypass: bool = False
+) -> tuple[dict[str, Any], bool]:
+    """Fetch an agent's public keys through the client's TTL cache (sync).
+
+    Args:
+        client: HTTP client owning the per-instance key cache.
+        agent_id: Agent UUID.
+        bypass: Skip the cache read (forces a network fetch) but still refresh
+            the cache with the result — used by the verify-failure refetch.
+
+    Returns:
+        A ``(keys, from_cache)`` pair: the raw ``/agents/{id}/keys`` response
+        (signing + encryption keys) and whether it was served from the cache.
+        Callers use ``from_cache`` to gate the verify-failure refetch so a fresh
+        miss is not re-fetched (parity with rine-core ``fetchAgentKeys``).
+    """
+    if not bypass:
+        cached = client._keys_cache.get(agent_id)
+        if cached is not None:
+            return cached, True
+    data: dict[str, Any] = client.get(f"/agents/{agent_id}/keys")
+    client._keys_cache.set(agent_id, data)
+    return data, False
+
+
+async def get_agent_keys_async(
+    client: AsyncHttpClient, agent_id: str, *, bypass: bool = False
+) -> tuple[dict[str, Any], bool]:
+    """Fetch an agent's public keys through the client's TTL cache (async).
+
+    Returns a ``(keys, from_cache)`` pair; see :func:`get_agent_keys_sync`.
+    """
+    if not bypass:
+        cached = client._keys_cache.get(agent_id)
+        if cached is not None:
+            return cached, True
+    data: dict[str, Any] = await client.get(f"/agents/{agent_id}/keys")
+    client._keys_cache.set(agent_id, data)
+    return data, False
+
+
+def _verify_with_keys(keys_resp: dict[str, Any], payload: bytes, signature: bytes) -> bool:
+    """Verify a signature against the signing key in a keys response."""
+    sender_pk = jwk_to_public_key(keys_resp["signing_public_key"], expected_crv="Ed25519")
+    return verify_signature(sender_pk, payload, signature)
+
+
 def _verify_envelope_sender_sync(
     kid: str, payload: bytes, signature: bytes, client: SyncHttpClient
 ) -> tuple[bool, VerificationStatus]:
-    """Verify envelope sender signature synchronously."""
+    """Verify envelope sender signature synchronously.
+
+    If a CACHED key yields a verify failure the sender may have rotated keys
+    mid-TTL, so refetch once bypassing the cache and re-verify before declaring
+    the signature invalid (D-5). A genuinely fresh fetch that fails is not
+    re-fetched (parity with rine-core ``verifyEnvelopeSender``).
+    """
     try:
         agent_id = agent_id_from_kid(kid)
-        keys_resp: Any = client.get(f"/agents/{agent_id}/keys")
-        sender_pk = jwk_to_public_key(keys_resp["signing_public_key"], expected_crv="Ed25519")
-        verified = verify_signature(sender_pk, payload, signature)
+        keys, from_cache = get_agent_keys_sync(client, agent_id)
+        verified = _verify_with_keys(keys, payload, signature)
+        if not verified and from_cache:
+            fresh, _ = get_agent_keys_sync(client, agent_id, bypass=True)
+            verified = _verify_with_keys(fresh, payload, signature)
         return verified, "verified" if verified else "invalid"
     except (KeyError, ValueError, CryptoError):
         logger.debug("Could not verify sender %s (malformed key)", kid, exc_info=True)
@@ -116,12 +172,18 @@ def _verify_envelope_sender_sync(
 async def _verify_envelope_sender_async(
     kid: str, payload: bytes, signature: bytes, client: AsyncHttpClient
 ) -> tuple[bool, VerificationStatus]:
-    """Verify envelope sender signature asynchronously."""
+    """Verify envelope sender signature asynchronously.
+
+    Mirrors :func:`_verify_envelope_sender_sync`, including the cache-gated
+    verify-failure refetch (D-5): only a CACHED key that fails is re-fetched.
+    """
     try:
         agent_id = agent_id_from_kid(kid)
-        keys_resp: Any = await client.get(f"/agents/{agent_id}/keys")
-        sender_pk = jwk_to_public_key(keys_resp["signing_public_key"], expected_crv="Ed25519")
-        verified = verify_signature(sender_pk, payload, signature)
+        keys, from_cache = await get_agent_keys_async(client, agent_id)
+        verified = _verify_with_keys(keys, payload, signature)
+        if not verified and from_cache:
+            fresh, _ = await get_agent_keys_async(client, agent_id, bypass=True)
+            verified = _verify_with_keys(fresh, payload, signature)
         return verified, "verified" if verified else "invalid"
     except (KeyError, ValueError, CryptoError):
         logger.debug("Could not verify sender %s (malformed key)", kid, exc_info=True)
@@ -411,7 +473,7 @@ def fetch_recipient_encryption_key_sync(client: SyncHttpClient, agent_id: str) -
     Returns:
         32-byte X25519 public key.
     """
-    data: Any = client.get(f"/agents/{agent_id}/keys")
+    data, _ = get_agent_keys_sync(client, agent_id)
     return jwk_to_public_key(data["encryption_public_key"], expected_crv="X25519")
 
 
@@ -425,7 +487,7 @@ async def fetch_recipient_encryption_key_async(client: AsyncHttpClient, agent_id
     Returns:
         32-byte X25519 public key.
     """
-    data: Any = await client.get(f"/agents/{agent_id}/keys")
+    data, _ = await get_agent_keys_async(client, agent_id)
     return jwk_to_public_key(data["encryption_public_key"], expected_crv="X25519")
 
 

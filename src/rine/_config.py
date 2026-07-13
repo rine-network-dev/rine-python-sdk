@@ -9,11 +9,9 @@ import json
 import os
 import tempfile
 import time
-from pathlib import Path
 from typing import Any
 
 from rine._constants import DEFAULT_API_URL, TOKEN_REFRESH_MARGIN
-from rine._logging import logger
 from rine._types import CachedToken, CredentialEntry
 from rine.errors import ConfigError
 
@@ -122,9 +120,7 @@ def save_credentials(config_dir: str, credentials: dict[str, CredentialEntry]) -
     _write_atomic(path, json.dumps(credentials, indent=2))
 
 
-def get_credential_entry(
-    config_dir: str, profile: str = "default"
-) -> CredentialEntry | None:
+def get_credential_entry(config_dir: str, profile: str = "default") -> CredentialEntry | None:
     """Get a credential entry, preferring env vars over file.
 
     Priority: ``RINE_CLIENT_ID`` + ``RINE_CLIENT_SECRET`` env vars > profile in file.
@@ -174,9 +170,7 @@ def save_token_cache(config_dir: str, cache: dict[str, CachedToken]) -> None:
     _write_atomic(path, json.dumps(cache, indent=2))
 
 
-def cache_token(
-    config_dir: str, profile: str, token: str, expires_in: int
-) -> None:
+def cache_token(config_dir: str, profile: str, token: str, expires_in: int) -> None:
     """Cache an OAuth token with computed expiration.
 
     Args:
@@ -193,19 +187,24 @@ def cache_token(
     save_token_cache(config_dir, cache)
 
 
-def get_cached_token(config_dir: str, profile: str = "default") -> str | None:
+def get_cached_token(
+    config_dir: str, profile: str = "default", margin: float = TOKEN_REFRESH_MARGIN
+) -> str | None:
     """Get a cached token if it's still valid (with refresh margin).
 
     Args:
         config_dir: Path to config directory.
         profile: Profile name.
+        margin: Seconds before expiry at which the token is considered stale.
+            Defaults to the flat base; callers pass a per-client jittered value
+            so co-located clients desynchronize their refreshes.
 
     Returns:
         Access token string, or ``None`` if expired or missing.
     """
     cache = load_token_cache(config_dir)
     entry = cache.get(profile)
-    if entry and entry["expires_at"] - time.time() > TOKEN_REFRESH_MARGIN:
+    if entry and entry["expires_at"] - time.time() > margin:
         return entry["access_token"]
     return None
 

@@ -17,7 +17,7 @@ from rine._crypto.keys import (
     save_agent_keys,
     signing_public_key_to_jwk,
 )
-from rine._http import _USER_AGENT, SyncHttpClient, _parse_error_detail
+from rine._http import _USER_AGENT, SyncHttpClient, _parse_error_detail, _parse_retry_after
 from rine._logging import logger
 from rine._timelock import solve_timelock
 from rine._verify import apply_identity_verification
@@ -47,8 +47,7 @@ def _raise_registration_error(resp: object) -> None:
     """
     detail = _parse_error_detail(resp)  # type: ignore[arg-type]
     if resp.status_code == 429:  # type: ignore[union-attr]
-        retry_after = resp.headers.get("Retry-After")  # type: ignore[union-attr]
-        retry_val = float(retry_after) if retry_after else None
+        retry_val = _parse_retry_after(resp)  # type: ignore[arg-type]
         raise RateLimitError(detail=detail, retry_after=retry_val, raw=resp.text)  # type: ignore[union-attr]
     raise_for_status(resp.status_code, detail, raw=resp.text)  # type: ignore[union-attr]
 

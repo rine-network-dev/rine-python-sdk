@@ -5,7 +5,7 @@ from __future__ import annotations
 import json as _json
 import random
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
 import httpx
@@ -16,7 +16,18 @@ from rine._config import (
     get_credential_entry,
     resolve_api_url,
 )
-from rine._constants import DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT, RETRYABLE_STATUS_CODES
+from rine._constants import (
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_TIMEOUT,
+    KEY_CACHE_MAX_ENTRIES,
+    KEY_CACHE_TTL,
+    RETRYABLE_STATUS_CODES,
+    TOKEN_REFRESH_JITTER,
+    TOKEN_REFRESH_MARGIN,
+    TOKEN_RETRY_ATTEMPTS,
+    TOKEN_RETRY_TOTAL_CAP,
+)
+from rine._crypto._key_cache import KeyCache
 from rine._logging import logger
 from rine._version import __version__
 from rine.errors import (
@@ -24,16 +35,18 @@ from rine.errors import (
     APITimeoutError,
     AuthenticationError,
     RateLimitError,
-    RineApiError,
     raise_for_status,
 )
 
 _USER_AGENT = f"rine-python/{__version__}"
+_TOKEN_BACKOFF_BASE = 0.5
+_TOKEN_BACKOFF_CAP = 8.0
+_TOKEN_FORM_HEADERS = {"Content-Type": "application/x-www-form-urlencoded"}
 
 
 def _backoff_delay(attempt: int, base: float = 0.5, max_delay: float = 8.0) -> float:
     """Exponential backoff with jitter."""
-    delay = min(base * (2 ** attempt), max_delay)
+    delay = min(base * (2**attempt), max_delay)
     return delay * (0.5 + random.random() * 0.5)  # noqa: S311
 
 
@@ -52,6 +65,92 @@ def _parse_error_detail(response: httpx.Response) -> str:
         return text
 
 
+def _parse_retry_after(response: httpx.Response) -> float | None:
+    """Parse the ``Retry-After`` header into seconds, or ``None`` if absent."""
+    retry_after = response.headers.get("Retry-After")
+    return float(retry_after) if retry_after else None
+
+
+def _token_retry_delay(attempt: int, retry_after: float | None, rng: Callable[[], float]) -> float:
+    """Delay before the next token retry: honor ``Retry-After``, else full jitter.
+
+    Full jitter draws uniformly from ``[0, min(cap, base * 2**attempt))`` so
+    co-located clients that all trip a 429 do not retry in lockstep.
+
+    Args:
+        attempt: Zero-based retry attempt index.
+        retry_after: Server-advised wait in seconds, or ``None``.
+        rng: Uniform ``[0, 1)`` source (injectable for deterministic tests).
+
+    Returns:
+        Seconds to wait before the next attempt.
+    """
+    if retry_after is not None:
+        return retry_after
+    ceiling = min(_TOKEN_BACKOFF_CAP, _TOKEN_BACKOFF_BASE * float(2**attempt))
+    return ceiling * rng()
+
+
+def _token_backoff(
+    resp: httpx.Response, attempt: int, slept: float, rng: Callable[[], float]
+) -> float | None:
+    """Compute the sleep before retrying a token 429, or ``None`` to fail now.
+
+    Returns ``None`` when the response is not a retryable 429, no attempts
+    remain, or the cumulative-sleep budget (``TOKEN_RETRY_TOTAL_CAP``) is spent.
+
+    Args:
+        resp: The failed token response.
+        attempt: Zero-based attempt index just completed.
+        slept: Seconds already slept across prior retries.
+        rng: Uniform ``[0, 1)`` source.
+
+    Returns:
+        Seconds to sleep, or ``None`` to fail fast.
+    """
+    if resp.status_code != 429 or attempt >= TOKEN_RETRY_ATTEMPTS - 1:
+        return None
+    remaining = TOKEN_RETRY_TOTAL_CAP - slept
+    if remaining <= 0:
+        return None
+    return min(_token_retry_delay(attempt, _parse_retry_after(resp), rng), remaining)
+
+
+def _jittered_margin(rng: Callable[[], float]) -> float:
+    """Draw a per-client token-refresh margin: base + uniform(0, jitter) seconds.
+
+    Drawn once per client so a single client stays stable around the expiry
+    boundary while co-located clients desynchronize (D-4).
+
+    Args:
+        rng: Uniform ``[0, 1)`` source.
+
+    Returns:
+        Effective refresh margin in seconds.
+    """
+    return TOKEN_REFRESH_MARGIN + rng() * TOKEN_REFRESH_JITTER
+
+
+def _token_form(client_id: str, client_secret: str) -> dict[str, str]:
+    """Build the ``client_credentials`` grant form body."""
+    return {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+
+
+def _token_result(resp: httpx.Response) -> tuple[str, int]:
+    """Parse a successful token response into ``(access_token, expires_in)``."""
+    body = resp.json()
+    return body["access_token"], body.get("expires_in", 900)
+
+
+def _token_error(resp: httpx.Response) -> AuthenticationError:
+    """Build the hard-failure error for a non-success token response."""
+    return AuthenticationError(detail=f"Token fetch failed: {_parse_error_detail(resp)}")
+
+
 def _check_response(response: httpx.Response) -> Any:
     """Check response and raise appropriate error or return parsed body."""
     if response.status_code == 204:
@@ -65,55 +164,77 @@ def _check_response(response: httpx.Response) -> Any:
     detail = _parse_error_detail(response)
 
     if response.status_code == 429:
-        retry_after = response.headers.get("Retry-After")
-        retry_val = float(retry_after) if retry_after else None
-        raise RateLimitError(detail=detail, retry_after=retry_val, raw=response.text)
+        raise RateLimitError(
+            detail=detail, retry_after=_parse_retry_after(response), raw=response.text
+        )
 
     raise_for_status(response.status_code, detail, raw=response.text)
 
 
 def _fetch_oauth_token(
-    http: httpx.Client, api_url: str, client_id: str, client_secret: str
+    http: httpx.Client,
+    api_url: str,
+    client_id: str,
+    client_secret: str,
+    *,
+    rng: Callable[[], float] = random.random,
 ) -> tuple[str, int]:
     """Fetch an OAuth2 token via client_credentials grant.
+
+    On a ``429`` the POST is retried up to ``TOKEN_RETRY_ATTEMPTS`` times,
+    honoring ``Retry-After`` (else exponential backoff with full jitter) and
+    capping cumulative sleep at ``TOKEN_RETRY_TOTAL_CAP`` seconds. Non-429
+    failures fail fast.
+
+    Args:
+        http: HTTP client.
+        api_url: API base URL.
+        client_id: OAuth client id.
+        client_secret: OAuth client secret.
+        rng: Uniform ``[0, 1)`` jitter source (injectable for tests).
 
     Returns:
         Tuple of (access_token, expires_in).
     """
-    resp = http.post(
-        f"{api_url}/oauth/token",
-        data={
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    if not resp.is_success:
-        detail = _parse_error_detail(resp)
-        raise AuthenticationError(detail=f"Token fetch failed: {detail}")
-    body = resp.json()
-    return body["access_token"], body.get("expires_in", 900)
+    form = _token_form(client_id, client_secret)
+    slept = 0.0
+    for attempt in range(TOKEN_RETRY_ATTEMPTS):
+        resp = http.post(f"{api_url}/oauth/token", data=form, headers=_TOKEN_FORM_HEADERS)
+        if resp.is_success:
+            return _token_result(resp)
+        delay = _token_backoff(resp, attempt, slept, rng)
+        if delay is None:
+            raise _token_error(resp)
+        logger.warning("429 on token fetch, retrying in %.1fs", delay)
+        time.sleep(delay)
+        slept += delay
+    raise AuthenticationError(detail="Token fetch failed: retries exhausted")
 
 
 async def _fetch_oauth_token_async(
-    http: httpx.AsyncClient, api_url: str, client_id: str, client_secret: str
+    http: httpx.AsyncClient,
+    api_url: str,
+    client_id: str,
+    client_secret: str,
+    *,
+    rng: Callable[[], float] = random.random,
 ) -> tuple[str, int]:
-    """Async version of OAuth2 token fetch."""
-    resp = await http.post(
-        f"{api_url}/oauth/token",
-        data={
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    if not resp.is_success:
-        detail = _parse_error_detail(resp)
-        raise AuthenticationError(detail=f"Token fetch failed: {detail}")
-    body = resp.json()
-    return body["access_token"], body.get("expires_in", 900)
+    """Async version of :func:`_fetch_oauth_token` (same D-3 retry semantics)."""
+    import asyncio
+
+    form = _token_form(client_id, client_secret)
+    slept = 0.0
+    for attempt in range(TOKEN_RETRY_ATTEMPTS):
+        resp = await http.post(f"{api_url}/oauth/token", data=form, headers=_TOKEN_FORM_HEADERS)
+        if resp.is_success:
+            return _token_result(resp)
+        delay = _token_backoff(resp, attempt, slept, rng)
+        if delay is None:
+            raise _token_error(resp)
+        logger.warning("429 on token fetch, retrying in %.1fs", delay)
+        await asyncio.sleep(delay)
+        slept += delay
+    raise AuthenticationError(detail="Token fetch failed: retries exhausted")
 
 
 class SyncHttpClient:
@@ -126,6 +247,8 @@ class SyncHttpClient:
         timeout: Request timeout in seconds.
         max_retries: Max retry attempts for rate limiting.
         http_client: Optional custom ``httpx.Client``.
+        rng: Uniform ``[0, 1)`` source for the per-instance refresh-margin jitter
+            and token-retry backoff (injectable for deterministic tests).
     """
 
     def __init__(
@@ -136,6 +259,7 @@ class SyncHttpClient:
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
         http_client: httpx.Client | None = None,
+        rng: Callable[[], float] = random.random,
     ) -> None:
         self._config_dir = config_dir
         self._api_url = api_url or resolve_api_url()
@@ -146,6 +270,9 @@ class SyncHttpClient:
         self._http = http_client or httpx.Client(timeout=timeout)
         self._profile = "default"
         self._cached_token: str | None = None
+        self._rng = rng
+        self._refresh_margin = _jittered_margin(rng)
+        self._keys_cache = KeyCache(KEY_CACHE_TTL, KEY_CACHE_MAX_ENTRIES)
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -157,19 +284,21 @@ class SyncHttpClient:
         if not force and self._cached_token:
             return self._cached_token
         if not force:
-            cached = get_cached_token(self._config_dir, self._profile)
+            cached = get_cached_token(self._config_dir, self._profile, self._refresh_margin)
             if cached:
                 self._cached_token = cached
                 return cached
 
         entry = get_credential_entry(self._config_dir, self._profile)
         if not entry:
-            raise AuthenticationError(
-                "No credentials found. Run: rine onboard"
-            )
+            raise AuthenticationError("No credentials found. Run: rine onboard")
 
         token, expires_in = _fetch_oauth_token(
-            self._http, self._api_url, entry["client_id"], entry["client_secret"]
+            self._http,
+            self._api_url,
+            entry["client_id"],
+            entry["client_secret"],
+            rng=self._rng,
         )
         try:
             cache_token(self._config_dir, self._profile, token, expires_in)
@@ -235,11 +364,17 @@ class SyncHttpClient:
         for attempt in range(max_attempts):
             try:
                 resp = self._http.request(
-                    method, url, params=params, json=json_body, headers=headers,
+                    method,
+                    url,
+                    params=params,
+                    json=json_body,
+                    headers=headers,
                 )
                 logger.debug(
                     "%s %s → %d (%.0fms)",
-                    method, path, resp.status_code,
+                    method,
+                    path,
+                    resp.status_code,
                     (time.monotonic() - start) * 1000,
                 )
             except httpx.TimeoutException as exc:
@@ -252,7 +387,9 @@ class SyncHttpClient:
             except httpx.ConnectError as exc:
                 if attempt < self._max_retries:
                     delay = _backoff_delay(attempt)
-                    logger.warning("Connect error on %s %s, retrying in %.1fs", method, path, delay)
+                    logger.warning(
+                        "Connect error on %s %s, retrying in %.1fs", method, path, delay
+                    )
                     time.sleep(delay)
                     continue
                 raise APIConnectionError(f"Connection failed: {method} {path}") from exc
@@ -273,7 +410,9 @@ class SyncHttpClient:
                     time.sleep(retry_after)
                 else:
                     delay = _backoff_delay(attempt)
-                    logger.warning("%d on %s %s, retrying in %.1fs", resp.status_code, method, path, delay)
+                    logger.warning(
+                        "%d on %s %s, retrying in %.1fs", resp.status_code, method, path, delay
+                    )
                     time.sleep(delay)
                 continue
 
@@ -349,11 +488,11 @@ class SyncHttpClient:
                 if not resp.is_success:
                     resp.read()
                     if resp.status_code == 429:
-                        retry_after = resp.headers.get("Retry-After")
-                        retry_val = float(retry_after) if retry_after else None
                         detail = _parse_error_detail(resp)
                         raise RateLimitError(
-                            detail=detail, retry_after=retry_val, raw=resp.text,
+                            detail=detail,
+                            retry_after=_parse_retry_after(resp),
+                            raw=resp.text,
                         )
                     detail = _parse_error_detail(resp)
                     raise_for_status(resp.status_code, detail, raw=resp.text)
@@ -417,6 +556,8 @@ class AsyncHttpClient:
         timeout: Request timeout in seconds.
         max_retries: Max retry attempts for rate limiting.
         http_client: Optional custom ``httpx.AsyncClient``.
+        rng: Uniform ``[0, 1)`` source for the per-instance refresh-margin jitter
+            and token-retry backoff (injectable for deterministic tests).
     """
 
     def __init__(
@@ -427,6 +568,7 @@ class AsyncHttpClient:
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
         http_client: httpx.AsyncClient | None = None,
+        rng: Callable[[], float] = random.random,
     ) -> None:
         self._config_dir = config_dir
         self._api_url = api_url or resolve_api_url()
@@ -437,6 +579,9 @@ class AsyncHttpClient:
         self._http = http_client or httpx.AsyncClient(timeout=timeout)
         self._profile = "default"
         self._cached_token: str | None = None
+        self._rng = rng
+        self._refresh_margin = _jittered_margin(rng)
+        self._keys_cache = KeyCache(KEY_CACHE_TTL, KEY_CACHE_MAX_ENTRIES)
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -448,19 +593,21 @@ class AsyncHttpClient:
         if not force and self._cached_token:
             return self._cached_token
         if not force:
-            cached = get_cached_token(self._config_dir, self._profile)
+            cached = get_cached_token(self._config_dir, self._profile, self._refresh_margin)
             if cached:
                 self._cached_token = cached
                 return cached
 
         entry = get_credential_entry(self._config_dir, self._profile)
         if not entry:
-            raise AuthenticationError(
-                "No credentials found. Run: rine onboard"
-            )
+            raise AuthenticationError("No credentials found. Run: rine onboard")
 
         token, expires_in = await _fetch_oauth_token_async(
-            self._http, self._api_url, entry["client_id"], entry["client_secret"]
+            self._http,
+            self._api_url,
+            entry["client_id"],
+            entry["client_secret"],
+            rng=self._rng,
         )
         try:
             cache_token(self._config_dir, self._profile, token, expires_in)
@@ -527,11 +674,17 @@ class AsyncHttpClient:
         for attempt in range(max_attempts):
             try:
                 resp = await self._http.request(
-                    method, url, params=params, json=json_body, headers=headers,
+                    method,
+                    url,
+                    params=params,
+                    json=json_body,
+                    headers=headers,
                 )
                 logger.debug(
                     "%s %s → %d (%.0fms)",
-                    method, path, resp.status_code,
+                    method,
+                    path,
+                    resp.status_code,
                     (time.monotonic() - start) * 1000,
                 )
             except httpx.TimeoutException as exc:
@@ -544,7 +697,9 @@ class AsyncHttpClient:
             except httpx.ConnectError as exc:
                 if attempt < self._max_retries:
                     delay = _backoff_delay(attempt)
-                    logger.warning("Connect error on %s %s, retrying in %.1fs", method, path, delay)
+                    logger.warning(
+                        "Connect error on %s %s, retrying in %.1fs", method, path, delay
+                    )
                     await asyncio.sleep(delay)
                     continue
                 raise APIConnectionError(f"Connection failed: {method} {path}") from exc
@@ -565,7 +720,9 @@ class AsyncHttpClient:
                     await asyncio.sleep(retry_after)
                 else:
                     delay = _backoff_delay(attempt)
-                    logger.warning("%d on %s %s, retrying in %.1fs", resp.status_code, method, path, delay)
+                    logger.warning(
+                        "%d on %s %s, retrying in %.1fs", resp.status_code, method, path, delay
+                    )
                     await asyncio.sleep(delay)
                 continue
 
@@ -642,11 +799,11 @@ class AsyncHttpClient:
                 if not resp.is_success:
                     await resp.aread()
                     if resp.status_code == 429:
-                        retry_after = resp.headers.get("Retry-After")
-                        retry_val = float(retry_after) if retry_after else None
                         detail = _parse_error_detail(resp)
                         raise RateLimitError(
-                            detail=detail, retry_after=retry_val, raw=resp.text,
+                            detail=detail,
+                            retry_after=_parse_retry_after(resp),
+                            raw=resp.text,
                         )
                     detail = _parse_error_detail(resp)
                     raise_for_status(resp.status_code, detail, raw=resp.text)

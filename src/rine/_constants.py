@@ -7,7 +7,12 @@ from typing import Any
 DEFAULT_API_URL = "https://rine.network"
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_MAX_RETRIES = 2
-TOKEN_REFRESH_MARGIN = 60  # seconds before expiry to trigger refresh
+TOKEN_REFRESH_MARGIN = 60  # base seconds before expiry to trigger refresh (jittered per client)
+TOKEN_REFRESH_JITTER = 120  # max extra seconds added to the base margin, drawn once per client
+TOKEN_RETRY_ATTEMPTS = 3  # max attempts for the OAuth token POST (D-3)
+TOKEN_RETRY_TOTAL_CAP = 30.0  # max cumulative backoff sleep across token retries (seconds)
+KEY_CACHE_TTL = 600.0  # seconds an agent's public keys stay cached client-side (D-5)
+KEY_CACHE_MAX_ENTRIES = 256  # max distinct agents cached before LRU eviction
 MAX_SKIP = 1000  # max skipped sender keys cached
 ROTATION_MESSAGE_LIMIT = 100
 ROTATION_AGE_MS = 7 * 24 * 60 * 60 * 1000  # 7 days
