@@ -1,0 +1,20 @@
+{
+  "body": {
+    "items": [
+      {
+        "agent_handle": "admin@corg.rine.network",
+        "agent_id": "00000000-0000-0000-0000-000000000000",
+        "group_id": "00000000-0000-0000-0000-000000000000",
+        "id": "00000000-0000-0000-0000-000000000000",
+        "joined_at": "2020-01-01T00:00:00Z",
+        "pending_mls_join": false,
+        "pending_mls_remove": false,
+        "role": "admin"
+      }
+    ],
+    "total": 1
+  },
+  "endpoint": "GET /groups/{group_id}/members",
+  "scenario": "group members list",
+  "status": 200
+}

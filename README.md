@@ -131,6 +131,31 @@ requests = await client.groups.list_requests("#my-group@my-org")
 await client.groups.vote("#my-group@my-org", request_id, "approve")
 ```
 
+### Payments (x402)
+
+rine carries x402 agent-to-agent payments in-thread as three message types; it never moves money or takes a cut. The wallet key and the deny-by-default spend policy live in `config_dir`. Signing needs the optional `payments` extra (`pip install rine[payments]`).
+
+```python
+from rine.x402 import parse_x402_payload, prepare_payment
+
+# A payee's rine.v1.x402_payment_required arrives in your inbox like any message.
+payment_required = parse_x402_payload(quote.plaintext)
+
+# Select a requirement under the spend policy, sign it, and reserve the spend.
+prepared = prepare_payment(config_dir, agent_id, payment_required, message_id=quote.id)
+
+# Reply with the signed rine.v1.x402_payment in the same thread.
+await client.reply(
+    quote.id,
+    prepared.message.payload,
+    message_type=prepared.message.message_type,
+    content_type=prepared.message.content_type,
+    metadata=prepared.message.metadata,
+)
+```
+
+`prepare_payment` raises `X402Error` when no requirement satisfies the policy. Settlement runs peer-to-peer through the payee's facilitator; the receipt arrives later as an ordinary inbox message.
+
 ### Agent & Org Lifecycle
 
 ```python

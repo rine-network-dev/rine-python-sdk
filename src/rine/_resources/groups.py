@@ -14,8 +14,10 @@ from rine.types import (
     GroupMember,
     GroupRead,
     InviteResult,
+    JoinedResult,
     JoinRequestRead,
     JoinResult,
+    PendingJoinResult,
     VoteResponse,
 )
 
@@ -80,17 +82,23 @@ class SyncGroups:
             agent: Agent to act as.
 
         Returns:
-            JoinResult with status.
+            A ``JoinedResult`` (immediate join, server 200) or a
+            ``PendingJoinResult`` (vote required, server 202), discriminated on
+            ``.status``.
         """
         group_id = self._client._resolve_group_sync(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         body: dict[str, Any] = {}
         if message:
             body["message"] = message
-        data = self._client._http.post(
+        status, data = self._client._http.post_with_status(
             f"/groups/{group_id}/join", json_body=body, extra_headers=extra
         )
-        return JoinResult.model_validate(data)
+        if status == 202:
+            return PendingJoinResult(
+                status="pending", request=JoinRequestRead.model_validate(data)
+            )
+        return JoinedResult(status="joined", member=GroupMember.model_validate(data))
 
     def members(self, handle_or_id: str, *, agent: str | None = None) -> list[GroupMember]:
         """List group members.
@@ -139,7 +147,9 @@ class SyncGroups:
             f"/groups/{group_id}/invite", json_body=body, extra_headers=extra
         )
         self._notify_invitee(group_id, invitee_id, message, agent)
-        return InviteResult.model_validate(data)
+        # The voucher path returns a JoinRequestRead (id in ``id``); the open-group
+        # path returns only ``status``/``group_id``/``agent_id`` (no id).
+        return InviteResult(status=data["status"], request_id=data.get("id"))
 
     def _notify_invitee(
         self, group_id: str, invitee_id: str, message: str | None, agent: str | None
@@ -370,17 +380,23 @@ class AsyncGroups:
             agent: Agent to act as.
 
         Returns:
-            JoinResult with status.
+            A ``JoinedResult`` (immediate join, server 200) or a
+            ``PendingJoinResult`` (vote required, server 202), discriminated on
+            ``.status``.
         """
         group_id = await self._client._resolve_group_async(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         body: dict[str, Any] = {}
         if message:
             body["message"] = message
-        data = await self._client._http.post(
+        status, data = await self._client._http.post_with_status(
             f"/groups/{group_id}/join", json_body=body, extra_headers=extra
         )
-        return JoinResult.model_validate(data)
+        if status == 202:
+            return PendingJoinResult(
+                status="pending", request=JoinRequestRead.model_validate(data)
+            )
+        return JoinedResult(status="joined", member=GroupMember.model_validate(data))
 
     async def members(self, handle_or_id: str, *, agent: str | None = None) -> list[GroupMember]:
         """List group members.
@@ -429,7 +445,9 @@ class AsyncGroups:
             f"/groups/{group_id}/invite", json_body=body, extra_headers=extra
         )
         await self._notify_invitee(group_id, invitee_id, message, agent)
-        return InviteResult.model_validate(data)
+        # The voucher path returns a JoinRequestRead (id in ``id``); the open-group
+        # path returns only ``status``/``group_id``/``agent_id`` (no id).
+        return InviteResult(status=data["status"], request_id=data.get("id"))
 
     async def _notify_invitee(
         self, group_id: str, invitee_id: str, message: str | None, agent: str | None

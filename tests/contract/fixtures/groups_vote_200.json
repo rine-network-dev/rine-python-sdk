@@ -1,0 +1,10 @@
+{
+  "body": {
+    "request_id": "00000000-0000-0000-0000-000000000000",
+    "status": "approved",
+    "your_vote": "approve"
+  },
+  "endpoint": "POST /groups/{group_id}/requests/{req_id}/vote",
+  "scenario": "cast approve vote",
+  "status": 200
+}

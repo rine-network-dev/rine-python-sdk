@@ -13,8 +13,14 @@ from rine._crypto.keys import (
     generate_agent_keys,
     save_agent_keys,
 )
-from rine.errors import NotFoundError
-from rine.types import GroupRead, JoinRequestRead, JoinResult
+from rine.errors import AuthorizationError, ConflictError, NotFoundError
+from rine.types import (
+    GroupRead,
+    InviteResult,
+    JoinedResult,
+    JoinRequestRead,
+    PendingJoinResult,
+)
 
 AGENT_ID = "00000000-1111-2222-3333-444444444444"
 GROUP_ID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
@@ -89,6 +95,57 @@ _INVITE_PAYLOAD = {
     "created_at": "2024-01-01T00:00:00Z",
     "group_handle": "#test-group@myorg.rine.network",
     "group_name": "test-group",
+}
+
+# Server response shapes copied field-for-field from src/rine/api/group_schemas.py.
+
+# GroupMemberRead — POST /groups/{id}/join returns this (200) on an immediate join.
+_MEMBER_PAYLOAD = {
+    "id": MEMBER_ID,
+    "group_id": GROUP_ID,
+    "agent_id": AGENT_ID,
+    "role": "member",
+    "joined_at": "2024-01-01T00:00:00Z",
+    "agent_handle": "test-agent@myorg.rine.network",
+    "pending_mls_join": False,
+    "pending_mls_remove": False,
+}
+
+# JoinRequestRead (status "pending") — POST /groups/{id}/join returns this (202)
+# when a vote is required. The id field is ``id``, never ``request_id``.
+_PENDING_REQUEST_PAYLOAD = {
+    "id": REQUEST_ID,
+    "group_id": GROUP_ID,
+    "agent_id": AGENT_ID,
+    "invited_by": None,
+    "message": "please let me in",
+    "status": "pending",
+    "expires_at": "2024-01-08T00:00:00Z",
+    "created_at": "2024-01-01T00:00:00Z",
+    "resolved_at": None,
+    "your_vote": None,
+}
+
+# JoinRequestRead (status "invited") — POST /groups/{id}/invite voucher (201) for
+# closed/majority/unanimity groups.
+_VOUCHER_PAYLOAD = {
+    "id": REQUEST_ID,
+    "group_id": GROUP_ID,
+    "agent_id": OTHER_AGENT_ID,
+    "invited_by": AGENT_ID,
+    "message": "join us",
+    "status": "invited",
+    "expires_at": None,
+    "created_at": "2024-01-01T00:00:00Z",
+    "resolved_at": None,
+    "your_vote": None,
+}
+
+# POST /groups/{id}/invite for an OPEN group (201) — no request id.
+_OPEN_INVITE_PAYLOAD = {
+    "status": "invited",
+    "group_id": GROUP_ID,
+    "agent_id": OTHER_AGENT_ID,
 }
 
 
@@ -190,17 +247,46 @@ class TestSyncGroupsList:
 
 class TestSyncGroupsJoin:
     @respx.mock
-    def test_join_by_uuid_posts_to_correct_endpoint(self, sync_client):
+    def test_open_policy_join_returns_joined(self, sync_client):
+        """An open-policy join is a 200 + GroupMemberRead — the caller is a member."""
         _mock_token()
         route = respx.post(f"https://rine.network/groups/{GROUP_ID}/join").mock(
-            return_value=httpx.Response(200, json={"status": "joined", "group": _GROUP_PAYLOAD})
+            return_value=httpx.Response(200, json=_MEMBER_PAYLOAD)
         )
 
         result = sync_client.groups.join(GROUP_ID)
 
-        assert isinstance(result, JoinResult)
+        assert isinstance(result, JoinedResult)
         assert result.status == "joined"
+        assert str(result.member.agent_id) == AGENT_ID
         assert route.called
+
+    @respx.mock
+    def test_voucher_join_returns_joined(self, sync_client):
+        """A voucher/invite-matched join is also a 200 + GroupMemberRead."""
+        _mock_token()
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/join").mock(
+            return_value=httpx.Response(200, json=_MEMBER_PAYLOAD)
+        )
+
+        result = sync_client.groups.join(GROUP_ID)
+
+        assert isinstance(result, JoinedResult)
+        assert result.status == "joined"
+
+    @respx.mock
+    def test_vote_required_join_returns_pending(self, sync_client):
+        """A vote-gated join is a 202 + JoinRequestRead — a pending request."""
+        _mock_token()
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/join").mock(
+            return_value=httpx.Response(202, json=_PENDING_REQUEST_PAYLOAD)
+        )
+
+        result = sync_client.groups.join(GROUP_ID)
+
+        assert isinstance(result, PendingJoinResult)
+        assert result.status == "pending"
+        assert str(result.request.id) == REQUEST_ID
 
     @respx.mock
     def test_join_by_handle_resolves_first(self, sync_client):
@@ -210,13 +296,33 @@ class TestSyncGroupsJoin:
             return_value=httpx.Response(200, json={"items": [_GROUP_PAYLOAD]})
         )
         respx.post(f"https://rine.network/groups/{GROUP_ID}/join").mock(
-            return_value=httpx.Response(200, json={"status": "pending"})
+            return_value=httpx.Response(200, json=_MEMBER_PAYLOAD)
         )
 
         result = sync_client.groups.join("#test-group@myorg.rine.network")
 
-        assert isinstance(result, JoinResult)
-        assert result.status == "pending"
+        assert isinstance(result, JoinedResult)
+        assert result.status == "joined"
+
+    @respx.mock
+    def test_join_closed_no_invite_raises_403(self, sync_client):
+        _mock_token()
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/join").mock(
+            return_value=httpx.Response(403, json={"detail": "closed group"})
+        )
+
+        with pytest.raises(AuthorizationError):
+            sync_client.groups.join(GROUP_ID)
+
+    @respx.mock
+    def test_join_duplicate_member_raises_409(self, sync_client):
+        _mock_token()
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/join").mock(
+            return_value=httpx.Response(409, json={"detail": "already a member"})
+        )
+
+        with pytest.raises(ConflictError):
+            sync_client.groups.join(GROUP_ID)
 
     @respx.mock
     def test_join_raises_not_found_on_unknown_handle(self, sync_client):
@@ -227,6 +333,23 @@ class TestSyncGroupsJoin:
 
         with pytest.raises(NotFoundError):
             sync_client.groups.join("nonexistent-group")
+
+
+class TestSyncGroupsMembers:
+    @respx.mock
+    def test_members_surface_mls_pending_flags(self, sync_client):
+        """A GroupMemberRead's ``pending_mls_join``/``_remove`` flags round-trip."""
+        _mock_token()
+        payload = {**_MEMBER_PAYLOAD, "pending_mls_join": True, "pending_mls_remove": False}
+        respx.get(f"https://rine.network/groups/{GROUP_ID}/members").mock(
+            return_value=httpx.Response(200, json={"items": [payload]})
+        )
+
+        members = sync_client.groups.members(GROUP_ID)
+
+        assert len(members) == 1
+        assert members[0].pending_mls_join is True
+        assert members[0].pending_mls_remove is False
 
 
 class TestAsyncGroupsCreate:
@@ -312,25 +435,72 @@ class TestAsyncGroupsList:
 
 class TestAsyncGroupsJoin:
     @respx.mock
-    async def test_join_by_uuid(self, async_client):
-        respx.post("https://rine.network/oauth/token").mock(
-            return_value=httpx.Response(200, json=_TOKEN_RESPONSE)
-        )
-        respx.post(f"https://rine.network/groups/{GROUP_ID}/join").mock(
-            return_value=httpx.Response(200, json={"status": "joined", "group": _GROUP_PAYLOAD})
+    async def test_open_policy_join_returns_joined(self, async_client):
+        _mock_token()
+        route = respx.post(f"https://rine.network/groups/{GROUP_ID}/join").mock(
+            return_value=httpx.Response(200, json=_MEMBER_PAYLOAD)
         )
 
         result = await async_client.groups.join(GROUP_ID)
 
-        assert isinstance(result, JoinResult)
+        assert isinstance(result, JoinedResult)
+        assert result.status == "joined"
+        assert str(result.member.agent_id) == AGENT_ID
+        assert route.called
+        await async_client.close()
+
+    @respx.mock
+    async def test_voucher_join_returns_joined(self, async_client):
+        _mock_token()
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/join").mock(
+            return_value=httpx.Response(200, json=_MEMBER_PAYLOAD)
+        )
+
+        result = await async_client.groups.join(GROUP_ID)
+
+        assert isinstance(result, JoinedResult)
         assert result.status == "joined"
         await async_client.close()
 
     @respx.mock
-    async def test_join_raises_not_found_on_unknown_handle(self, async_client):
-        respx.post("https://rine.network/oauth/token").mock(
-            return_value=httpx.Response(200, json=_TOKEN_RESPONSE)
+    async def test_vote_required_join_returns_pending(self, async_client):
+        _mock_token()
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/join").mock(
+            return_value=httpx.Response(202, json=_PENDING_REQUEST_PAYLOAD)
         )
+
+        result = await async_client.groups.join(GROUP_ID)
+
+        assert isinstance(result, PendingJoinResult)
+        assert result.status == "pending"
+        assert str(result.request.id) == REQUEST_ID
+        await async_client.close()
+
+    @respx.mock
+    async def test_join_closed_no_invite_raises_403(self, async_client):
+        _mock_token()
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/join").mock(
+            return_value=httpx.Response(403, json={"detail": "closed group"})
+        )
+
+        with pytest.raises(AuthorizationError):
+            await async_client.groups.join(GROUP_ID)
+        await async_client.close()
+
+    @respx.mock
+    async def test_join_duplicate_member_raises_409(self, async_client):
+        _mock_token()
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/join").mock(
+            return_value=httpx.Response(409, json={"detail": "already a member"})
+        )
+
+        with pytest.raises(ConflictError):
+            await async_client.groups.join(GROUP_ID)
+        await async_client.close()
+
+    @respx.mock
+    async def test_join_raises_not_found_on_unknown_handle(self, async_client):
+        _mock_token()
         respx.get("https://rine.network/groups").mock(
             return_value=httpx.Response(200, json={"items": []})
         )
@@ -353,7 +523,7 @@ class TestSyncGroupsBareNameResolve:
         _mock_token()
         _mock_groups_serverlike()
         invite = respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
-            return_value=httpx.Response(200, json={"status": "invited"})
+            return_value=httpx.Response(201, json=_OPEN_INVITE_PAYLOAD)
         )
 
         result = sync_client.groups.invite("test-group", OTHER_AGENT_ID)
@@ -368,7 +538,7 @@ class TestSyncGroupsBareNameResolve:
             return_value=httpx.Response(200, json={"items": [_GROUP_PAYLOAD]})
         )
         invite = respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
-            return_value=httpx.Response(200, json={"status": "invited"})
+            return_value=httpx.Response(201, json=_OPEN_INVITE_PAYLOAD)
         )
 
         sync_client.groups.invite("#test-group@myorg.rine.network", OTHER_AGENT_ID)
@@ -386,7 +556,7 @@ class TestSyncGroupsBareNameResolve:
             return_value=httpx.Response(200, json={"items": [_GROUP_PAYLOAD]})
         )
         invite = respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
-            return_value=httpx.Response(200, json={"status": "invited"})
+            return_value=httpx.Response(201, json=_OPEN_INVITE_PAYLOAD)
         )
 
         sync_client.groups.invite(GROUP_ID, OTHER_AGENT_ID)
@@ -423,7 +593,7 @@ class TestAsyncGroupsBareNameResolve:
         _mock_token()
         _mock_groups_serverlike()
         invite = respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
-            return_value=httpx.Response(200, json={"status": "invited"})
+            return_value=httpx.Response(201, json=_OPEN_INVITE_PAYLOAD)
         )
 
         result = await async_client.groups.invite("test-group", OTHER_AGENT_ID)
@@ -439,7 +609,7 @@ class TestAsyncGroupsBareNameResolve:
             return_value=httpx.Response(200, json={"items": [_GROUP_PAYLOAD]})
         )
         invite = respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
-            return_value=httpx.Response(200, json={"status": "invited"})
+            return_value=httpx.Response(201, json=_OPEN_INVITE_PAYLOAD)
         )
 
         await async_client.groups.invite("#test-group@myorg.rine.network", OTHER_AGENT_ID)
@@ -457,7 +627,7 @@ class TestAsyncGroupsBareNameResolve:
             return_value=httpx.Response(200, json={"items": [_GROUP_PAYLOAD]})
         )
         invite = respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
-            return_value=httpx.Response(200, json={"status": "invited"})
+            return_value=httpx.Response(201, json=_OPEN_INVITE_PAYLOAD)
         )
 
         await async_client.groups.invite(GROUP_ID, OTHER_AGENT_ID)
@@ -578,7 +748,7 @@ class TestSyncGroupsInviteNotification:
         _mock_agents()
         _mock_invitee_keys(tmp_config_dir)
         respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
-            return_value=httpx.Response(200, json={"status": "invited"})
+            return_value=httpx.Response(201, json=_OPEN_INVITE_PAYLOAD)
         )
         respx.get(f"https://rine.network/groups/{GROUP_ID}").mock(
             return_value=httpx.Response(200, json=_GROUP_PAYLOAD)
@@ -600,7 +770,7 @@ class TestSyncGroupsInviteNotification:
         _mock_token()
         # No invitee key mock and no /messages mock — the notification send blows up.
         respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
-            return_value=httpx.Response(200, json={"status": "invited"})
+            return_value=httpx.Response(201, json=_OPEN_INVITE_PAYLOAD)
         )
 
         result = sync_client.groups.invite(GROUP_ID, OTHER_AGENT_ID)
@@ -618,7 +788,7 @@ class TestAsyncGroupsInviteNotification:
         _mock_agents()
         _mock_invitee_keys(tmp_config_dir)
         respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
-            return_value=httpx.Response(200, json={"status": "invited"})
+            return_value=httpx.Response(201, json=_OPEN_INVITE_PAYLOAD)
         )
         respx.get(f"https://rine.network/groups/{GROUP_ID}").mock(
             return_value=httpx.Response(200, json=_GROUP_PAYLOAD)
@@ -640,10 +810,74 @@ class TestAsyncGroupsInviteNotification:
     async def test_invite_succeeds_when_notification_fails(self, async_client, tmp_config_dir):
         _mock_token()
         respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
-            return_value=httpx.Response(200, json={"status": "invited"})
+            return_value=httpx.Response(201, json=_OPEN_INVITE_PAYLOAD)
         )
 
         result = await async_client.groups.invite(GROUP_ID, OTHER_AGENT_ID)
 
         assert result.status == "invited"
+        await async_client.close()
+
+
+class TestSyncGroupsInviteResult:
+    """``invite()`` maps the server body onto ``InviteResult`` for both shapes."""
+
+    @respx.mock
+    def test_invite_voucher_populates_request_id(self, sync_client):
+        """A closed-group voucher (JoinRequestRead) exposes its id as ``request_id``."""
+        _mock_token()
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
+            return_value=httpx.Response(201, json=_VOUCHER_PAYLOAD)
+        )
+
+        result = sync_client.groups.invite(GROUP_ID, OTHER_AGENT_ID)
+
+        assert isinstance(result, InviteResult)
+        assert result.status == "invited"
+        assert str(result.request_id) == REQUEST_ID
+
+    @respx.mock
+    def test_invite_open_group_request_id_none(self, sync_client):
+        """An open-group invite body has no id, so ``request_id`` is ``None``."""
+        _mock_token()
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
+            return_value=httpx.Response(201, json=_OPEN_INVITE_PAYLOAD)
+        )
+
+        result = sync_client.groups.invite(GROUP_ID, OTHER_AGENT_ID)
+
+        assert isinstance(result, InviteResult)
+        assert result.status == "invited"
+        assert result.request_id is None
+
+
+class TestAsyncGroupsInviteResult:
+    """Async parity for ``invite()`` result mapping."""
+
+    @respx.mock
+    async def test_invite_voucher_populates_request_id(self, async_client):
+        _mock_token()
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
+            return_value=httpx.Response(201, json=_VOUCHER_PAYLOAD)
+        )
+
+        result = await async_client.groups.invite(GROUP_ID, OTHER_AGENT_ID)
+
+        assert isinstance(result, InviteResult)
+        assert result.status == "invited"
+        assert str(result.request_id) == REQUEST_ID
+        await async_client.close()
+
+    @respx.mock
+    async def test_invite_open_group_request_id_none(self, async_client):
+        _mock_token()
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
+            return_value=httpx.Response(201, json=_OPEN_INVITE_PAYLOAD)
+        )
+
+        result = await async_client.groups.invite(GROUP_ID, OTHER_AGENT_ID)
+
+        assert isinstance(result, InviteResult)
+        assert result.status == "invited"
+        assert result.request_id is None
         await async_client.close()

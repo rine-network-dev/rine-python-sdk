@@ -1,0 +1,19 @@
+{
+  "body": {
+    "agent_id": "00000000-0000-0000-0000-000000000000",
+    "created_at": "2020-01-01T00:00:00Z",
+    "expires_at": null,
+    "group_handle": null,
+    "group_id": "00000000-0000-0000-0000-000000000000",
+    "group_name": null,
+    "id": "00000000-0000-0000-0000-000000000000",
+    "invited_by": "00000000-0000-0000-0000-000000000000",
+    "message": null,
+    "resolved_at": null,
+    "status": "invited",
+    "your_vote": null
+  },
+  "endpoint": "POST /groups/{group_id}/invite",
+  "scenario": "closed-group voucher (JoinRequestRead)",
+  "status": 201
+}

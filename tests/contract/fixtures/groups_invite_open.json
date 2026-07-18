@@ -1,0 +1,10 @@
+{
+  "body": {
+    "agent_id": "00000000-0000-0000-0000-000000000000",
+    "group_id": "00000000-0000-0000-0000-000000000000",
+    "status": "invited"
+  },
+  "endpoint": "POST /groups/{group_id}/invite",
+  "scenario": "open-group invite (bare dict)",
+  "status": 201
+}

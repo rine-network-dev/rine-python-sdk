@@ -171,6 +171,16 @@ def _check_response(response: httpx.Response) -> Any:
     raise_for_status(response.status_code, detail, raw=response.text)
 
 
+def _check_response_with_status(response: httpx.Response) -> tuple[int, Any]:
+    """Like :func:`_check_response`, but also returns the HTTP status code.
+
+    For callers that must discriminate on the status code (e.g. group ``join``:
+    200 member vs 202 pending request), which the body alone cannot tell apart.
+    Error / 204 / empty handling is identical to :func:`_check_response`.
+    """
+    return response.status_code, _check_response(response)
+
+
 def _fetch_oauth_token(
     http: httpx.Client,
     api_url: str,
@@ -319,7 +329,7 @@ class SyncHttpClient:
             headers.update(extra)
         return headers
 
-    def request(
+    def _execute(
         self,
         method: str,
         path: str,
@@ -328,8 +338,11 @@ class SyncHttpClient:
         json_body: Any = None,
         extra_headers: dict[str, str] | None = None,
         authenticated: bool = True,
-    ) -> Any:
-        """Execute an HTTP request with token management and retries.
+    ) -> httpx.Response:
+        """Run a request with token management and retries, returning the settled response.
+
+        Shared by :meth:`request` (body only) and :meth:`request_with_status`
+        (``(status, body)``) so the retry loop lives in one place.
 
         Args:
             method: HTTP method.
@@ -340,10 +353,9 @@ class SyncHttpClient:
             authenticated: Whether to include auth token.
 
         Returns:
-            Parsed JSON response, or ``None`` for 204.
+            The settled ``httpx.Response`` — the caller checks it.
 
         Raises:
-            RineApiError: On HTTP errors.
             APITimeoutError: On request timeout.
             APIConnectionError: On network failure.
         """
@@ -416,10 +428,64 @@ class SyncHttpClient:
                     time.sleep(delay)
                 continue
 
-            return _check_response(resp)
+            return resp
 
         assert resp is not None
-        return _check_response(resp)
+        return resp
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: Any = None,
+        extra_headers: dict[str, str] | None = None,
+        authenticated: bool = True,
+    ) -> Any:
+        """Execute an HTTP request and return the parsed body (``None`` for 204).
+
+        Raises:
+            RineApiError: On HTTP errors.
+            APITimeoutError: On request timeout.
+            APIConnectionError: On network failure.
+        """
+        return _check_response(
+            self._execute(
+                method,
+                path,
+                params=params,
+                json_body=json_body,
+                extra_headers=extra_headers,
+                authenticated=authenticated,
+            )
+        )
+
+    def request_with_status(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: Any = None,
+        extra_headers: dict[str, str] | None = None,
+        authenticated: bool = True,
+    ) -> tuple[int, Any]:
+        """Like :meth:`request`, but returns ``(status_code, body)``.
+
+        For callers that discriminate on the HTTP status code (e.g. group
+        ``join``: 200 member vs 202 pending request). Error handling is identical.
+        """
+        return _check_response_with_status(
+            self._execute(
+                method,
+                path,
+                params=params,
+                json_body=json_body,
+                extra_headers=extra_headers,
+                authenticated=authenticated,
+            )
+        )
 
     def stream_sse(
         self,
@@ -512,6 +578,10 @@ class SyncHttpClient:
     def post(self, path: str, **kwargs: Any) -> Any:
         """HTTP POST."""
         return self.request("POST", path, **kwargs)
+
+    def post_with_status(self, path: str, **kwargs: Any) -> tuple[int, Any]:
+        """HTTP POST returning ``(status_code, body)``."""
+        return self.request_with_status("POST", path, **kwargs)
 
     def put(self, path: str, **kwargs: Any) -> Any:
         """HTTP PUT."""
@@ -628,7 +698,7 @@ class AsyncHttpClient:
             headers.update(extra)
         return headers
 
-    async def request(
+    async def _execute(
         self,
         method: str,
         path: str,
@@ -637,8 +707,11 @@ class AsyncHttpClient:
         json_body: Any = None,
         extra_headers: dict[str, str] | None = None,
         authenticated: bool = True,
-    ) -> Any:
-        """Execute an async HTTP request with token management and retries.
+    ) -> httpx.Response:
+        """Run an async request with token management and retries, returning the response.
+
+        Shared by :meth:`request` (body only) and :meth:`request_with_status`
+        (``(status, body)``) so the retry loop lives in one place.
 
         Args:
             method: HTTP method.
@@ -649,10 +722,9 @@ class AsyncHttpClient:
             authenticated: Whether to include auth token.
 
         Returns:
-            Parsed JSON response, or ``None`` for 204.
+            The settled ``httpx.Response`` — the caller checks it.
 
         Raises:
-            RineApiError: On HTTP errors.
             APITimeoutError: On request timeout.
             APIConnectionError: On network failure.
         """
@@ -726,10 +798,64 @@ class AsyncHttpClient:
                     await asyncio.sleep(delay)
                 continue
 
-            return _check_response(resp)
+            return resp
 
         assert resp is not None
-        return _check_response(resp)
+        return resp
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: Any = None,
+        extra_headers: dict[str, str] | None = None,
+        authenticated: bool = True,
+    ) -> Any:
+        """Execute an async HTTP request and return the parsed body (``None`` for 204).
+
+        Raises:
+            RineApiError: On HTTP errors.
+            APITimeoutError: On request timeout.
+            APIConnectionError: On network failure.
+        """
+        return _check_response(
+            await self._execute(
+                method,
+                path,
+                params=params,
+                json_body=json_body,
+                extra_headers=extra_headers,
+                authenticated=authenticated,
+            )
+        )
+
+    async def request_with_status(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: Any = None,
+        extra_headers: dict[str, str] | None = None,
+        authenticated: bool = True,
+    ) -> tuple[int, Any]:
+        """Like :meth:`request`, but returns ``(status_code, body)``.
+
+        For callers that discriminate on the HTTP status code (e.g. group
+        ``join``: 200 member vs 202 pending request). Error handling is identical.
+        """
+        return _check_response_with_status(
+            await self._execute(
+                method,
+                path,
+                params=params,
+                json_body=json_body,
+                extra_headers=extra_headers,
+                authenticated=authenticated,
+            )
+        )
 
     async def stream_sse(
         self,
@@ -823,6 +949,10 @@ class AsyncHttpClient:
     async def post(self, path: str, **kwargs: Any) -> Any:
         """HTTP POST."""
         return await self.request("POST", path, **kwargs)
+
+    async def post_with_status(self, path: str, **kwargs: Any) -> tuple[int, Any]:
+        """HTTP POST returning ``(status_code, body)``."""
+        return await self.request_with_status("POST", path, **kwargs)
 
     async def put(self, path: str, **kwargs: Any) -> Any:
         """HTTP PUT."""

@@ -38,6 +38,7 @@ from rine._resolve import (
 from rine._resources.groups import AsyncGroups
 from rine._resources.webhooks import AsyncWebhooks
 from rine._thread import to_thread_entry
+from rine._utils import apply_cleartext_fields
 from rine._verify import async_verify_identity as _async_verify_identity
 from rine.errors import (
     ConfigError,
@@ -218,6 +219,8 @@ class RineClient(BaseRineClient):
         message_type: str = MessageType.TASK_REQUEST,
         agent: str | None = None,
         idempotency_key: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        content_type: str | None = None,
     ) -> MessageRead:
         """Send an encrypted message (1:1 or group).
 
@@ -230,6 +233,9 @@ class RineClient(BaseRineClient):
             message_type: Message type (default: ``rine.v1.task_request``).
             agent: Agent to send as (for multi-agent orgs).
             idempotency_key: Optional idempotency key.
+            metadata: Optional cleartext (server-visible) message metadata, e.g.
+                the x402 payment-status marker. Never put E2EE-sensitive data here.
+            content_type: Optional payload content type (e.g. ``application/json``).
 
         Returns:
             MessageRead of the sent message.
@@ -252,6 +258,7 @@ class RineClient(BaseRineClient):
         else:
             result, body = await self._encrypt_dm(agent_id, to, payload, message_type)
 
+        apply_cleartext_fields(body, metadata, content_type)
         data = await self._http.post("/messages", json_body=body, extra_headers=headers or None)
         return MessageRead.model_validate(data)
 
@@ -505,6 +512,8 @@ class RineClient(BaseRineClient):
         *,
         message_type: str = MessageType.TASK_RESPONSE,
         agent: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        content_type: str | None = None,
     ) -> MessageRead:
         """Reply to a message in the same conversation.
 
@@ -513,6 +522,9 @@ class RineClient(BaseRineClient):
             payload: JSON-serializable reply payload.
             message_type: Message type.
             agent: Agent to reply as.
+            metadata: Optional cleartext (server-visible) message metadata, e.g.
+                the x402 payment-status marker.
+            content_type: Optional payload content type (e.g. ``application/json``).
 
         Returns:
             MessageRead of the reply.
@@ -533,6 +545,7 @@ class RineClient(BaseRineClient):
         }
         if result.self_encrypted_payload is not None:
             reply_body["self_encrypted_payload"] = result.self_encrypted_payload
+        apply_cleartext_fields(reply_body, metadata, content_type)
         data = await self._http.post(
             f"/messages/{message_id}/reply",
             json_body=reply_body,

@@ -38,6 +38,22 @@ def from_base64url(s: str) -> bytes:
     return base64.urlsafe_b64decode(s)
 
 
+def apply_cleartext_fields(
+    body: dict[str, Any],
+    metadata: dict[str, Any] | None,
+    content_type: str | None,
+) -> None:
+    """Attach optional cleartext ``metadata``/``content_type`` to a send body.
+
+    Only present values are added, so existing callers (which pass neither) keep
+    their exact wire shape. Mirrors the TypeScript SDK's ``buildSendBody``.
+    """
+    if content_type is not None:
+        body["content_type"] = content_type
+    if metadata is not None:
+        body["metadata"] = metadata
+
+
 def compact_json(obj: Any) -> bytes:
     """Serialize to compact JSON bytes (no whitespace).
 

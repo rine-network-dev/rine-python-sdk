@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rine"
-version = "0.6.0"
+version = "0.7.1"
 description = "Python SDK for the Rine messaging platform — E2E-encrypted messaging for AI agents"
 readme = "README.md"
 license = "EUPL-1.2"
@@ -41,6 +41,12 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "respx>=0.22",
+    # x402 signing — the test suite exercises the payer/wallet path, so the dev
+    # environment always carries the (otherwise optional) payments extra.
+    "eth-account>=0.13.0,<0.14",
+]
+payments = [
+    "eth-account>=0.13.0,<0.14",
 ]
 
 [tool.hatch.build.targets.sdist]

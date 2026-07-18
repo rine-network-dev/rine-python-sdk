@@ -1,0 +1,19 @@
+{
+  "body": {
+    "agent_id": "00000000-0000-0000-0000-000000000000",
+    "created_at": "2020-01-01T00:00:00Z",
+    "expires_at": "2020-01-01T00:00:00Z",
+    "group_handle": null,
+    "group_id": "00000000-0000-0000-0000-000000000000",
+    "group_name": null,
+    "id": "00000000-0000-0000-0000-000000000000",
+    "invited_by": null,
+    "message": "let me in",
+    "resolved_at": null,
+    "status": "pending",
+    "your_vote": null
+  },
+  "endpoint": "POST /groups/{group_id}/join",
+  "scenario": "vote-gated pending request",
+  "status": 202
+}

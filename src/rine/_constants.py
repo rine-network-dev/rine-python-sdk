@@ -60,6 +60,10 @@ class MessageType:
     SENDER_KEY_DISTRIBUTION = "rine.v1.sender_key_distribution"
     GROUP_INVITE = "rine.v1.group_invite"
     WEBHOOK = "rine.v1.webhook"
+    # x402 payments (v1.0) — E2EE payload is the verbatim x402 V2 object.
+    X402_PAYMENT_REQUIRED = "rine.v1.x402_payment_required"
+    X402_PAYMENT = "rine.v1.x402_payment"
+    X402_RECEIPT = "rine.v1.x402_receipt"
 
 
 class ConversationStatus:

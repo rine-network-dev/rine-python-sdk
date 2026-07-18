@@ -236,14 +236,9 @@ class GroupMember(BaseModel):
     role: str = "member"
     joined_at: datetime
     agent_handle: str | None = None
-
-
-class JoinResult(BaseModel):
-    """Result of attempting to join a group."""
-
-    status: str
-    group: GroupRead | None = None
-    request_id: UUID | None = None
+    # MLS membership-transition flags — set while an add/remove commit is pending.
+    pending_mls_join: bool = False
+    pending_mls_remove: bool = False
 
 
 class InviteResult(BaseModel):
@@ -279,6 +274,26 @@ class JoinRequestRead(BaseModel):
     your_vote: str | None = None  # "approve", "deny", or None
     group_handle: str | None = None  # enriched by GET /groups/invites
     group_name: str | None = None  # enriched by GET /groups/invites
+
+
+class JoinedResult(BaseModel):
+    """Immediate join — the caller is now a member (server 200 + GroupMemberRead)."""
+
+    status: Literal["joined"] = "joined"
+    member: GroupMember
+
+
+class PendingJoinResult(BaseModel):
+    """Join requires a vote — a pending request was created (server 202 + JoinRequestRead)."""
+
+    status: Literal["pending"] = "pending"
+    request: JoinRequestRead
+
+
+# ``join()`` result, discriminated on ``status``: an immediate join (200) vs a
+# vote-gated request (202). The join request id is reachable via
+# ``PendingJoinResult.request.id``.
+JoinResult = JoinedResult | PendingJoinResult
 
 
 class VoteResponse(BaseModel):

@@ -38,6 +38,7 @@ from rine._resolve import (
 from rine._resources.groups import SyncGroups
 from rine._resources.webhooks import SyncWebhooks
 from rine._thread import to_thread_entry
+from rine._utils import apply_cleartext_fields
 from rine._verify import verify_identity as _verify_identity
 from rine.errors import (
     ConfigError,
@@ -210,6 +211,8 @@ class SyncRineClient(BaseRineClient):
         message_type: str = MessageType.TASK_REQUEST,
         agent: str | None = None,
         idempotency_key: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        content_type: str | None = None,
     ) -> MessageRead:
         """Send an encrypted message (1:1 or group).
 
@@ -219,6 +222,9 @@ class SyncRineClient(BaseRineClient):
             message_type: Message type.
             agent: Agent to send as.
             idempotency_key: Optional idempotency key.
+            metadata: Optional cleartext (server-visible) message metadata, e.g.
+                the x402 payment-status marker.
+            content_type: Optional payload content type (e.g. ``application/json``).
 
         Returns:
             MessageRead of the sent message.
@@ -240,6 +246,7 @@ class SyncRineClient(BaseRineClient):
         else:
             _, body = self._encrypt_dm(agent_id, to, payload, message_type)
 
+        apply_cleartext_fields(body, metadata, content_type)
         data = self._http.post("/messages", json_body=body, extra_headers=headers or None)
         return MessageRead.model_validate(data)
 
@@ -464,6 +471,8 @@ class SyncRineClient(BaseRineClient):
         *,
         message_type: str = MessageType.TASK_RESPONSE,
         agent: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        content_type: str | None = None,
     ) -> MessageRead:
         """Reply to a message.
 
@@ -472,6 +481,9 @@ class SyncRineClient(BaseRineClient):
             payload: Reply payload.
             message_type: Message type.
             agent: Agent to reply as.
+            metadata: Optional cleartext (server-visible) message metadata, e.g.
+                the x402 payment-status marker.
+            content_type: Optional payload content type (e.g. ``application/json``).
 
         Returns:
             MessageRead of the reply.
@@ -491,6 +503,7 @@ class SyncRineClient(BaseRineClient):
         }
         if result.self_encrypted_payload is not None:
             reply_body["self_encrypted_payload"] = result.self_encrypted_payload
+        apply_cleartext_fields(reply_body, metadata, content_type)
         data = self._http.post(
             f"/messages/{message_id}/reply",
             json_body=reply_body,
