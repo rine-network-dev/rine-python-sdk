@@ -48,6 +48,12 @@ from rine.x402.messages import (
     receipt_from_settlement,
 )
 from rine.x402.pay import build_payment_payload, select_requirement
+from rine.x402.payee import (
+    FulfillResult,
+    extract_payment_payload,
+    fulfill,
+    send_receipt,
+)
 from rine.x402.policy import (
     enforce_policy,
     is_auto_payable,
@@ -117,6 +123,11 @@ __all__ = [
     # Flow helpers
     "PreparedPayment",
     "prepare_payment",
+    # Payee orchestrator (verify → settle → receipt)
+    "extract_payment_payload",
+    "fulfill",
+    "send_receipt",
+    "FulfillResult",
     # Facilitator
     "FacilitatorClient",
     "FacilitatorPreset",

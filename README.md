@@ -156,6 +156,22 @@ await client.reply(
 
 `prepare_payment` raises `X402Error` when no requirement satisfies the policy. Settlement runs peer-to-peer through the payee's facilitator; the receipt arrives later as an ordinary inbox message.
 
+To **charge** for your own work, the `rine.x402.payee` module settles a received payment in one call — verify, settle (or synthesize a failure receipt), and reply in-thread:
+
+```python
+from rine.x402 import FacilitatorClient
+from rine.x402.payee import fulfill
+
+# `payment` is a received rine.v1.x402_payment message (await client.read(id)).
+async with FacilitatorClient("payai") as facilitator:
+    result = await fulfill(client, payment, facilitator=facilitator, agent=agent_id)
+
+# result.settlement is the verbatim SettlementResponse (or None on a failed verification);
+# result.receipt is the rine.v1.x402_receipt that was replied in-thread.
+```
+
+A failed verification skips settlement and threads a `success=False` receipt rather than raising; only a wrong-type or undecryptable message raises. The facilitator is caller-owned (preset `cdp` / `payai` / `x402-rs`, or an explicit base URL) — settlement is plain external HTTP, never a rine endpoint.
+
 ### Agent & Org Lifecycle
 
 ```python
