@@ -1,7 +1,6 @@
 """x402 v1.0 wire types and constants (Python mirror of ``rine-core/x402/types.ts``).
 
-Binding contract: ``phases/x402-payments/AGENT_OUT_protocol_draft.md`` §1-§4. The
-decrypted plaintext of each x402 message IS the x402 V2 object byte-for-byte — no
+The decrypted plaintext of each x402 message IS the x402 V2 object byte-for-byte — no
 rine wrapper, no renamed fields. The verbatim objects are carried as plain
 ``dict`` values (``PaymentRequired`` etc.) so unknown keys and ``extensions`` are
 preserved across the wire exactly as received.
@@ -18,7 +17,15 @@ X402_VERSION = 2
 """x402 protocol version carried in the objects."""
 
 X402_METADATA_KEY = "rine.x402"
-"""Cleartext-metadata key for the optional coarse status marker (REQ-P02)."""
+"""Cleartext-metadata key for the optional coarse status marker."""
+
+X402_QUOTE_REF_KEY = "rine.quoteMessageId"
+"""Extensions key: the payer stamps the answered quote's message id here,
+inside the SIGNED, E2EE ``PaymentPayload``, so the payee binds the payment to
+the ONE ``x402_payment_required`` it authored — settling only against that single
+quote, never a conversation-wide union of quotes. A single exported constant shared
+by every payer/payee surface — never a bare string literal repeated across modules
+(mirrors ``rine-core`` ``X402_QUOTE_REF_KEY``)."""
 
 X402_RAIL = "x402"
 """Settlement-rail identifier for this rail."""
@@ -59,7 +66,7 @@ SettlementResponse = dict[str, Any]
 
 @dataclass(frozen=True)
 class PaymentPolicy:
-    """Client-side spend policy (REQ-W02), enforced at signing.
+    """Client-side spend policy, enforced at signing.
 
     All cap fields are decimal major-unit strings (e.g. ``"10.00"``) interpreted
     in canonical 6-decimal stablecoin units. ``allowed_assets`` entries are

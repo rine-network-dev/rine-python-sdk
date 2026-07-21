@@ -1,4 +1,4 @@
-"""Lane-C asset registry and canonical amount math (mirror of ``x402/assets.ts``).
+"""Asset registry and canonical amount math (mirror of ``x402/assets.ts``).
 
 All v1.0 ``exact``-scheme assets are 6-decimal stablecoins (EURC/USDC on Base).
 Caps and daily-spend are tracked in canonical micro-units; per-asset amounts are
@@ -18,13 +18,6 @@ if TYPE_CHECKING:
 
 CANONICAL_DECIMALS = 6
 """Canonical accounting precision (6-decimal stablecoins)."""
-
-DEFAULT_STABLECOIN_DECIMALS = 6
-"""Fallback decimals for an unrecognised ``exact``-scheme stablecoin.
-
-Chosen as the low end so an unknown asset is never treated as *more* valuable
-than it is (an over-estimate of decimals would silently relax the caps).
-"""
 
 
 @dataclass(frozen=True)
@@ -47,10 +40,14 @@ KNOWN_ASSETS: tuple[KnownAsset, ...] = (
     KnownAsset("EURC", "eip155:84532", "0x808456652fdb597867f38412077a9182bf77359f", 6),
 )
 
-_ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}$", re.I)
-_DECIMAL_RE = re.compile(r"^\d+(\.\d+)?$")
-_CAIP2_RE = re.compile(r"^eip155:(\d+)$")
-_ATOMIC_RE = re.compile(r"^\d+$")
+# ``\Z`` (end of string), not ``$``: Python ``$`` also matches just before a
+# trailing ``\n``, so ``re.match(r"^\d+$", "100\n")`` would accept ``"100\n"``.
+# JS ``/^\d+$/`` rejects it. ``\Z`` keeps every anchor here byte-for-byte with the
+# TS SDK's regexes in ``x402/assets.ts`` (no trailing-whitespace parse divergence).
+_ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}\Z", re.I)
+_DECIMAL_RE = re.compile(r"^\d+(\.\d+)?\Z")
+_CAIP2_RE = re.compile(r"^eip155:(\d+)\Z")
+_ATOMIC_RE = re.compile(r"^\d+\Z")
 
 
 def chain_id_from_caip2(network: str) -> int:
@@ -75,9 +72,24 @@ def lookup_asset(network: str, address: str) -> KnownAsset | None:
 
 
 def resolve_decimals(network: str, address: str) -> int:
-    """Decimals for an asset: registry hit, else the safe stablecoin default."""
+    """Decimals for an asset from the known-asset registry, or FAIL CLOSED.
+
+    A non-registry asset has no trustworthy decimals: assuming 6 would misprice a
+    sub-6-decimal token (the signed EIP-3009 ``value`` is atomic, so a 2-decimal
+    token read as 6-decimal values far too low). Rather than price it wrong, unknown
+    decimals are refused — raise :class:`X402Error` (``unknown-asset-decimals``); the
+    caller must add the asset to the registry (or quote a registry asset) rather than
+    pay it blind.
+    """
     known = lookup_asset(network, address)
-    return known.decimals if known else DEFAULT_STABLECOIN_DECIMALS
+    if known is None:
+        raise X402Error(
+            X402ErrorCode.UNKNOWN_ASSET_DECIMALS,
+            f"Cannot resolve decimals for non-registry asset {address} on {network}; "
+            "refusing to price it (add it to the known-asset registry to enable)",
+            {"network": network, "asset": address},
+        )
+    return known.decimals
 
 
 def parse_units(value: str, decimals: int) -> int:
@@ -122,16 +134,26 @@ def requirement_amount(req: PaymentRequirements) -> str:
     return raw
 
 
-def parse_atomic_amount(req: PaymentRequirements) -> int:
-    """Parse a requirement's atomic amount string into an int (typed guard)."""
-    amount = requirement_amount(req)
-    if not _ATOMIC_RE.match(amount):
+def parse_atomic_units(value: str, label: str = "Amount") -> int:
+    """Parse a raw atomic-units decimal string into an int (typed guard).
+
+    Shared by :func:`parse_atomic_amount` (a requirement's ``amount``) and the
+    payee-side signed-value defense (an EIP-3009 ``authorization.value``), so both
+    reject a non-integer value with the same typed :class:`X402Error` instead of a
+    silent ``int(...)`` throw. Mirrors the TS ``parseAtomicUnits``.
+    """
+    if not _ATOMIC_RE.match(value):
         raise X402Error(
             X402ErrorCode.INVALID_REQUIREMENT,
-            f"Requirement amount must be atomic integer units, got: {amount!r}",
-            {"amount": amount},
+            f"{label} must be atomic integer units, got: {value!r}",
+            {"value": value},
         )
-    return int(amount)
+    return int(value)
+
+
+def parse_atomic_amount(req: PaymentRequirements) -> int:
+    """Parse a requirement's atomic amount string into an int (typed guard)."""
+    return parse_atomic_units(requirement_amount(req), "Requirement amount")
 
 
 def requirement_canonical_amount(req: PaymentRequirements) -> int:

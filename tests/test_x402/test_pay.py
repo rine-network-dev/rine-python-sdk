@@ -10,7 +10,7 @@ from rine.x402.assets import chain_id_from_caip2
 from rine.x402.eip3009 import Eip712Domain, eip3009_digest
 from rine.x402.errors import X402Error, X402ErrorCode
 from rine.x402.pay import build_payment_payload, select_requirement
-from rine.x402.types import PaymentPolicy
+from rine.x402.types import X402_QUOTE_REF_KEY, PaymentPolicy
 
 BASE = "eip155:8453"
 EURC = "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42"
@@ -104,6 +104,29 @@ def test_build_payment_payload_when_built_echoes_resource_and_accepted_verbatim(
     assert payload["resource"] == pr["resource"]
     assert payload["extensions"] == {"k": 1}
     assert payload["x402Version"] == 2
+
+
+def test_build_payment_payload_when_quote_id_given_stamps_signed_ref() -> None:
+    """R-1: the answered quote's id is stamped into extensions (payer binding)."""
+    req = _req("100000")
+    pr = {"x402Version": 2, "accepts": [req], "extensions": {"k": 1}}
+    source_extensions = pr["extensions"]
+    payload = build_payment_payload(
+        pr, req, KEY, now=1_700_000_000, nonce=bytes(32), quote_message_id="quote-abc"
+    )
+    assert payload["extensions"][X402_QUOTE_REF_KEY] == "quote-abc"
+    assert payload["extensions"]["k"] == 1  # the quote's own extensions are echoed
+    # The source PaymentRequired.extensions is cloned, never mutated.
+    assert source_extensions == {"k": 1}
+    assert X402_QUOTE_REF_KEY not in source_extensions
+
+
+def test_build_payment_payload_when_no_quote_id_omits_ref() -> None:
+    """Without a quote id the payment is unbound (raw HTTP-402 flow) — no stray key."""
+    req = _req("100000")
+    pr = {"x402Version": 2, "accepts": [req]}
+    payload = build_payment_payload(pr, req, KEY, now=1_700_000_000, nonce=bytes(32))
+    assert X402_QUOTE_REF_KEY not in payload["extensions"]
 
 
 def test_build_payment_payload_when_bad_nonce_length_raises() -> None:

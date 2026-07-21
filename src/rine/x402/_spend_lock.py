@@ -74,12 +74,15 @@ def _try_create(path: str, now_ms: int) -> bool:
     Returns ``True`` on success, ``False`` if it already exists (someone holds it).
     Content-atomic: a plain ``O_EXCL`` create then ``write`` leaves an EMPTY file for
     a moment, and a racing acquirer would read that as unparseable → steal a LIVE
-    holder → two holders (a lost update). Writing the body to a per-pid temp first,
-    then ``os.link``-ing it into place, keeps the exclusive-create guarantee while
-    making the lock non-empty the instant it exists.
+    holder → two holders (a lost update). Writing the body to a random per-attempt
+    temp first, then ``os.link``-ing it into place, keeps the exclusive-create
+    guarantee while making the lock non-empty the instant it exists. The temp name
+    uses ``os.urandom`` entropy (not ``pid``, which is not unique across pid
+    namespaces on a shared volume) so concurrent creators never collide; that name
+    is never read across languages, so it is not part of the interop contract.
     """
     body = json.dumps({"pid": os.getpid(), "acquired_at": now_ms}, separators=(",", ":")) + "\n"
-    tmp = f"{path}.{os.getpid()}.tmp"
+    tmp = f"{path}.{os.urandom(8).hex()}.tmp"
     fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
     try:
         os.write(fd, body.encode("utf-8"))
@@ -100,9 +103,13 @@ def _steal_stale(path: str) -> None:
 
     ``rename`` has exactly one winner, so two processes that both judge the lock
     stale cannot both take it (unlike an in-place overwrite). The rename winner
-    unlinks the renamed file; a rename ENOENT means the steal race was lost.
+    unlinks the renamed file; a rename ENOENT means the steal race was lost. The
+    target name uses ``os.urandom`` entropy (not ``pid``, which is not unique across
+    pid namespaces on a shared volume) so distinct processes never collide on the
+    transient ``.stale-*`` name; that name is never read across languages, so it is
+    not part of the interop contract.
     """
-    stolen = f"{path}.stale-{os.getpid()}"
+    stolen = f"{path}.stale-{os.urandom(8).hex()}"
     try:
         os.rename(path, stolen)
     except OSError:

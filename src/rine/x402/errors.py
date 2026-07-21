@@ -22,6 +22,17 @@ class X402ErrorCode:
     INVALID_AMOUNT = "invalid-amount"
     WALLET_BUSY = "wallet-busy"
     ALREADY_PAID = "already-paid"
+    NOT_X402_TYPE = "not-x402-type"
+    MALFORMED_PAYLOAD = "malformed-payload"
+    # The payment does not match any payee-issued quote (scheme/network/asset/
+    # payTo/amount) — the payee refuses to settle payer-authored terms.
+    REQUIREMENT_MISMATCH = "requirement-mismatch"
+    # No decryptable payee-issued quote (and no explicit expected terms) is
+    # available to reconcile the payment against — fail closed.
+    NO_QUOTE = "no-quote"
+    # The asset's decimals cannot be resolved from the registry (and none were
+    # explicitly declared) — refuse to price it rather than assume 6.
+    UNKNOWN_ASSET_DECIMALS = "unknown-asset-decimals"
 
 
 class X402Error(Exception):

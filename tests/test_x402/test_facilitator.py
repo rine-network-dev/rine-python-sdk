@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -10,8 +12,10 @@ from rine.x402.facilitator import (
     FACILITATOR_PRESETS,
     FEATURED_FACILITATOR,
     FacilitatorClient,
+    assert_facilitator_transport,
     resolve_base_url,
 )
+from rine.x402.types import X402_QUOTE_REF_KEY
 
 REQ = {
     "scheme": "exact",
@@ -84,6 +88,40 @@ async def test_settle_when_facilitator_settles_returns_settlement_response() -> 
 
 
 @respx.mock
+async def test_verify_when_payment_has_extensions_strips_them_from_the_wire_body() -> None:
+    """rine-internal ``extensions`` (R-1 quote-ref) never reach a facilitator.
+
+    The payee reads the quote-ref from its OWN decrypted payment, never the
+    facilitator round-trip, and facilitators schema-validate ``extensions``
+    (PayAI 403s non-object values — the live-settlement regression this guards).
+    Standard top-level ``scheme``/``network`` (x402 V2 wire format) survive;
+    unknown keys do not; the caller's payment dict is never mutated.
+    """
+    route = respx.post("https://fac.local/verify").mock(
+        return_value=httpx.Response(200, json={"isValid": True})
+    )
+    payment = {
+        **PAYMENT,
+        "scheme": "exact",
+        "network": "eip155:84532",
+        "extensions": {X402_QUOTE_REF_KEY: "11111111-2222-3333-4444-555555555555"},
+        "rine.internal": "never-forwarded",
+    }
+    async with FacilitatorClient("x402-rs", base_url="https://fac.local") as fac:
+        await fac.verify(payment, REQ)
+    sent = json.loads(route.calls.last.request.read())
+    forwarded = sent["paymentPayload"]
+    assert "extensions" not in forwarded
+    assert "rine.internal" not in forwarded
+    assert forwarded["scheme"] == "exact"
+    assert forwarded["network"] == "eip155:84532"
+    assert forwarded["accepted"] == REQ
+    assert forwarded["payload"] == PAYMENT["payload"]
+    # The caller's payment is untouched — the payee still reads its quote-ref.
+    assert payment["extensions"] == {X402_QUOTE_REF_KEY: "11111111-2222-3333-4444-555555555555"}
+
+
+@respx.mock
 async def test_verify_when_facilitator_errors_raises() -> None:
     """Verify when facilitator errors raises."""
     respx.post("https://fac.local/verify").mock(
@@ -92,3 +130,47 @@ async def test_verify_when_facilitator_errors_raises() -> None:
     async with FacilitatorClient("x402-rs", base_url="https://fac.local") as fac:
         with pytest.raises(httpx.HTTPStatusError):
             await fac.verify(PAYMENT, REQ)
+
+
+# --- F-5: transport allowlist (https, or http only to loopback) --------------
+
+
+def test_transport_allows_https() -> None:
+    """https:// is always allowed (no exception)."""
+    assert_facilitator_transport("https://fac.example")
+
+
+def test_transport_allows_loopback_http() -> None:
+    """Loopback http:// is exempt (local dev/testnet)."""
+    for url in ("http://localhost:8080", "http://127.0.0.1:8899", "http://[::1]:8080"):
+        assert_facilitator_transport(url)
+
+
+def test_transport_rejects_non_loopback_http() -> None:
+    """A cleartext http:// to a remote host is refused, credentials or not (TS parity)."""
+    with pytest.raises(ValueError, match="cleartext"):
+        assert_facilitator_transport("http://fac.example")
+
+
+def test_transport_rejects_unsupported_scheme() -> None:
+    """A non-http(s) scheme is rejected outright."""
+    with pytest.raises(ValueError, match="scheme"):
+        assert_facilitator_transport("ftp://fac.example")
+
+
+def test_client_init_rejects_non_loopback_http() -> None:
+    """F-5 end-to-end: constructing a client over remote http:// is refused."""
+    with pytest.raises(ValueError, match="cleartext"):
+        FacilitatorClient("x402-rs", base_url="http://evil.example", api_key="secret")
+
+
+def test_client_init_rejects_non_loopback_http_without_key() -> None:
+    """F-5: even a no-credential remote http:// facilitator is refused (TS parity)."""
+    with pytest.raises(ValueError, match="cleartext"):
+        FacilitatorClient("x402-rs", base_url="http://evil.example")
+
+
+def test_client_init_allows_loopback_http_with_key() -> None:
+    """A local x402-rs over http://localhost with a key is fine (loopback exempt)."""
+    fac = FacilitatorClient("x402-rs", base_url="http://localhost:8080", api_key="secret")
+    assert fac.base_url == "http://localhost:8080"

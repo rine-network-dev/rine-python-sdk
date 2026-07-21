@@ -1,4 +1,4 @@
-"""High-level payer/payee flow helpers (Python half of REQ-M04).
+"""High-level payer/payee flow helpers.
 
 Ties the wallet, spend policy, signer, and message builders together so a caller
 does the minimum:
@@ -66,7 +66,11 @@ def prepare_payment(
 
     ``message_id`` (the received ``payment_required`` message id) makes the debit
     idempotent per day: a second prepare for the same id raises ``already-paid``
-    unless ``force=True``. Raises :class:`rine.x402.errors.X402Error` if no
+    unless ``force=True``. It is ALSO stamped into the signed payload's
+    ``extensions[X402_QUOTE_REF_KEY]`` so the payee can bind this payment to
+    the ONE quote it answers; omitting it leaves the payment unbound and the payee
+    then requires explicit expected terms to settle (fail closed). Raises
+    :class:`rine.x402.errors.X402Error` if no
     requirement satisfies the policy, if the lock is contended (``wallet-busy``),
     or on a replay (``already-paid``).
 
@@ -79,7 +83,12 @@ def prepare_payment(
     requirement = select_requirement(payment_required, policy, daily_spent)
     wallet_key = load_wallet_key(config_dir, agent_id)
     payload = build_payment_payload(
-        payment_required, requirement, wallet_key, now=now, nonce=nonce
+        payment_required,
+        requirement,
+        wallet_key,
+        now=now,
+        nonce=nonce,
+        quote_message_id=message_id,
     )
     message = payment_message(payload, add_marker=add_marker)
     auto_payable = policy is not None and is_auto_payable(policy, requirement)

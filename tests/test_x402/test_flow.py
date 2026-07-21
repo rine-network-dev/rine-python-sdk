@@ -12,7 +12,7 @@ from rine.x402.errors import X402Error, X402ErrorCode
 from rine.x402.flow import prepare_payment
 from rine.x402.journal import read_daily_spent
 from rine.x402.policy import save_policy
-from rine.x402.types import PaymentPolicy
+from rine.x402.types import X402_QUOTE_REF_KEY, PaymentPolicy
 
 BASE = "eip155:8453"
 EURC = "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42"
@@ -80,6 +80,29 @@ def test_prepare_payment_when_add_marker_false_emits_no_marker(tmp_path) -> None
         str(tmp_path), agent_id, _pr("500000"), now=1_700_000_000, nonce=bytes(32)
     )
     assert marked.message.metadata != {}  # default stays opt-out (marker present)
+
+
+def test_prepare_payment_stamps_message_id_as_signed_quote_ref(tmp_path) -> None:
+    """R-1: the received quote's message_id is stamped into the signed payment payload."""
+    agent_id = _setup(tmp_path)
+    prepared = prepare_payment(
+        str(tmp_path),
+        agent_id,
+        _pr("500000"),
+        message_id="quote-42",
+        now=1_700_000_000,
+        nonce=bytes(32),
+    )
+    assert prepared.message.payload["extensions"][X402_QUOTE_REF_KEY] == "quote-42"
+
+
+def test_prepare_payment_without_message_id_leaves_payment_unbound(tmp_path) -> None:
+    """No message_id → no quote-ref stamped (payee must then use expected terms)."""
+    agent_id = _setup(tmp_path)
+    prepared = prepare_payment(
+        str(tmp_path), agent_id, _pr("500000"), now=1_700_000_000, nonce=bytes(32)
+    )
+    assert X402_QUOTE_REF_KEY not in prepared.message.payload["extensions"]
 
 
 def test_prepare_payment_when_over_threshold_not_auto_payable(tmp_path) -> None:

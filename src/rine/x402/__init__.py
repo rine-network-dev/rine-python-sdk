@@ -29,11 +29,14 @@ from rine.x402.assets import (
     requirement_canonical_amount,
 )
 from rine.x402.errors import X402Error, X402ErrorCode
+from rine.x402.extract import extract_payment_payload
 from rine.x402.facilitator import (
     FACILITATOR_PRESETS,
+    FACILITATOR_TIMEOUT_SECONDS,
     FEATURED_FACILITATOR,
     FacilitatorClient,
     FacilitatorPreset,
+    assert_facilitator_transport,
     resolve_base_url,
 )
 from rine.x402.flow import PreparedPayment, prepare_payment
@@ -50,9 +53,15 @@ from rine.x402.messages import (
 from rine.x402.pay import build_payment_payload, select_requirement
 from rine.x402.payee import (
     FulfillResult,
-    extract_payment_payload,
     fulfill,
     send_receipt,
+)
+from rine.x402.payee_settle import (
+    MatchedQuote,
+    resolve_payee_requirement,
+    resolve_requirement,
+    settle,
+    verify,
 )
 from rine.x402.policy import (
     enforce_policy,
@@ -61,8 +70,11 @@ from rine.x402.policy import (
     save_policy,
     validate_policy,
 )
+from rine.x402.quote_ref import ReferencedQuote, load_referenced_quote
+from rine.x402.reconcile import reconcile_payment
 from rine.x402.types import (
     X402_METADATA_KEY,
+    X402_QUOTE_REF_KEY,
     X402_RAIL,
     X402_SUPPORTED_SCHEMES,
     X402_VERSION,
@@ -83,6 +95,7 @@ __all__ = [
     "X402Status",
     "X402Mode",
     "X402_METADATA_KEY",
+    "X402_QUOTE_REF_KEY",
     "X402_RAIL",
     "X402_VERSION",
     "X402_SUPPORTED_SCHEMES",
@@ -123,15 +136,27 @@ __all__ = [
     # Flow helpers
     "PreparedPayment",
     "prepare_payment",
-    # Payee orchestrator (verify → settle → receipt)
+    # Payee orchestrator (reconcile → verify → settle → receipt)
     "extract_payment_payload",
     "fulfill",
     "send_receipt",
     "FulfillResult",
+    # Reconciling standalone verify/settle (settle-after-delivery, fail-closed)
+    "verify",
+    "settle",
+    "resolve_requirement",
+    "resolve_payee_requirement",
+    "MatchedQuote",
+    # Reconciliation (payee binds settlement to the ONE quote it issued)
+    "reconcile_payment",
+    "load_referenced_quote",
+    "ReferencedQuote",
     # Facilitator
     "FacilitatorClient",
     "FacilitatorPreset",
     "FACILITATOR_PRESETS",
+    "FACILITATOR_TIMEOUT_SECONDS",
     "FEATURED_FACILITATOR",
+    "assert_facilitator_transport",
     "resolve_base_url",
 ]

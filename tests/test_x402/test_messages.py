@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from rine._constants import MessageType
+from rine.x402.errors import X402Error, X402ErrorCode
 from rine.x402.messages import (
     build_payment_required,
     build_receipt,
@@ -87,3 +90,11 @@ def test_parse_x402_payload_roundtrips_verbatim_from_json_string() -> None:
     # The inbox stores the decrypted plaintext as a JSON string.
     wire = json.dumps(original)
     assert parse_x402_payload(wire) == original
+
+
+def test_parse_x402_payload_when_not_json_object_raises_malformed() -> None:
+    """A non-object / non-JSON body is a typed malformed-payload refusal (F-4)."""
+    for bad in ("[]", "not json", "null"):
+        with pytest.raises(X402Error) as exc:
+            parse_x402_payload(bad)
+        assert exc.value.code == X402ErrorCode.MALFORMED_PAYLOAD

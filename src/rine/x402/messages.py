@@ -1,4 +1,4 @@
-"""Build and parse the three x402 message payloads (Python half of REQ-M04/M01).
+"""Build and parse the three x402 message payloads.
 
 Each payload is the verbatim x402 V2 object (``PaymentRequired`` /
 ``PaymentPayload`` / ``SettlementResponse``) — unknown keys are preserved. These
@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeGuard
 
 from rine._constants import MessageType
+from rine.x402.errors import X402Error, X402ErrorCode
 from rine.x402.marker import marker_metadata
 from rine.x402.types import (
     X402_VERSION,
@@ -23,6 +24,11 @@ from rine.x402.types import (
 )
 
 _CONTENT_TYPE = "application/json"
+
+
+def _is_object(value: Any) -> TypeGuard[dict[str, Any]]:
+    """A non-null mapping — the shape every x402 sub-object must be."""
+    return isinstance(value, dict)
 
 
 @dataclass
@@ -117,9 +123,33 @@ def parse_x402_payload(plaintext: str | dict[str, Any]) -> dict[str, Any]:
     """Parse a decrypted x402 message plaintext into its verbatim object dict.
 
     Accepts the raw decrypted JSON string (as the inbox stores it) or an already
-    parsed mapping. Raises ``ValueError`` if the plaintext is not a JSON object.
+    parsed mapping, and returns the object UNCHANGED (unknown keys preserved) so
+    ``parse(build(x)) == x`` byte-for-byte. A body that is not a JSON object raises
+    a typed ``X402Error(MALFORMED_PAYLOAD)`` — never a bare ``ValueError`` — so
+    callers get a structured, catchable refusal.
+
+    Parser-parity note: the TS ``parseX402Payload(type, plaintext)``
+    takes the message type and folds the per-type structural checks inline. The
+    Python parser is intentionally single-argument (type-agnostic JSON-object
+    validation only); the equivalent per-type checks live at the type-aware call
+    sites — a payment's ``accepted``/``authorization`` in
+    :func:`rine.x402.extract.extract_payment_payload`, a quote's ``accepts[]`` in
+    :func:`rine.x402.quote_ref.load_referenced_quote`. This split is deliberate and
+    consistent (it keeps this function's single-argument public contract) — the same
+    malformed body is a typed refusal on both SDKs, only the check's location differs.
+
+    Raises:
+        X402Error: ``malformed-payload`` when the body is not a JSON object.
     """
-    obj = json.loads(plaintext) if isinstance(plaintext, str) else plaintext
-    if not isinstance(obj, dict):
-        raise ValueError("x402 payload is not a JSON object")
+    if isinstance(plaintext, str):
+        try:
+            obj = json.loads(plaintext)
+        except (ValueError, TypeError) as exc:
+            raise X402Error(
+                X402ErrorCode.MALFORMED_PAYLOAD, "x402 payload is not valid JSON"
+            ) from exc
+    else:
+        obj = plaintext
+    if not _is_object(obj):
+        raise X402Error(X402ErrorCode.MALFORMED_PAYLOAD, "x402 payload is not a JSON object")
     return obj

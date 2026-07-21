@@ -1,6 +1,6 @@
 """Requirement selection + PaymentPayload construction (mirror of ``x402/pay.ts``).
 
-The payer side of REQ-W03: pick an acceptable requirement under the spend policy,
+The payer side: pick an acceptable requirement under the spend policy,
 then build and sign the verbatim x402 ``PaymentPayload``. The signer pins
 ``to``/``value``/``asset``/``network`` inside the EIP-712 signature, so a relayer
 or facilitator cannot redirect funds.
@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import secrets
 import time
-from typing import cast
+from typing import Any, cast
 
 from rine._crypto.wallet import derive_evm_address, sign_digest
 from rine.x402.assets import chain_id_from_caip2, requirement_amount
@@ -19,6 +19,7 @@ from rine.x402.eip3009 import Eip712Domain, eip3009_digest
 from rine.x402.errors import X402Error, X402ErrorCode
 from rine.x402.policy import enforce_policy
 from rine.x402.types import (
+    X402_QUOTE_REF_KEY,
     X402_VERSION,
     PaymentPayload,
     PaymentPolicy,
@@ -78,11 +79,20 @@ def build_payment_payload(
     now: int | None = None,
     nonce: bytes | None = None,
     valid_after_skew_seconds: int = _DEFAULT_SKEW_SECONDS,
+    quote_message_id: str | None = None,
 ) -> PaymentPayload:
-    """Build and sign a ``PaymentPayload`` for a chosen requirement (REQ-W03).
+    """Build and sign a ``PaymentPayload`` for a chosen requirement.
 
     Echoes ``resource``/``extensions`` and the chosen requirement (``accepted``)
     verbatim per the x402 contract. ``now``/``nonce`` are injectable for tests.
+
+    When ``quote_message_id`` is supplied it is stamped into the SIGNED, E2EE
+    ``extensions[X402_QUOTE_REF_KEY]`` so the payee binds this payment to the
+    ONE ``x402_payment_required`` it authored. The quote's own ``extensions`` are
+    cloned first and never mutated. Every rine payer surface passes the received
+    quote's message id; a raw HTTP-402 flow (no rine quote message) omits it, and
+    the payee then requires an explicit expected-terms override to settle (fail
+    closed). Mirrors ``rine-core`` ``buildPaymentPayload`` ``opts.quoteMessageId``.
     """
     ts = now if now is not None else math.floor(time.time())
     nonce_bytes = nonce if nonce is not None else secrets.token_bytes(32)
@@ -109,10 +119,17 @@ def build_payment_payload(
     )
     digest = eip3009_digest(domain, authorization)
     signature = sign_digest(wallet_private_key, digest)
+    # Echo the quote's ``extensions`` verbatim (cloned, never mutated), then stamp
+    # the answered-quote message id so the payee binds this payment to the
+    # single quote it authored. The stamp rides inside the signed, E2EE payload —
+    # integrity protected and authored only by the payer.
+    extensions: dict[str, Any] = dict(pr.get("extensions") or {})
+    if quote_message_id:
+        extensions[X402_QUOTE_REF_KEY] = quote_message_id
     return {
         "x402Version": pr.get("x402Version", X402_VERSION),
         "resource": pr.get("resource"),
         "accepted": requirement,
         "payload": {"signature": signature, "authorization": authorization},
-        "extensions": pr.get("extensions", {}),
+        "extensions": extensions,
     }
