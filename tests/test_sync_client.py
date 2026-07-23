@@ -1831,3 +1831,37 @@ class TestWebhookDeliverySummary:
 
         with pytest.raises(NotFoundError):
             sync_client.webhooks.delivery_summary(WEBHOOK_ID)
+
+
+class TestInboxGroupSelfHeal:
+    """inbox() opens sender-key group rows: cold, and again after read()."""
+
+    @respx.mock
+    def test_inbox_self_heals_sender_key_group_when_none(
+        self, sync_client, group_message_fixture, mock_group_message_routes
+    ):
+        """A group row whose sender key was never ingested still yields plaintext."""
+        mock_group_message_routes()
+
+        page = sync_client.inbox()
+
+        msg = page.items[0]
+        assert msg.decrypt_error is None
+        assert msg.plaintext == group_message_fixture.plaintext
+        assert msg.verified is True
+
+    @respx.mock
+    def test_inbox_idempotent_after_read_consumes_ratchet(
+        self, sync_client, group_message_fixture, mock_group_message_routes
+    ):
+        """read() consumes the ratchet key; a later inbox() still returns plaintext."""
+        mock_group_message_routes()
+
+        first = sync_client.read(group_message_fixture.message_id)
+        assert first.plaintext == group_message_fixture.plaintext
+
+        page = sync_client.inbox()
+
+        msg = page.items[0]
+        assert msg.decrypt_error is None
+        assert msg.plaintext == group_message_fixture.plaintext

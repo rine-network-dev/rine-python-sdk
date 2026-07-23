@@ -222,6 +222,21 @@ def keys_dir(config_dir: str, agent_id: str) -> str:
     return os.path.join(config_dir, "keys", agent_id)
 
 
+def mls_store_dir(config_dir: str, agent_id: str) -> str:
+    """Return the MLS state store root for an agent.
+
+    Args:
+        config_dir: Path to config directory.
+        agent_id: Agent UUID string.
+
+    Returns:
+        Path to ``keys/{agent_id}/mls2/``. The ``mls2`` name is what keeps state
+        written by the previous MLS core, under ``mls/``, from colliding with
+        this one's — nothing ever reads those blobs again.
+    """
+    return os.path.join(config_dir, "keys", agent_id, "mls2")
+
+
 def sender_keys_dir(config_dir: str, agent_id: str) -> str:
     """Return the sender keys directory path for an agent.
 

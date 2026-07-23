@@ -11,12 +11,7 @@ from collections.abc import Callable
 from typing import Any
 
 from rine._config import cache_token, load_credentials, save_credentials
-from rine._crypto.keys import (
-    encryption_public_key_to_jwk,
-    generate_agent_keys,
-    save_agent_keys,
-    signing_public_key_to_jwk,
-)
+from rine._crypto.keys import generate_agent_keys, public_keys_body, save_agent_keys
 from rine._http import _USER_AGENT, SyncHttpClient, _parse_error_detail, _parse_retry_after
 from rine._logging import logger
 from rine._timelock import solve_timelock
@@ -278,14 +273,21 @@ def create_agent(
         "name": name,
         "human_oversight": human_oversight,
         "unlisted": unlisted,
-        "signing_public_key": signing_public_key_to_jwk(keys.signing.public_key),
-        "encryption_public_key": encryption_public_key_to_jwk(keys.encryption.public_key),
+        **public_keys_body(keys),
     }
     data = client.post("/agents", json_body=body)
     agent = AgentRead.model_validate(data)
 
     # Save private keys
     save_agent_keys(config_dir, str(agent.id), keys)
+
+    # Publish an initial batch of MLS KeyPackages so the agent can be added to
+    # groups from birth — without them, the first invite fails with "No key
+    # packages available". Best-effort: a failure here must never undo agent
+    # creation, and the next MLS operation replenishes.
+    from rine._mls import replenish_mls_key_packages
+
+    replenish_mls_key_packages(client, config_dir, str(agent.id))
 
     # Save poll_url to credentials if present
     if agent.poll_url:

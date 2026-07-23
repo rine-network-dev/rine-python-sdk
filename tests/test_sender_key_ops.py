@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-from unittest.mock import MagicMock, call, patch
-
 import httpx
 import pytest
 import respx
@@ -18,24 +15,24 @@ from rine._crypto.keys import (
     signing_public_key_to_jwk,
 )
 from rine._crypto.sender_keys import SenderKeyState, generate_sender_key
+from rine._group_send import resolve_group_for_send
 from rine._http import SyncHttpClient
 from rine._sender_key_ops import distribute_sender_key_sync, get_or_create_sender_key_sync
 from rine.errors import NotFoundError
-
 
 AGENT_ID = "00000000-1111-2222-3333-444444444444"
 MEMBER_ID_1 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 MEMBER_ID_2 = "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb"
 GROUP_ID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 GROUP_HANDLE = "#my-group@myorg.rine.network"
+#: A resolved group on Sender Keys, as ``rine._group_send`` hands it over.
+_GROUP = {"id": GROUP_ID, "handle": GROUP_HANDLE, "mls_group_id": None, "mls_pending": False}
 
 _TOKEN_RESPONSE = {"access_token": "test-token", "expires_in": 900}
 
 
 def _make_http_client(tmp_config_dir: str) -> SyncHttpClient:
-    save_credentials(tmp_config_dir, {
-        "default": {"client_id": "cid", "client_secret": "csecret"}
-    })
+    save_credentials(tmp_config_dir, {"default": {"client_id": "cid", "client_secret": "csecret"}})
     return SyncHttpClient(config_dir=tmp_config_dir, api_url="https://rine.network")
 
 
@@ -56,61 +53,71 @@ class TestGetOrCreateSenderKeySync:
 
         # Group resolve
         respx.get("https://rine.network/groups").mock(
-            return_value=httpx.Response(200, json={
-                "items": [{"id": GROUP_ID, "handle": GROUP_HANDLE}]
-            })
+            return_value=httpx.Response(
+                200, json={"items": [{"id": GROUP_ID, "handle": GROUP_HANDLE}]}
+            )
         )
 
         # Members
         member1_jwk = _make_enc_jwk(MEMBER_ID_1, tmp_config_dir)
         respx.get(f"https://rine.network/groups/{GROUP_ID}/members").mock(
-            return_value=httpx.Response(200, json={
-                "items": [
-                    {"agent_id": MEMBER_ID_1, "role": "member"},
-                ]
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {"agent_id": MEMBER_ID_1, "role": "member"},
+                    ]
+                },
+            )
         )
 
         # Recipient keys fetch for distribution
         respx.get(f"https://rine.network/agents/{MEMBER_ID_1}/keys").mock(
-            return_value=httpx.Response(200, json={
-                "agent_id": MEMBER_ID_1,
-                "encryption_public_key": member1_jwk,
-                "signing_public_key": signing_public_key_to_jwk(
-                    generate_agent_keys().signing.public_key
-                ),
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "agent_id": MEMBER_ID_1,
+                    "encryption_public_key": member1_jwk,
+                    "signing_public_key": signing_public_key_to_jwk(
+                        generate_agent_keys().signing.public_key
+                    ),
+                },
+            )
         )
 
         # Message post for distribution
         respx.post("https://rine.network/messages").mock(
-            return_value=httpx.Response(200, json={
-                "id": "dddddddd-eeee-ffff-0000-111111111111",
-                "conversation_id": "dddddddd-eeee-ffff-0000-111111111112",
-                "from_agent_id": AGENT_ID,
-                "to_agent_id": MEMBER_ID_1,
-                "type": MessageType.SENDER_KEY_DISTRIBUTION,
-                "encrypted_payload": "abc",
-                "encryption_version": "hpke-v1",
-                "sender_signing_kid": f"rine:{AGENT_ID}",
-                "created_at": "2024-01-01T00:00:00Z",
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "dddddddd-eeee-ffff-0000-111111111111",
+                    "conversation_id": "dddddddd-eeee-ffff-0000-111111111112",
+                    "from_agent_id": AGENT_ID,
+                    "to_agent_id": MEMBER_ID_1,
+                    "type": MessageType.SENDER_KEY_DISTRIBUTION,
+                    "encrypted_payload": "abc",
+                    "encryption_version": "hpke-v1",
+                    "sender_signing_kid": f"rine:{AGENT_ID}",
+                    "created_at": "2024-01-01T00:00:00Z",
+                },
+            )
         )
 
         http = _make_http_client(tmp_config_dir)
-        state, returned_group_id = get_or_create_sender_key_sync(
-            http, tmp_config_dir, AGENT_ID, GROUP_HANDLE
-        )
+        state = get_or_create_sender_key_sync(http, tmp_config_dir, AGENT_ID, _GROUP)
         http.close()
 
-        assert returned_group_id == GROUP_ID
         assert isinstance(state, SenderKeyState)
         assert state.sender_agent_id == AGENT_ID
         assert len(state.chain_key) == 32
 
     @respx.mock
     def test_raises_not_found_when_group_missing(self, tmp_config_dir, saved_agent_keys):
-        """get_or_create_sender_key_sync raises NotFoundError when group doesn't exist."""
+        """A send to a handle no group carries is refused before any crypto runs.
+
+        The handle lookup belongs to the send dispatcher now — it is what decides
+        MLS vs Sender Keys — so this asserts it there.
+        """
         respx.post("https://rine.network/oauth/token").mock(
             return_value=httpx.Response(200, json=_TOKEN_RESPONSE)
         )
@@ -120,16 +127,15 @@ class TestGetOrCreateSenderKeySync:
 
         http = _make_http_client(tmp_config_dir)
         with pytest.raises(NotFoundError, match="Group not found"):
-            get_or_create_sender_key_sync(
-                http, tmp_config_dir, AGENT_ID, "#nonexistent-group@org.rine.network"
-            )
+            resolve_group_for_send(http, "#nonexistent-group@org.rine.network")
         http.close()
 
     @respx.mock
     def test_returns_existing_key_when_valid(self, tmp_config_dir, saved_agent_keys):
         """When a valid, non-rotated sender key exists, it is returned without generating a new one."""
-        from rine._crypto.sender_keys_helpers import save_sender_key_state
         import time
+
+        from rine._crypto.sender_keys_helpers import save_sender_key_state
 
         # Pre-populate state
         existing_state = generate_sender_key(GROUP_ID, AGENT_ID)
@@ -141,23 +147,20 @@ class TestGetOrCreateSenderKeySync:
             return_value=httpx.Response(200, json=_TOKEN_RESPONSE)
         )
         respx.get("https://rine.network/groups").mock(
-            return_value=httpx.Response(200, json={
-                "items": [{"id": GROUP_ID, "handle": GROUP_HANDLE}]
-            })
+            return_value=httpx.Response(
+                200, json={"items": [{"id": GROUP_ID, "handle": GROUP_HANDLE}]}
+            )
         )
         respx.get(f"https://rine.network/groups/{GROUP_ID}/members").mock(
-            return_value=httpx.Response(200, json={
-                "items": [{"agent_id": MEMBER_ID_1, "role": "member"}]
-            })
+            return_value=httpx.Response(
+                200, json={"items": [{"agent_id": MEMBER_ID_1, "role": "member"}]}
+            )
         )
 
         http = _make_http_client(tmp_config_dir)
-        state, returned_group_id = get_or_create_sender_key_sync(
-            http, tmp_config_dir, AGENT_ID, GROUP_HANDLE
-        )
+        state = get_or_create_sender_key_sync(http, tmp_config_dir, AGENT_ID, _GROUP)
         http.close()
 
-        assert returned_group_id == GROUP_ID
         assert state.sender_key_id == existing_state.sender_key_id
 
 
@@ -171,30 +174,38 @@ class TestDistributeSenderKeySync:
 
         member2_jwk = _make_enc_jwk(MEMBER_ID_2, tmp_config_dir)
 
-        for member_id, jwk in [(MEMBER_ID_1, _make_enc_jwk(MEMBER_ID_1, tmp_config_dir)),
-                                (MEMBER_ID_2, member2_jwk)]:
+        for member_id, jwk in [
+            (MEMBER_ID_1, _make_enc_jwk(MEMBER_ID_1, tmp_config_dir)),
+            (MEMBER_ID_2, member2_jwk),
+        ]:
             respx.get(f"https://rine.network/agents/{member_id}/keys").mock(
-                return_value=httpx.Response(200, json={
-                    "agent_id": member_id,
-                    "encryption_public_key": jwk,
-                    "signing_public_key": signing_public_key_to_jwk(
-                        generate_agent_keys().signing.public_key
-                    ),
-                })
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "agent_id": member_id,
+                        "encryption_public_key": jwk,
+                        "signing_public_key": signing_public_key_to_jwk(
+                            generate_agent_keys().signing.public_key
+                        ),
+                    },
+                )
             )
 
         msg_route = respx.post("https://rine.network/messages").mock(
-            return_value=httpx.Response(200, json={
-                "id": "dddddddd-eeee-ffff-0000-111111111111",
-                "conversation_id": "dddddddd-eeee-ffff-0000-111111111112",
-                "from_agent_id": AGENT_ID,
-                "to_agent_id": MEMBER_ID_1,
-                "type": MessageType.SENDER_KEY_DISTRIBUTION,
-                "encrypted_payload": "abc",
-                "encryption_version": "hpke-v1",
-                "sender_signing_kid": f"rine:{AGENT_ID}",
-                "created_at": "2024-01-01T00:00:00Z",
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "dddddddd-eeee-ffff-0000-111111111111",
+                    "conversation_id": "dddddddd-eeee-ffff-0000-111111111112",
+                    "from_agent_id": AGENT_ID,
+                    "to_agent_id": MEMBER_ID_1,
+                    "type": MessageType.SENDER_KEY_DISTRIBUTION,
+                    "encrypted_payload": "abc",
+                    "encryption_version": "hpke-v1",
+                    "sender_signing_kid": f"rine:{AGENT_ID}",
+                    "created_at": "2024-01-01T00:00:00Z",
+                },
+            )
         )
 
         state = generate_sender_key(GROUP_ID, AGENT_ID)
@@ -214,6 +225,9 @@ class TestDistributeSenderKeySync:
         assert MEMBER_ID_2 in succeeded
         assert failed == []
         assert msg_route.call_count == 2
+        # Names the sending agent: a multi-agent org has no default sender, and
+        # the server rejects the distribution DM without it.
+        assert all(c.request.headers["X-Rine-Agent"] == AGENT_ID for c in msg_route.calls)
 
     @respx.mock
     def test_records_failed_recipients(self, tmp_config_dir, saved_agent_keys):

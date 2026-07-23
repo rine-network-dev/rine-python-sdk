@@ -9,7 +9,14 @@ from __future__ import annotations
 from typing import Any
 
 from rine._config import get_credential_entry, resolve_api_url, resolve_config_dir
-from rine._constants import DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT, NOT_GIVEN, NotGiven
+from rine._constants import (
+    DECRYPT_MEMO_MAX_ENTRIES,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_TIMEOUT,
+    NOT_GIVEN,
+    NotGiven,
+)
+from rine._crypto._decrypt_memo import DecryptMemo
 from rine._logging import logger
 from rine.errors import ConfigError
 
@@ -44,6 +51,10 @@ class BaseRineClient:
         self._max_retries = max_retries
         self._agents_cache: list[dict[str, Any]] | None = None
         self._resolved_agent_id: str | None = None
+        # Shared by the sync and async receive paths: makes a repeat decrypt of
+        # an already-opened group message return the same plaintext instead of
+        # hitting the consumed sender-key ratchet.
+        self._decrypt_memo = DecryptMemo(DECRYPT_MEMO_MAX_ENTRIES)
 
         # Validate credentials exist
         entry = get_credential_entry(self._config_dir)

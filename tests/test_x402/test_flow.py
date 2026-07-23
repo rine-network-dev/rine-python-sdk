@@ -83,7 +83,7 @@ def test_prepare_payment_when_add_marker_false_emits_no_marker(tmp_path) -> None
 
 
 def test_prepare_payment_stamps_message_id_as_signed_quote_ref(tmp_path) -> None:
-    """R-1: the received quote's message_id is stamped into the signed payment payload."""
+    """The received quote's message_id is stamped into the signed payment payload."""
     agent_id = _setup(tmp_path)
     prepared = prepare_payment(
         str(tmp_path),

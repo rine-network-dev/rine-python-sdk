@@ -11,6 +11,13 @@ import respx
 from rine import RineClient
 from rine._config import save_credentials
 from rine._constants import MessageType
+from rine._crypto.keys import (
+    encryption_public_key_to_jwk,
+    generate_agent_keys,
+    save_agent_keys,
+    signing_public_key_to_jwk,
+)
+from rine._crypto.sender_keys_helpers import load_sender_key_states
 from rine.errors import (
     AuthorizationError,
     ConfigError,
@@ -43,6 +50,7 @@ from rine.types import (
 
 AGENT_ID = "00000000-1111-2222-3333-444444444444"
 OTHER_AGENT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+MEMBER_AGENT_ID = "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb"
 
 _AGENT_PAYLOAD = {
     "id": AGENT_ID,
@@ -1844,4 +1852,111 @@ class TestWebhookDeliverySummary:
 
         with pytest.raises(NotFoundError):
             await async_client.webhooks.delivery_summary(WEBHOOK_ID)
+        await async_client.close()
+
+
+class TestInboxGroupSelfHeal:
+    """inbox() opens sender-key group rows: cold, and again after read()."""
+
+    @respx.mock
+    async def test_inbox_self_heals_sender_key_group_when_none(
+        self, async_client, group_message_fixture, mock_group_message_routes
+    ):
+        """A group row whose sender key was never ingested still yields plaintext."""
+        mock_group_message_routes()
+
+        page = await async_client.inbox()
+
+        msg = page.items[0]
+        assert msg.decrypt_error is None
+        assert msg.plaintext == group_message_fixture.plaintext
+        assert msg.verified is True
+        await async_client.close()
+
+    @respx.mock
+    async def test_inbox_idempotent_after_read_consumes_ratchet(
+        self, async_client, group_message_fixture, mock_group_message_routes
+    ):
+        """read() consumes the ratchet key; a later inbox() still returns plaintext."""
+        mock_group_message_routes()
+
+        first = await async_client.read(group_message_fixture.message_id)
+        assert first.plaintext == group_message_fixture.plaintext
+
+        page = await async_client.inbox()
+
+        msg = page.items[0]
+        assert msg.decrypt_error is None
+        assert msg.plaintext == group_message_fixture.plaintext
+        await async_client.close()
+
+
+class TestGroupSendActingAgent:
+    """send(agent=...) keys, distributes and ratchets under the requested agent."""
+
+    @respx.mock
+    async def test_group_send_uses_requested_agent_not_org_default(
+        self, async_client, tmp_config_dir, saved_agent_keys
+    ):
+        """In a multi-agent org, the whole group send runs as the requested agent.
+
+        The default agent must be left out of it entirely: no ratchet in its
+        store, no signature under its key. A split store would also strand the
+        ratchet at index 0 and make every message after the first unopenable.
+        """
+        save_agent_keys(tmp_config_dir, OTHER_AGENT_ID, generate_agent_keys())
+        member_keys = generate_agent_keys()
+
+        _mock_token()
+        # Two active agents: an argument-less resolve here is ambiguous.
+        respx.get("https://rine.network/agents").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "items": [
+                        _AGENT_PAYLOAD,
+                        {**_AGENT_PAYLOAD, "id": OTHER_AGENT_ID, "name": "other-agent"},
+                    ]
+                },
+            )
+        )
+        respx.get("https://rine.network/groups").mock(
+            return_value=httpx.Response(200, json={"items": [_GROUP_PAYLOAD]})
+        )
+        respx.get(f"https://rine.network/groups/{GROUP_ID}/members").mock(
+            return_value=httpx.Response(
+                200,
+                json={"items": [{"agent_id": OTHER_AGENT_ID}, {"agent_id": MEMBER_AGENT_ID}]},
+            )
+        )
+        respx.get(f"https://rine.network/agents/{MEMBER_AGENT_ID}/keys").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "agent_id": MEMBER_AGENT_ID,
+                    "encryption_public_key": encryption_public_key_to_jwk(
+                        member_keys.encryption.public_key
+                    ),
+                    "signing_public_key": signing_public_key_to_jwk(
+                        member_keys.signing.public_key
+                    ),
+                },
+            )
+        )
+        msg_route = respx.post("https://rine.network/messages").mock(
+            return_value=httpx.Response(200, json=_MESSAGE_PAYLOAD)
+        )
+
+        handle = _GROUP_PAYLOAD["handle"]
+        await async_client.send(handle, {"text": "one"}, agent=OTHER_AGENT_ID)
+        await async_client.send(handle, {"text": "two"}, agent=OTHER_AGENT_ID)
+
+        states = load_sender_key_states(tmp_config_dir, OTHER_AGENT_ID, GROUP_ID)
+        assert [s.sender_agent_id for s in states] == [OTHER_AGENT_ID]
+        # One ratchet advanced twice — not two sends stuck on index 0.
+        assert states[0].message_index == 2
+        assert load_sender_key_states(tmp_config_dir, AGENT_ID, GROUP_ID) == []
+
+        body = json.loads(msg_route.calls[-1].request.content)
+        assert body["sender_signing_kid"] == f"rine:{OTHER_AGENT_ID}"
         await async_client.close()

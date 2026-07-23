@@ -14,14 +14,16 @@ import httpx
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
+    from rine._mls import MlsCutoverResult
+
+
 from rine._base_client import BaseRineClient
 from rine._constants import NOT_GIVEN, EncryptionVersion, MessageType, NotGiven
 from rine._crypto.message import (
     decrypt_group_message_async,
     decrypt_message_async,
-    encrypt_group_message,
     encrypt_message,
-    fetch_recipient_encryption_key_async,
+    fetch_recipient_keys_async,
 )
 from rine._crypto.sender_keys import SenderKeyState
 from rine._crypto.sender_keys_helpers import load_sender_key_states, save_sender_key_state
@@ -267,8 +269,8 @@ class RineClient(BaseRineClient):
     ) -> tuple[Any, dict[str, Any]]:
         """Encrypt and build body for 1:1 message."""
         recipient_id = await resolve_to_uuid_async(self._api_url, to)
-        recipient_pk = await fetch_recipient_encryption_key_async(self._http, recipient_id)
-        result = encrypt_message(self._config_dir, agent_id, recipient_pk, payload)
+        recipient = await fetch_recipient_keys_async(self._http, recipient_id)
+        result = encrypt_message(self._config_dir, agent_id, recipient, payload)
         body: dict[str, Any] = {
             "to_agent_id": recipient_id,
             "type": msg_type,
@@ -286,30 +288,23 @@ class RineClient(BaseRineClient):
     async def _encrypt_group(
         self, agent_id: str, to: str, payload: object, msg_type: str
     ) -> tuple[Any, dict[str, Any]]:
-        """Encrypt and build body for group message."""
-        import asyncio
+        """Encrypt and build body for group message.
 
-        from rine._http import SyncHttpClient
-        from rine._sender_key_ops import get_or_create_sender_key_sync
+        ``agent_id`` is the acting agent ``send()`` already resolved. The sender
+        key must be keyed, distributed and ratcheted under that same identity —
+        re-resolving here would key the ratchet to the org's default agent while
+        the encrypt signs as the requested one.
 
-        resolved_agent_id = await self._resolve_agent_id()
+        The encryption itself is the sync client's, run on a worker thread: one
+        implementation of the group protocol, not two that can drift.
+        """
+        from rine._group_send import encrypt_for_group_sync
+        from rine._mls.bridge import with_sync_http
 
-        def _sync_sk_ops() -> tuple[Any, str]:
-            sync_http = SyncHttpClient(
-                config_dir=self._config_dir,
-                api_url=self._api_url,
-                timeout=self._timeout,
-            )
-            try:
-                return get_or_create_sender_key_sync(
-                    sync_http, self._config_dir, resolved_agent_id, to
-                )
-            finally:
-                sync_http.close()
-
-        own_state, group_id = await asyncio.to_thread(_sync_sk_ops)
-
-        result, _ = encrypt_group_message(self._config_dir, agent_id, group_id, own_state, payload)
+        result, _ = await with_sync_http(
+            self,
+            lambda http: encrypt_for_group_sync(http, self._config_dir, agent_id, to, payload),
+        )
         return result, {
             "to_handle": to,
             "type": msg_type,
@@ -328,7 +323,10 @@ class RineClient(BaseRineClient):
     ) -> CursorPage[DecryptedMessage]:
         """Read inbox messages with auto-decryption.
 
-        Silently returns undecrypted messages on decryption failure (no retry).
+        Group rows self-heal like ``read()``: a message whose sender key has not
+        been ingested yet triggers a pending-distribution fetch and one retry.
+        A message that still cannot be opened carries ``decrypt_error`` — the
+        inbox never raises on a single bad row.
 
         Args:
             agent: Agent to read as.
@@ -366,6 +364,8 @@ class RineClient(BaseRineClient):
             msg = DecryptedMessage.model_validate(raw)
             try:
                 msg = await self._decrypt_message(agent_id, msg)
+            except CryptoError as e:
+                msg = await self._self_heal_group_decrypt(agent_id, msg, e)
             except Exception as e:
                 msg.decrypt_error = str(e)
                 logger.debug("Inbox decrypt failed for %s", msg.id, exc_info=True)
@@ -435,26 +435,48 @@ class RineClient(BaseRineClient):
 
     async def _decrypt_message(self, agent_id: str, msg: DecryptedMessage) -> DecryptedMessage:
         """Decrypt a message in-place."""
-        if msg.encryption_version == EncryptionVersion.HPKE_V1:
+        if msg.encryption_version in (
+            EncryptionVersion.HPKE_V1,
+            EncryptionVersion.HPKE_HYBRID_V1,
+        ):
             result = await decrypt_message_async(
                 self._config_dir, agent_id, msg.encrypted_payload, self._http
             )
         elif msg.encryption_version == EncryptionVersion.SENDER_KEY_V1 and msg.group_id:
-            result = await decrypt_group_message_async(
-                self._config_dir, agent_id, str(msg.group_id), msg.encrypted_payload, self._http
-            )
+            # The sender-key ratchet consumes its message key, so a second
+            # decrypt of the same row would fail; serve it from the memo.
+            memoized = self._decrypt_memo.get(agent_id, str(msg.id))
+            if memoized is not None:
+                result = memoized
+            else:
+                result = await decrypt_group_message_async(
+                    self._config_dir,
+                    agent_id,
+                    str(msg.group_id),
+                    msg.encrypted_payload,
+                    self._http,
+                )
+                self._decrypt_memo.set(agent_id, str(msg.id), result)
         elif msg.encryption_version == EncryptionVersion.MLS_V1:
-            # MLS crypto is TypeScript-only (ts-mls); return undecrypted with a
-            # clear marker instead of crashing.
-            msg.decrypt_error = (
-                "MLS-encrypted message; the Python SDK cannot decrypt it. Use "
-                "the rine CLI, MCP server, or TypeScript SDK to read it."
+            from rine._mls.bridge import with_sync_http
+            from rine._mls.messages import decrypt_mls_group_message
+
+            # MLS recovers inside the decrypt (install pending Welcomes, sync
+            # commits, retry once), so there is nothing for the sender-key
+            # self-heal to add. A sender reading its own message back is served
+            # by the MLS core's self-read cache, not by the memo. The decrypt is
+            # the sync client's, run on a worker thread.
+            group_id = None if msg.group_id is None else str(msg.group_id)
+            result = await with_sync_http(
+                self,
+                lambda http: decrypt_mls_group_message(
+                    http, self._config_dir, agent_id, group_id, msg.encrypted_payload
+                ),
             )
-            return msg
         else:
-            # Unknown/unhandled encryption_version (e.g. hpke-hybrid-v1). Mark it
-            # explicitly so it is never mistaken for a successfully-decrypted
-            # message with empty plaintext — fail loud, never silent.
+            # An encryption_version this SDK does not know. Mark it explicitly so
+            # it is never mistaken for a successfully-decrypted message with
+            # empty plaintext — fail loud, never silent.
             msg.decrypt_error = (
                 f"Unsupported encryption_version '{msg.encryption_version}'; "
                 "the Python SDK cannot decrypt this message."
@@ -465,6 +487,28 @@ class RineClient(BaseRineClient):
         msg.verified = result.verified
         msg.verification_status = result.verification_status
         return msg
+
+    async def _self_heal_group_decrypt(
+        self, agent_id: str, msg: DecryptedMessage, error: CryptoError
+    ) -> DecryptedMessage:
+        """Retry one failed group decrypt after ingesting pending sender keys.
+
+        Mirrors ``read()``'s self-heal for the best-effort receive path: a group
+        message whose sender key has not been ingested yet arrives before its
+        distribution DM is opened, and would otherwise stay undecryptable
+        forever. Never raises — the failure is reported as ``decrypt_error``.
+        """
+        if msg.encryption_version != EncryptionVersion.SENDER_KEY_V1:
+            msg.decrypt_error = str(error)
+            logger.debug("Inbox decrypt failed for %s", msg.id, exc_info=error)
+            return msg
+        try:
+            await self._fetch_pending_sk_distributions(agent_id)
+            return await self._decrypt_message(agent_id, msg)
+        except Exception as e:  # noqa: BLE001 — degrade, never raise (inbox is best-effort)
+            msg.decrypt_error = str(e)
+            logger.debug("Inbox self-heal failed for %s", msg.id, exc_info=True)
+            return msg
 
     async def _fetch_pending_sk_distributions(self, agent_id: str) -> int:
         """Fetch and ingest pending sender key distributions."""
@@ -533,8 +577,8 @@ class RineClient(BaseRineClient):
         # Fetch original to get sender info
         original = await self._http.get(f"/messages/{message_id}")
         recipient_id = str(original.get("from_agent_id", ""))
-        recipient_pk = await fetch_recipient_encryption_key_async(self._http, recipient_id)
-        result = encrypt_message(self._config_dir, agent_id, recipient_pk, payload)
+        recipient = await fetch_recipient_keys_async(self._http, recipient_id)
+        result = encrypt_message(self._config_dir, agent_id, recipient, payload)
 
         extra = self._agent_header(agent)
         reply_body: dict[str, Any] = {
@@ -1029,9 +1073,9 @@ class RineClient(BaseRineClient):
         ``decrypt_error`` set and ``plaintext is None`` — this method never
         raises on a single bad row.
 
-        Note: a message sealed with hybrid PQ (``hpke-hybrid-v1``) cannot be
-        self-read by the Python SDK (no hybrid path); such a row degrades to
-        ``decrypt_error`` like any other unsupported version.
+        Post-quantum (``hpke-hybrid-v1``) rows read like any other: the sender's
+        self-blob is sealed to the sender's own keys, hybrid when it has an
+        ML-KEM key, and the reader dispatches on the blob's own version byte.
 
         Args:
             conversation_id: Conversation UUID.
@@ -1053,8 +1097,8 @@ class RineClient(BaseRineClient):
             params=params,
             extra_headers=extra,
         )
-        # The endpoint returns `{messages, truncated}` (ConversationMessagesPage,
-        # REQ-SRV-04), NOT a cursor `{items}` page. Read the `messages` key.
+        # The endpoint returns `{messages, truncated}` (ConversationMessagesPage),
+        # NOT a cursor `{items}` page. Read the `messages` key.
         raw_items = data.get("messages", []) if isinstance(data, dict) else data
 
         messages: list[DecryptedMessage] = []
@@ -1076,14 +1120,14 @@ class RineClient(BaseRineClient):
             if msg.self_encrypted_payload is None:
                 msg.decrypt_error = "No self-seal blob for this sent message."
                 return msg
-            # The caller can only open the self-sealed copy of its own send.
-            # The self-blob is ALWAYS a classical ``hpke-v1`` seal (the sender's
-            # own X25519 key — see ``encrypt_message``), even on a row whose
-            # ``encryption_version`` is ``hpke-hybrid-v1`` (that version reflects
-            # the *recipient* negotiation). Pin the version to the blob's actual
-            # scheme so ``_decrypt_message`` dispatches classically instead of
-            # falling into the unsupported-version branch and degrading a
-            # recoverable row.
+            # The caller can only open the self-sealed copy of its own send, and
+            # the self-blob is sealed to the SENDER's keys — so its scheme
+            # follows the sender's own PQ capability, not the row's
+            # ``encryption_version`` (which records the *recipient*
+            # negotiation). Route it to the 1:1 branch; that branch dispatches
+            # on the blob's own version byte, so a classical and a hybrid
+            # self-blob are both read correctly and neither degrades into the
+            # unsupported-version branch.
             msg.encrypted_payload = msg.self_encrypted_payload
             msg.encryption_version = EncryptionVersion.HPKE_V1
         try:
@@ -1211,8 +1255,10 @@ class RineClient(BaseRineClient):
     async def rotate_keys(self, agent_id: str) -> AgentRead:
         """Rotate an agent's signing and encryption keypairs.
 
-        Generates new Ed25519 + X25519 keypairs locally, uploads the public
-        halves, and saves the new private keys to the config directory.
+        Generates new Ed25519 + X25519 + ML-KEM-768 keypairs locally, uploads
+        the public halves, and saves the new private keys to the config
+        directory. An agent that predates post-quantum DM keys gains one here,
+        after which peers seal ``hpke-hybrid-v1`` to it.
 
         Args:
             agent_id: Agent UUID.
@@ -1225,20 +1271,41 @@ class RineClient(BaseRineClient):
             NotFoundError: If agent not found.
         """
         from rine._crypto.keys import (
-            encryption_public_key_to_jwk,
             generate_agent_keys,
+            public_keys_body,
             save_agent_keys,
-            signing_public_key_to_jwk,
         )
 
         keys = generate_agent_keys()
-        body = {
-            "signing_public_key": signing_public_key_to_jwk(keys.signing.public_key),
-            "encryption_public_key": encryption_public_key_to_jwk(keys.encryption.public_key),
-        }
+        body = public_keys_body(keys)
         data = await self._http.post(f"/agents/{agent_id}/keys", json_body=body)
         save_agent_keys(self._config_dir, agent_id, keys)
         return AgentRead.model_validate(data)
+
+    # --- MLS ---
+
+    async def republish_mls_key_packages(self, agent_id: str) -> MlsCutoverResult:
+        """Discard the agent's MLS KeyPackage pool and publish a fresh one.
+
+        Run this once when upgrading from a rine release that predates the
+        current MLS core: KeyPackages published by the old one cannot be read by
+        the new one, so a peer trying to add this agent to a group would fail on
+        every stale entry. The stale packages are claimed out of the *server*
+        pool, not merely outnumbered, so a peer can never claim one and fail.
+
+        Args:
+            agent_id: Agent UUID.
+
+        Returns:
+            The count drained from the server and the count freshly stored.
+        """
+        from rine._mls import drain_and_republish_mls_key_packages
+        from rine._mls.bridge import with_sync_http
+
+        return await with_sync_http(
+            self,
+            lambda http: drain_and_republish_mls_key_packages(http, self._config_dir, agent_id),
+        )
 
     # --- Agent Inspection ---
 

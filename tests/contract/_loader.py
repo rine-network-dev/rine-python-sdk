@@ -1,9 +1,9 @@
 """Golden-envelope loader for the SDK-side contract tests.
 
 Loads fixtures from ``Path(__file__).parent / "fixtures"`` — portable, ships in
-the sdist (REQ-C1/C7), never reaches up to the monorepo ``../tests``. Skips
+the sdist, never reaches up to the monorepo ``../tests``. Skips
 cleanly if the dir/file is absent so a standalone-sdist consumer running the
-suite in isolation is not broken (REQ-C4); fixtures always ship, so in-repo this
+suite in isolation is not broken; fixtures always ship, so in-repo this
 skip never fires.
 """
 

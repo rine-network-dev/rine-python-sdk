@@ -1,6 +1,6 @@
 """Rate-limit resilience: token 429 backoff, jittered refresh margin, key cache.
 
-Covers REQ-PY-01..04. Pure unit / respx — no real network, injected RNG and
+Pure unit / respx — no real network, injected RNG and
 clock instead of freezing time.
 """
 
@@ -21,8 +21,8 @@ from rine._crypto.keys import (
 from rine._crypto.message import (
     _verify_envelope_sender_async,
     _verify_envelope_sender_sync,
-    fetch_recipient_encryption_key_async,
-    fetch_recipient_encryption_key_sync,
+    fetch_recipient_keys_async,
+    fetch_recipient_keys_sync,
 )
 from rine._crypto.sign import sign_payload
 from rine._http import AsyncHttpClient, SyncHttpClient
@@ -258,8 +258,8 @@ class TestKeyCacheFetchThrough:
 
         respx.get(KEYS_URL).mock(side_effect=keys_handler)
         client = SyncHttpClient(config_dir=tmp_config_dir, api_url=API)
-        first = fetch_recipient_encryption_key_sync(client, SENDER_ID)
-        second = fetch_recipient_encryption_key_sync(client, SENDER_ID)
+        first = fetch_recipient_keys_sync(client, SENDER_ID)
+        second = fetch_recipient_keys_sync(client, SENDER_ID)
         assert first == second
         assert calls["c"] == 1
         client.close()
@@ -279,11 +279,11 @@ class TestKeyCacheFetchThrough:
         client = SyncHttpClient(config_dir=tmp_config_dir, api_url=API)
         now = {"t": 1000.0}
         client._keys_cache = KeyCache(600.0, 256, time_fn=lambda: now["t"])
-        fetch_recipient_encryption_key_sync(client, SENDER_ID)
-        fetch_recipient_encryption_key_sync(client, SENDER_ID)
+        fetch_recipient_keys_sync(client, SENDER_ID)
+        fetch_recipient_keys_sync(client, SENDER_ID)
         assert calls["c"] == 1
         now["t"] = 1601.0  # past the 600s TTL
-        fetch_recipient_encryption_key_sync(client, SENDER_ID)
+        fetch_recipient_keys_sync(client, SENDER_ID)
         assert calls["c"] == 2
         client.close()
 
@@ -300,8 +300,8 @@ class TestKeyCacheFetchThrough:
 
         respx.get(KEYS_URL).mock(side_effect=keys_handler)
         client = AsyncHttpClient(config_dir=tmp_config_dir, api_url=API)
-        await fetch_recipient_encryption_key_async(client, SENDER_ID)
-        await fetch_recipient_encryption_key_async(client, SENDER_ID)
+        await fetch_recipient_keys_async(client, SENDER_ID)
+        await fetch_recipient_keys_async(client, SENDER_ID)
         assert calls["c"] == 1
         await client.close()
 

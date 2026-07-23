@@ -2,17 +2,16 @@
 
 Covers the four small fixes from ``phases/crewai-integration/DECISIONS.md``:
 
-- **P0-1** ``inbox(status=...)`` forwards the status filter to the inbox GET, and
+- ``inbox(status=...)`` forwards the status filter to the inbox GET, and
   a new ``mark_delivered(agent_id, message_ids)`` method POSTs to the server's
   ``/agents/{id}/messages/mark-delivered`` endpoint. Sync + async.
-- **P0-2** ``_decrypt_message`` (reached via ``read()``) sets a clear
+- ``_decrypt_message`` (reached via ``read()``) sets a clear
   ``decrypt_error`` naming the unhandled ``encryption_version`` instead of
   silently returning the message with ``decrypt_error=None``. Sync + async.
-- **P0-3** ``rine.__version__`` matches ``pyproject.toml`` (0.2.0), read from the
+- ``rine.__version__`` matches ``pyproject.toml`` (0.2.0), read from the
   file so it can't drift again.
-- **P0-4** The sender-key send latch raises ``MlsUnsupportedError`` when the
-  resolved ``/groups`` payload signals ``mls_pending`` (in addition to the
-  existing ``mls_group_id`` case).
+- A group send routes by the resolved ``/groups`` payload: ``mls_pending``
+  (like ``mls_group_id``) means MLS, and must never reach the sender-key path.
 
 All HTTP is mocked with respx; no DB. Server contract verified against
 ``src/rine/api/messages.py`` (mark-delivered handler + ``_status_filter``) and
@@ -38,9 +37,10 @@ from rine._crypto.keys import (
     signing_public_key_to_jwk,
 )
 from rine._crypto.message import encrypt_message
+from rine._group_send import encrypt_for_group_sync, is_mls_group
 from rine._http import SyncHttpClient
-from rine._sender_key_ops import get_or_create_sender_key_sync
-from rine.errors import MlsUnsupportedError
+from rine.errors import CryptoError
+from tests.conftest import recipient_view
 
 AGENT_ID = "00000000-1111-2222-3333-444444444444"
 OTHER_AGENT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -96,9 +96,12 @@ def _mock_own_signing_keys() -> None:
 _CONFIG_DIR_HOLDER: dict[str, str] = {"dir": ""}
 
 
-def _build_message_payload(encryption_version: str, encrypted_payload: str) -> dict:
+def _build_message_payload(
+    encryption_version: str, encrypted_payload: str, group_id: str | None = None
+) -> dict:
     return {
         "id": MESSAGE_ID,
+        "group_id": group_id,
         "conversation_id": "cccccccc-dddd-eeee-ffff-000000000002",
         "from_agent_id": AGENT_ID,
         "to_agent_id": AGENT_ID,
@@ -110,15 +113,39 @@ def _build_message_payload(encryption_version: str, encrypted_payload: str) -> d
     }
 
 
+def _mock_unreachable_mls_group() -> None:
+    """An MLS group this agent can neither be welcomed into nor self-join."""
+    respx.get(f"https://rine.network/agents/{AGENT_ID}/mls/welcomes").mock(
+        return_value=httpx.Response(200, json={"welcomes": []})
+    )
+    respx.get(f"https://rine.network/groups/{GROUP_ID}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": GROUP_ID,
+                "name": "g",
+                "handle": GROUP_HANDLE,
+                "created_at": "2024-01-01T00:00:00Z",
+                "mls_enabled": True,
+                "mls_group_id": "99999999-0000-1111-2222-333333333333",
+                "mls_pending": False,
+            },
+        )
+    )
+    respx.get(f"https://rine.network/groups/{GROUP_ID}/mls/group-info").mock(
+        return_value=httpx.Response(200, json={"group_info": None, "epoch": None})
+    )
+
+
 def _self_encrypt(config_dir: str, payload: dict) -> str:
-    """HPKE-encrypt ``payload`` from AGENT_ID to AGENT_ID (self-readable)."""
-    own_pk = load_agent_keys(config_dir, AGENT_ID).encryption.public_key
-    result = encrypt_message(config_dir, AGENT_ID, own_pk, payload)
+    """Encrypt ``payload`` from AGENT_ID to AGENT_ID (self-readable)."""
+    own = recipient_view(load_agent_keys(config_dir, AGENT_ID))
+    result = encrypt_message(config_dir, AGENT_ID, own, payload)
     return result.encrypted_payload
 
 
 # =====================================================================
-# P0-1: inbox(status=) filter + mark_delivered()
+# inbox(status=) filter + mark_delivered()
 # =====================================================================
 
 
@@ -275,8 +302,13 @@ class TestMarkDeliveredAsync:
 
 
 # =====================================================================
-# P0-2: decrypt_error on unknown encryption_version (no silent passthrough)
+# decrypt_error on unknown encryption_version (no silent passthrough)
 # =====================================================================
+
+#: A version this SDK has never heard of. It used to be `hpke-hybrid-v1`, which
+#: the SDK now decrypts — the row this pins is one from a FUTURE scheme, which
+#: must still fail loud rather than arrive as empty plaintext.
+_UNKNOWN_VERSION = "hpke-from-the-future-v9"
 
 
 class TestUnknownEncryptionVersionSync:
@@ -287,31 +319,39 @@ class TestUnknownEncryptionVersionSync:
         _mock_agents()
         respx.get(f"https://rine.network/messages/{MESSAGE_ID}").mock(
             return_value=httpx.Response(
-                200, json=_build_message_payload("hpke-hybrid-v1", "ZHVtbXk=")
+                200, json=_build_message_payload(_UNKNOWN_VERSION, "ZHVtbXk=")
             )
         )
 
         msg = sync_client.read(MESSAGE_ID)
 
         assert msg.decrypt_error is not None
-        assert "hpke-hybrid-v1" in msg.decrypt_error
+        assert _UNKNOWN_VERSION in msg.decrypt_error
         assert msg.plaintext is None
 
     @respx.mock
-    def test_read_mls_message_still_sets_mls_marker(self, sync_client, tmp_config_dir):
+    def test_read_mls_message_this_agent_cannot_join_fails_by_name(
+        self, sync_client, tmp_config_dir
+    ):
+        """An MLS row is decrypted for real now, so an unreachable group must say so.
+
+        No Welcome is waiting and the group has published no GroupInfo, so the
+        read path's one-shot recovery cannot establish state. That surfaces as a
+        CryptoError naming the group — never as a silently undecrypted message.
+        """
         _CONFIG_DIR_HOLDER["dir"] = tmp_config_dir
         _mock_token()
         _mock_agents()
+        _mock_unreachable_mls_group()
         respx.get(f"https://rine.network/messages/{MESSAGE_ID}").mock(
             return_value=httpx.Response(
-                200, json=_build_message_payload(EncryptionVersion.MLS_V1, "ZHVtbXk=")
+                200,
+                json=_build_message_payload(EncryptionVersion.MLS_V1, "BAAB", group_id=GROUP_ID),
             )
         )
 
-        msg = sync_client.read(MESSAGE_ID)
-
-        assert msg.decrypt_error is not None
-        assert "MLS" in msg.decrypt_error
+        with pytest.raises(CryptoError, match=GROUP_ID):
+            sync_client.read(MESSAGE_ID)
 
     @respx.mock
     def test_read_normal_hpke_message_still_decrypts(self, sync_client, tmp_config_dir):
@@ -343,32 +383,35 @@ class TestUnknownEncryptionVersionAsync:
         _mock_agents()
         respx.get(f"https://rine.network/messages/{MESSAGE_ID}").mock(
             return_value=httpx.Response(
-                200, json=_build_message_payload("hpke-hybrid-v1", "ZHVtbXk=")
+                200, json=_build_message_payload(_UNKNOWN_VERSION, "ZHVtbXk=")
             )
         )
 
         msg = await async_client.read(MESSAGE_ID)
 
         assert msg.decrypt_error is not None
-        assert "hpke-hybrid-v1" in msg.decrypt_error
+        assert _UNKNOWN_VERSION in msg.decrypt_error
         assert msg.plaintext is None
         await async_client.close()
 
     @respx.mock
-    async def test_read_mls_message_still_sets_mls_marker(self, async_client, tmp_config_dir):
+    async def test_read_mls_message_this_agent_cannot_join_fails_by_name(
+        self, async_client, tmp_config_dir
+    ):
+        """Async counterpart: the same refusal, through the same implementation."""
         _CONFIG_DIR_HOLDER["dir"] = tmp_config_dir
         _mock_token()
         _mock_agents()
+        _mock_unreachable_mls_group()
         respx.get(f"https://rine.network/messages/{MESSAGE_ID}").mock(
             return_value=httpx.Response(
-                200, json=_build_message_payload(EncryptionVersion.MLS_V1, "ZHVtbXk=")
+                200,
+                json=_build_message_payload(EncryptionVersion.MLS_V1, "BAAB", group_id=GROUP_ID),
             )
         )
 
-        msg = await async_client.read(MESSAGE_ID)
-
-        assert msg.decrypt_error is not None
-        assert "MLS" in msg.decrypt_error
+        with pytest.raises(CryptoError, match=GROUP_ID):
+            await async_client.read(MESSAGE_ID)
         await async_client.close()
 
     @respx.mock
@@ -393,7 +436,7 @@ class TestUnknownEncryptionVersionAsync:
 
 
 # =====================================================================
-# P0-3: _version.py matches pyproject.toml
+# _version.py matches pyproject.toml
 # =====================================================================
 
 
@@ -419,7 +462,7 @@ class TestVersionConsistency:
 
 
 # =====================================================================
-# P0-4: sender-key latch widened to mls_pending
+# sender-key latch widened to mls_pending
 # =====================================================================
 
 
@@ -428,10 +471,30 @@ def _make_http_client(tmp_config_dir: str) -> SyncHttpClient:
     return SyncHttpClient(config_dir=tmp_config_dir, api_url="https://rine.network")
 
 
-class TestSenderKeyLatchMlsPending:
+class TestGroupSendRoutesMlsAwayFromSenderKeys:
+    """The send dispatcher, not the sender-key path, decides which crypto a group gets.
+
+    The server refuses a ``sender-key-v1`` send to an MLS (or MLS-initializing)
+    group, so routing it there would produce an undeliverable message. These
+    pin the routing decision itself, which is cheaper and more direct than
+    driving a whole encrypt to observe it.
+    """
+
+    def test_mls_pending_group_is_an_mls_group(self):
+        """A group frozen mid-init: its unfreezing MLS commit is already in flight."""
+        assert is_mls_group({"id": GROUP_ID, "mls_group_id": None, "mls_pending": True})
+
+    def test_mls_active_group_is_an_mls_group(self):
+        assert is_mls_group({"id": GROUP_ID, "mls_group_id": "some-mls-id", "mls_pending": False})
+
+    def test_plain_group_is_not_an_mls_group(self):
+        assert not is_mls_group({"id": GROUP_ID, "mls_group_id": None, "mls_pending": False})
+
     @respx.mock
-    def test_raises_mls_unsupported_when_group_mls_pending(self, tmp_config_dir, saved_agent_keys):
-        """A group payload with mls_pending=True must trip the local latch."""
+    def test_mls_group_send_never_reaches_the_sender_key_path(
+        self, tmp_config_dir, saved_agent_keys
+    ):
+        """Routing is proven by what is NOT called: no member fan-out, no distribution."""
         respx.post("https://rine.network/oauth/token").mock(
             return_value=httpx.Response(200, json=_TOKEN_RESPONSE)
         )
@@ -442,7 +505,10 @@ class TestSenderKeyLatchMlsPending:
                     "items": [
                         {
                             "id": GROUP_ID,
+                            "name": "g",
                             "handle": GROUP_HANDLE,
+                            "created_at": "2024-01-01T00:00:00Z",
+                            "mls_enabled": True,
                             "mls_group_id": None,
                             "mls_pending": True,
                         }
@@ -450,47 +516,26 @@ class TestSenderKeyLatchMlsPending:
                 },
             )
         )
-        # Members mocked empty so that, while the latch is NOT yet widened, the
-        # call completes WITHOUT raising — making the assertion fail cleanly with
-        # "DID NOT RAISE MlsUnsupportedError" rather than an unmocked-request error.
-        respx.get(f"https://rine.network/groups/{GROUP_ID}/members").mock(
+        members = respx.get(f"https://rine.network/groups/{GROUP_ID}/members").mock(
             return_value=httpx.Response(200, json={"items": []})
         )
-
-        http = _make_http_client(tmp_config_dir)
-        try:
-            with pytest.raises(MlsUnsupportedError):
-                get_or_create_sender_key_sync(http, tmp_config_dir, AGENT_ID, GROUP_HANDLE)
-        finally:
-            http.close()
-
-    @respx.mock
-    def test_raises_mls_unsupported_when_group_has_mls_group_id(
-        self, tmp_config_dir, saved_agent_keys
-    ):
-        """Existing latch case: mls_group_id set still raises (regression guard)."""
-        respx.post("https://rine.network/oauth/token").mock(
-            return_value=httpx.Response(200, json=_TOKEN_RESPONSE)
+        # The MLS path with no local state: pre-sync fails quietly, then recovery
+        # runs and cannot establish state either.
+        respx.get(f"https://rine.network/groups/{GROUP_ID}/mls/handshakes").mock(
+            return_value=httpx.Response(200, json={"handshakes": []})
         )
-        respx.get("https://rine.network/groups").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "items": [
-                        {
-                            "id": GROUP_ID,
-                            "handle": GROUP_HANDLE,
-                            "mls_group_id": "some-mls-id",
-                            "mls_pending": False,
-                        }
-                    ]
-                },
-            )
+        respx.get(f"https://rine.network/agents/{AGENT_ID}/mls/welcomes").mock(
+            return_value=httpx.Response(200, json={"welcomes": []})
+        )
+        respx.get(f"https://rine.network/groups/{GROUP_ID}/mls/group-info").mock(
+            return_value=httpx.Response(200, json={"group_info": None, "epoch": None})
         )
 
         http = _make_http_client(tmp_config_dir)
         try:
-            with pytest.raises(MlsUnsupportedError):
-                get_or_create_sender_key_sync(http, tmp_config_dir, AGENT_ID, GROUP_HANDLE)
+            with pytest.raises(CryptoError, match=GROUP_ID):
+                encrypt_for_group_sync(http, tmp_config_dir, AGENT_ID, GROUP_HANDLE, {"a": 1})
         finally:
             http.close()
+
+        assert not members.called, "an MLS group must never be fanned out to sender keys"

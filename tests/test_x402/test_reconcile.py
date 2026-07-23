@@ -1,12 +1,12 @@
-"""F-1 reconciliation: the pure payee-quote-binding invariant (mirror of TS tests).
+"""Reconciliation: the pure payee-quote-binding invariant (mirror of TS tests).
 
 ``reconcile_payment`` returns the payee-authored requirement a payment satisfies, or
 raises a typed refusal on every mismatch axis (payTo redirect, underpay, wrong asset,
-wrong network, wrong scheme, worthless token). R-1 binds a payment to the ONE quote it
+wrong network, wrong scheme, worthless token). Each payment is bound to the ONE quote it
 answers, so the reconciler is always handed a single quote's ``accepts[]`` (the
 conversation-wide union is dissolved).
 
-The reconciler now takes the FULL ``PaymentPayload`` (findings #3/#4): it binds to the
+The reconciler now takes the FULL ``PaymentPayload``: it binds to the
 tier the payer's own ``accepted`` block NAMES (exact atomic amount) — not the first tier
 a ``>=`` check happens to satisfy — and enforces a local defense-in-depth check that the
 SIGNED EIP-3009 ``payload.authorization.value`` covers that tier, never the payer-echoed
@@ -113,7 +113,7 @@ def test_reconcile_refuses_missing_asset_without_crashing() -> None:
 
     Parity guard with the TS suite: a malformed but well-typed envelope (valid amount,
     absent asset) must yield a typed REQUIREMENT_MISMATCH — never an AttributeError /
-    TypeError — so every surface threads a graceful receipt (F-4).
+    TypeError — so every surface threads a graceful receipt.
     """
     payment = _payment()
     del payment["accepted"]["asset"]

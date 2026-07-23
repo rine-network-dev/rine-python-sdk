@@ -1090,12 +1090,13 @@ wheels = [
 
 [[package]]
 name = "rine"
-version = "0.8.1"
+version = "0.9.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
     { name = "httpx" },
     { name = "pydantic" },
+    { name = "rine-mls" },
 ]
 
 [package.optional-dependencies]
@@ -1122,9 +1123,14 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
     { name = "respx", marker = "extra == 'dev'", specifier = ">=0.22" },
+    { name = "rine-mls", directory = "../rine-mls/crates/rine-mls-py" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8" },
 ]
 provides-extras = ["dev", "payments"]
+
+[[package]]
+name = "rine-mls"
+source = { directory = "../rine-mls/crates/rine-mls-py" }
 
 [[package]]
 name = "rlp"

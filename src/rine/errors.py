@@ -144,23 +144,21 @@ class UnsupportedTargetError(RineError):
     """
 
 
-class MlsUnsupportedError(RineError):
-    """MLS-encrypted group operation unsupported by the Python SDK.
+class NoMlsGroupStateError(CryptoError):
+    """This agent holds no local MLS state for the group it was asked about.
 
-    MLS crypto lives in the TypeScript ``@rine-network/core`` library (``ts-mls``);
-    Python has no in-process equivalent. Use the rine CLI, MCP server, or
-    TypeScript SDK to send to / read from MLS groups.
+    The three causes a caller answers the same way — never added to the MLS
+    group, a Welcome not installed yet, or state that was retired — so sending
+    and reading both respond by installing state and retrying once. Reaching a
+    caller means that recovery has already run and failed.
     """
 
-    def __init__(
-        self,
-        detail: str = (
-            "This group uses MLS encryption, which the Python SDK does not yet "
-            "support. Use the rine CLI, MCP server, or TypeScript SDK to send to "
-            "MLS groups."
-        ),
-    ) -> None:
-        super().__init__(detail)
+    def __init__(self, group_id: str) -> None:
+        super().__init__(
+            f"No MLS state for group {group_id}. This agent is not in the group's "
+            "MLS state yet; joining the group, or receiving a Welcome from a "
+            "member, establishes it."
+        )
 
 
 class SpiffeVerificationError(RineError):

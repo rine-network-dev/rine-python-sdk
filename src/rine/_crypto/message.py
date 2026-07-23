@@ -12,15 +12,20 @@ from typing import TYPE_CHECKING, Any, Literal
 import httpx
 
 from rine._constants import EncryptionVersion
+from rine._crypto.dm_envelope import (
+    RecipientKeys,
+    open_dm,
+    recipient_keys_from_response,
+    seal_to_recipient,
+    seal_to_self,
+)
 from rine._crypto.envelope import decode_envelope, encode_envelope
-from rine._crypto.hpke import open as hpke_open
-from rine._crypto.hpke import seal as hpke_seal
 from rine._crypto.keys import (
     agent_id_from_kid,
     jwk_to_public_key,
     load_agent_keys,
     make_kid,
-    signing_public_key_to_jwk,
+    public_keys_body,
 )
 from rine._crypto.sender_keys import (
     SenderKeyState,
@@ -53,8 +58,9 @@ class EncryptResult:
     to the SENDER's own key, set only for 1:1 sends (``encrypt_message``) so the
     sender can later self-read its own message via ``thread()``. It is ``None``
     for group sends (groups self-read via the sender-key cache, not a self-blob).
-    The Python SDK self-seals CLASSICALLY (HPKE to the sender's X25519 key) —
-    consistent with the SDK only decrypting ``hpke-v1``/sender-key.
+    The self-blob follows the SENDER's own post-quantum capability — hybrid when
+    the sender has an ML-KEM key, classical otherwise — independent of the
+    version negotiated for the recipient.
     """
 
     __slots__ = (
@@ -150,7 +156,7 @@ def _verify_envelope_sender_sync(
 
     If a CACHED key yields a verify failure the sender may have rotated keys
     mid-TTL, so refetch once bypassing the cache and re-verify before declaring
-    the signature invalid (D-5). A genuinely fresh fetch that fails is not
+    the signature invalid. A genuinely fresh fetch that fails is not
     re-fetched (parity with rine-core ``verifyEnvelopeSender``).
     """
     try:
@@ -175,7 +181,7 @@ async def _verify_envelope_sender_async(
     """Verify envelope sender signature asynchronously.
 
     Mirrors :func:`_verify_envelope_sender_sync`, including the cache-gated
-    verify-failure refetch (D-5): only a CACHED key that fails is re-fetched.
+    verify-failure refetch: only a CACHED key that fails is re-fetched.
     """
     try:
         agent_id = agent_id_from_kid(kid)
@@ -196,38 +202,36 @@ async def _verify_envelope_sender_async(
 def encrypt_message(
     config_dir: str,
     sender_agent_id: str,
-    recipient_encryption_pk: bytes,
+    recipient: RecipientKeys,
     payload: object,
 ) -> EncryptResult:
-    """Encrypt a 1:1 message with HPKE.
+    """Encrypt a 1:1 message, post-quantum when the recipient allows it.
 
     Args:
         config_dir: Config directory path.
         sender_agent_id: Sender agent UUID.
-        recipient_encryption_pk: Recipient's 32-byte X25519 public key.
+        recipient: Recipient's published encryption keys. A recipient that
+            publishes an ML-KEM key gets ``hpke-hybrid-v1``; one that does not
+            gets ``hpke-v1``.
         payload: JSON-serializable message payload.
 
     Returns:
         EncryptResult with base64url-encoded encrypted payload and a
-        ``self_encrypted_payload`` copy sealed to the sender's own X25519 key
-        (classical HPKE) so the sender can self-read its own message later.
+        ``self_encrypted_payload`` copy sealed to the sender's own keys so the
+        sender can self-read its own message later.
     """
     keys = load_agent_keys(config_dir, sender_agent_id)
     plaintext = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     kid = make_kid(sender_agent_id)
     signature = sign_payload(keys.signing.private_key, plaintext)
     envelope = encode_envelope(kid, signature, plaintext)
-    encrypted = hpke_seal(recipient_encryption_pk, envelope)
 
-    # Self-seal: a second ciphertext of the same envelope sealed to the SENDER's
-    # own encryption key. Classical-only (the Python SDK has no hybrid path), so
-    # a sender with a PQ key still self-seals to its X25519 key — additive, the
-    # recipient ciphertext above is unchanged.
-    self_sealed = hpke_seal(keys.encryption.public_key, envelope)
+    encrypted, version = seal_to_recipient(recipient, envelope)
+    self_sealed = seal_to_self(keys, envelope)
 
     return EncryptResult(
         encrypted_payload=to_base64url(encrypted),
-        encryption_version=EncryptionVersion.HPKE_V1,
+        encryption_version=version,
         kid=kid,
         self_encrypted_payload=to_base64url(self_sealed),
     )
@@ -239,7 +243,10 @@ def decrypt_message_sync(
     encrypted_payload_b64: str,
     client: SyncHttpClient,
 ) -> DecryptResult:
-    """Decrypt a 1:1 HPKE message (sync).
+    """Decrypt a 1:1 message, classical or post-quantum (sync).
+
+    The payload's own version byte picks the envelope, so the same call reads
+    ``hpke-v1`` and ``hpke-hybrid-v1``.
 
     Args:
         config_dir: Config directory path.
@@ -252,7 +259,7 @@ def decrypt_message_sync(
     """
     keys = load_agent_keys(config_dir, recipient_agent_id)
     encrypted = from_base64url(encrypted_payload_b64)
-    envelope_bytes = hpke_open(keys.encryption.private_key, encrypted)
+    envelope_bytes = open_dm(keys, encrypted)
     decoded = decode_envelope(envelope_bytes)
     plaintext = decoded.payload.decode("utf-8")
 
@@ -270,7 +277,9 @@ async def decrypt_message_async(
     encrypted_payload_b64: str,
     client: AsyncHttpClient,
 ) -> DecryptResult:
-    """Decrypt a 1:1 HPKE message (async).
+    """Decrypt a 1:1 message, classical or post-quantum (async).
+
+    Mirrors :func:`decrypt_message_sync`, including the version-byte dispatch.
 
     Args:
         config_dir: Config directory path.
@@ -283,7 +292,7 @@ async def decrypt_message_async(
     """
     keys = load_agent_keys(config_dir, recipient_agent_id)
     encrypted = from_base64url(encrypted_payload_b64)
-    envelope_bytes = hpke_open(keys.encryption.private_key, encrypted)
+    envelope_bytes = open_dm(keys, encrypted)
     decoded = decode_envelope(envelope_bytes)
     plaintext = decoded.payload.decode("utf-8")
 
@@ -463,50 +472,46 @@ async def decrypt_group_message_async(
     return DecryptResult(plaintext, decoded.kid, verified, status)
 
 
-def fetch_recipient_encryption_key_sync(client: SyncHttpClient, agent_id: str) -> bytes:
-    """Fetch recipient's encryption public key (sync).
+def fetch_recipient_keys_sync(client: SyncHttpClient, agent_id: str) -> RecipientKeys:
+    """Fetch a recipient's published encryption keys (sync).
 
     Args:
         client: HTTP client.
         agent_id: Agent UUID.
 
     Returns:
-        32-byte X25519 public key.
+        The recipient's X25519 key and, when published, its ML-KEM-768 key —
+        which is what decides whether the message is sealed post-quantum.
     """
     data, _ = get_agent_keys_sync(client, agent_id)
-    return jwk_to_public_key(data["encryption_public_key"], expected_crv="X25519")
+    return recipient_keys_from_response(data)
 
 
-async def fetch_recipient_encryption_key_async(client: AsyncHttpClient, agent_id: str) -> bytes:
-    """Fetch recipient's encryption public key (async).
+async def fetch_recipient_keys_async(client: AsyncHttpClient, agent_id: str) -> RecipientKeys:
+    """Fetch a recipient's published encryption keys (async).
+
+    Mirrors :func:`fetch_recipient_keys_sync`.
 
     Args:
         client: Async HTTP client.
         agent_id: Agent UUID.
 
     Returns:
-        32-byte X25519 public key.
+        The recipient's X25519 key and, when published, its ML-KEM-768 key.
     """
     data, _ = await get_agent_keys_async(client, agent_id)
-    return jwk_to_public_key(data["encryption_public_key"], expected_crv="X25519")
+    return recipient_keys_from_response(data)
 
 
 def get_agent_public_keys(config_dir: str, agent_id: str) -> dict[str, dict[str, str]]:
-    """Get an agent's public keys as JWK dicts.
+    """Get an agent's public keys in their published form.
 
     Args:
         config_dir: Config directory path.
         agent_id: Agent UUID.
 
     Returns:
-        Dict with ``signing_public_key`` and ``encryption_public_key`` JWK dicts.
+        Dict with ``signing_public_key`` and ``encryption_public_key``, plus
+        ``pq_encryption_public_key`` when the agent has a post-quantum key.
     """
-    keys = load_agent_keys(config_dir, agent_id)
-    return {
-        "signing_public_key": signing_public_key_to_jwk(keys.signing.public_key),
-        "encryption_public_key": {
-            "kty": "OKP",
-            "crv": "X25519",
-            "x": to_base64url(keys.encryption.public_key),
-        },
-    }
+    return public_keys_body(load_agent_keys(config_dir, agent_id))

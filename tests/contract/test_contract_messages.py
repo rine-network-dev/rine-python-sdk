@@ -1,7 +1,7 @@
 """SDK-side core-messages contract: replay server goldens through SDK models.
 
 ``send()``/``send_and_wait()`` encrypt before posting, so a full method replay is
-impractical; the assertion FLOOR (REQ-C4) is that the SDK model parses each golden
+impractical; the assertion FLOOR is that the SDK model parses each golden
 body with its relied-on fields populated. The sync test additionally exercises the
 exact key dispatch ``send_and_wait`` performs (``data["message"]`` /
 ``data.get("reply")``) — the drift risk that the server wraps the message under

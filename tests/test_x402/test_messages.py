@@ -93,7 +93,7 @@ def test_parse_x402_payload_roundtrips_verbatim_from_json_string() -> None:
 
 
 def test_parse_x402_payload_when_not_json_object_raises_malformed() -> None:
-    """A non-object / non-JSON body is a typed malformed-payload refusal (F-4)."""
+    """A non-object / non-JSON body is a typed malformed-payload refusal."""
     for bad in ("[]", "not json", "null"):
         with pytest.raises(X402Error) as exc:
             parse_x402_payload(bad)

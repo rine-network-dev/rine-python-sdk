@@ -9,10 +9,11 @@ DEFAULT_TIMEOUT = 30.0
 DEFAULT_MAX_RETRIES = 2
 TOKEN_REFRESH_MARGIN = 60  # base seconds before expiry to trigger refresh (jittered per client)
 TOKEN_REFRESH_JITTER = 120  # max extra seconds added to the base margin, drawn once per client
-TOKEN_RETRY_ATTEMPTS = 3  # max attempts for the OAuth token POST (D-3)
+TOKEN_RETRY_ATTEMPTS = 3  # max attempts for the OAuth token POST
 TOKEN_RETRY_TOTAL_CAP = 30.0  # max cumulative backoff sleep across token retries (seconds)
-KEY_CACHE_TTL = 600.0  # seconds an agent's public keys stay cached client-side (D-5)
+KEY_CACHE_TTL = 600.0  # seconds an agent's public keys stay cached client-side
 KEY_CACHE_MAX_ENTRIES = 256  # max distinct agents cached before LRU eviction
+DECRYPT_MEMO_MAX_ENTRIES = 256  # max group messages memoized per client before LRU eviction
 MAX_SKIP = 1000  # max skipped sender keys cached
 ROTATION_MESSAGE_LIMIT = 100
 ROTATION_AGE_MS = 7 * 24 * 60 * 60 * 1000  # 7 days
@@ -47,6 +48,7 @@ class EncryptionVersion:
     """Encryption version identifiers used in the wire protocol."""
 
     HPKE_V1 = "hpke-v1"
+    HPKE_HYBRID_V1 = "hpke-hybrid-v1"
     SENDER_KEY_V1 = "sender-key-v1"
     MLS_V1 = "mls-v1"
 

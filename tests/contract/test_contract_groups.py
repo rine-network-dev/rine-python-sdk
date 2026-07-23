@@ -3,7 +3,7 @@
 The join (200→JoinedResult / 202→PendingJoinResult) and invite (voucher vs open)
 paths are replayed at method level via respx — the exact status→model dispatch
 that shipped broken in 0.6.1 (``_resources/groups.py``). The remaining shapes use
-the ``Model.model_validate`` floor (REQ-C4): the SDK model must parse the golden
+the ``Model.model_validate`` floor: the SDK model must parse the golden
 body and populate the fields the SDK relies on (extras it ignores are not breaks).
 """
 

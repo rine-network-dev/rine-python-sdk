@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from rine._constants import MessageType
-from rine._crypto.message import encrypt_message, fetch_recipient_encryption_key_sync
+from rine._crypto.message import encrypt_message, fetch_recipient_keys_sync
 from rine._crypto.sender_keys import (
     SenderKeyState,
     generate_sender_key,
@@ -54,9 +54,9 @@ def distribute_sender_key_sync(
 
     for recipient_id in recipient_ids:
         try:
-            recipient_pk = fetch_recipient_encryption_key_sync(client, recipient_id)
+            recipient = fetch_recipient_keys_sync(client, recipient_id)
             result = encrypt_message(
-                config_dir, sender_agent_id, recipient_pk, distribution_payload
+                config_dir, sender_agent_id, recipient, distribution_payload
             )
             client.post(
                 "/messages",
@@ -67,6 +67,10 @@ def distribute_sender_key_sync(
                     "encryption_version": result.encryption_version,
                     "sender_signing_kid": result.sender_signing_kid,
                 },
+                # The distribution DM is sent BY the sender-key owner. Without
+                # this the server cannot pick a sender in a multi-agent org and
+                # 422s, so every recipient silently misses the key.
+                extra_headers={"X-Rine-Agent": sender_agent_id},
             )
             succeeded.append(recipient_id)
         except Exception:
@@ -80,8 +84,8 @@ def get_or_create_sender_key_sync(
     client: Any,
     config_dir: str,
     sender_agent_id: str,
-    group_handle: str,
-) -> tuple[SenderKeyState, str]:
+    group: dict[str, Any],
+) -> SenderKeyState:
     """Get or create a sender key for a group, distributing as needed.
 
     Handles rotation triggers (message limit, age, member changes).
@@ -90,30 +94,14 @@ def get_or_create_sender_key_sync(
         client: SyncHttpClient for API calls.
         config_dir: Config directory path.
         sender_agent_id: Sender agent UUID.
-        group_handle: Group handle (with or without ``#`` prefix).
+        group: The resolved group, as ``rine._group_send`` read it. Whether the
+            group is on Sender Keys at all is decided there, so reaching here
+            means it is.
 
     Returns:
-        Tuple of (SenderKeyState, group_id).
+        The sender key to encrypt with.
     """
-    # Resolve group — targeted handle lookup
-    from rine.errors import MlsUnsupportedError, NotFoundError
-
-    target_handle = group_handle if group_handle.startswith("#") else f"#{group_handle}"
-    group_data = client.get("/groups", params={"handle": target_handle})
-    items = group_data.get("items", []) if isinstance(group_data, dict) else group_data
-    if not items:
-        raise NotFoundError(f"Group not found: {group_handle}")
-    group = items[0]
     group_id = str(group["id"])
-
-    # MLS latch: a non-null mls_group_id means the group uses MLS encryption,
-    # and mls_pending means the server has frozen the group during MLS init.
-    # The Python SDK has no MLS crypto, and the server rejects sender-key-v1
-    # sends to MLS (or MLS-initializing) groups (409), so fail loudly BEFORE
-    # attempting sender-key crypto rather than silently producing an
-    # undeliverable message.
-    if group.get("mls_group_id") is not None or group.get("mls_pending"):
-        raise MlsUnsupportedError()
 
     # Get members
     members_data = client.get(f"/groups/{group_id}/members")
@@ -161,7 +149,7 @@ def get_or_create_sender_key_sync(
         ]
         other_states.append(new_state)
         save_sender_key_state(config_dir, sender_agent_id, group_id, other_states)
-        return new_state, group_id
+        return new_state
 
     assert own_state is not None
-    return own_state, group_id
+    return own_state

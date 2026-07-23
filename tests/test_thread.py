@@ -1,4 +1,4 @@
-"""REQ-SDK-PY-01/02 — self-seal on send/reply + thread()/get_conversation_messages.
+"""Self-seal on send/reply + thread()/get_conversation_messages.
 
 Covers both the async (``RineClient``) and sync (``SyncRineClient``) clients with
 the identical behavioral assertions (the sync client is a hand-mirror of async).
@@ -19,6 +19,7 @@ from rine._crypto.keys import (
     signing_public_key_to_jwk,
 )
 from rine._crypto.message import encrypt_message
+from tests.conftest import recipient_view
 from rine._utils import to_base64url
 from rine.types import DecryptedMessage, ThreadEntry
 
@@ -83,7 +84,7 @@ def _build_rows(config_dir: str, peer_keys) -> tuple[list[dict], dict]:
     sent = encrypt_message(
         config_dir,
         AGENT_ID,
-        peer_keys.encryption.public_key,
+        recipient_view(peer_keys),
         {"text": "hi peer, the codeword is albatross"},
     )
 
@@ -92,7 +93,7 @@ def _build_rows(config_dir: str, peer_keys) -> tuple[list[dict], dict]:
     # PEER_ID so its signature can be verified, then seal to the agent.
     save_agent_keys(config_dir, PEER_ID, peer_keys)
     received = encrypt_message(
-        config_dir, PEER_ID, my_keys.encryption.public_key, {"text": "got it, albatross noted"}
+        config_dir, PEER_ID, recipient_view(my_keys), {"text": "got it, albatross noted"}
     )
 
     rows = [
@@ -161,12 +162,12 @@ def _mock_keys(agent_jwk: dict, peer_keys) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Send / reply self-blob wiring (REQ-SDK-PY-01)
+# Send / reply self-blob wiring
 # ---------------------------------------------------------------------------
 
 
 class TestSelfSealOnSend:
-    """REQ-SDK-PY-01 — send/reply carry the self-seal blob on the wire."""
+    """Send/reply carry the self-seal blob on the wire."""
 
     @respx.mock
     async def test_async_send_includes_self_encrypted_payload(self, async_client):
@@ -315,20 +316,20 @@ class TestSelfSealOnSend:
 
 
 # ---------------------------------------------------------------------------
-# get_conversation_messages + thread() (REQ-SDK-PY-02)
+# get_conversation_messages + thread()
 # ---------------------------------------------------------------------------
 
 
 def _mock_thread_endpoint(rows: list[dict]) -> None:
     # The real Slice A endpoint returns ConversationMessagesPage
-    # (`{messages, truncated}`, REQ-SRV-04), NOT a cursor `{items}` page.
+    # (`{messages, truncated}`), NOT a cursor `{items}` page.
     respx.get(f"{API}/conversations/{CONVERSATION_ID}/messages").mock(
         return_value=httpx.Response(200, json={"messages": rows, "truncated": False})
     )
 
 
 class TestGetConversationMessages:
-    """REQ-SDK-PY-02 — both-sided fetch decrypts each side, degrades gracefully."""
+    """Both-sided fetch decrypts each side, degrades gracefully."""
 
     @respx.mock
     async def test_async_decrypts_both_directions_and_degrades(self, async_client, tmp_config_dir):
@@ -400,7 +401,7 @@ class TestGetConversationMessages:
 
 
 class TestThread:
-    """REQ-SDK-PY-02 — thread() renders the role-tagged transcript."""
+    """thread() renders the role-tagged transcript."""
 
     @respx.mock
     async def test_async_thread_renders_role_tagged_transcript(self, async_client, tmp_config_dir):

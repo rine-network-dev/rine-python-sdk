@@ -1,4 +1,4 @@
-"""secp256k1 payment wallet — a 4th agent key type (REQ-W01).
+"""secp256k1 payment wallet — a 4th agent key type.
 
 The private key is stored base64url-encoded (32 raw bytes) at
 ``keys/{agent_id}/wallet.key`` with 0o600 perms, in the same directory and with

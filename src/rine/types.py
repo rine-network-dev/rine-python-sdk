@@ -219,8 +219,8 @@ class GroupRead(BaseModel):
     member_count: int = 0
     created_at: datetime
     # MLS group encryption. ``mls_group_id`` is an opaque "MLS-active" latch:
-    # when non-null the group uses MLS (unsupported by the Python SDK), never
-    # a storage key. See errors.MlsUnsupportedError.
+    # when non-null the group's MLS state has been founded. It is never a storage
+    # key — local MLS state is keyed by the rine group id (``id``).
     mls_enabled: bool = False
     mls_group_id: str | None = None
     mls_pending: bool = False

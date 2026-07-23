@@ -89,7 +89,7 @@ async def test_settle_when_facilitator_settles_returns_settlement_response() -> 
 
 @respx.mock
 async def test_verify_when_payment_has_extensions_strips_them_from_the_wire_body() -> None:
-    """rine-internal ``extensions`` (R-1 quote-ref) never reach a facilitator.
+    """rine-internal ``extensions`` (quote-ref) never reach a facilitator.
 
     The payee reads the quote-ref from its OWN decrypted payment, never the
     facilitator round-trip, and facilitators schema-validate ``extensions``
@@ -132,7 +132,7 @@ async def test_verify_when_facilitator_errors_raises() -> None:
             await fac.verify(PAYMENT, REQ)
 
 
-# --- F-5: transport allowlist (https, or http only to loopback) --------------
+# --- transport allowlist (https, or http only to loopback) -------------------
 
 
 def test_transport_allows_https() -> None:
@@ -159,13 +159,13 @@ def test_transport_rejects_unsupported_scheme() -> None:
 
 
 def test_client_init_rejects_non_loopback_http() -> None:
-    """F-5 end-to-end: constructing a client over remote http:// is refused."""
+    """End-to-end: constructing a client over remote http:// is refused."""
     with pytest.raises(ValueError, match="cleartext"):
         FacilitatorClient("x402-rs", base_url="http://evil.example", api_key="secret")
 
 
 def test_client_init_rejects_non_loopback_http_without_key() -> None:
-    """F-5: even a no-credential remote http:// facilitator is refused (TS parity)."""
+    """Even a no-credential remote http:// facilitator is refused (TS parity)."""
     with pytest.raises(ValueError, match="cleartext"):
         FacilitatorClient("x402-rs", base_url="http://evil.example")
 

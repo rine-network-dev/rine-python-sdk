@@ -1,4 +1,4 @@
-"""F-2: unknown-decimal assets fail closed instead of being valued as 6-decimal.
+"""Unknown-decimal assets fail closed instead of being valued as 6-decimal.
 
 A non-registry asset has no trustworthy decimals; assuming 6 under-values a sub-6
 token 10^k× and bypasses every spend cap. ``resolve_decimals`` /

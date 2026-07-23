@@ -1,4 +1,4 @@
-"""Payee ``fulfill`` orchestrator: R-1 quote-ref binding + settle-first + failure parity.
+"""Payee ``fulfill`` orchestrator: quote-ref binding + settle-first + failure parity.
 
 The payee must settle against the ONE quote the payment answers — the payer stamps
 that quote's id into the signed ``extensions[X402_QUOTE_REF_KEY]`` and the payee
@@ -67,7 +67,7 @@ def _payment_payload(
 
     ``signed`` is the SIGNED EIP-3009 ``authorization.value`` (defaults to the named
     ``accepted.amount`` = honest payer); pass it to express overpayment on the signed
-    value while ``accepted`` still names the quoted tier exactly (findings #3/#4).
+    value while ``accepted`` still names the quoted tier exactly.
     """
     accepted = {**REQUIREMENT, **accepted_overrides}
     value = signed if signed is not None else accepted["amount"]
@@ -239,7 +239,7 @@ def test_extract_payment_payload_when_no_plaintext_raises_x402error() -> None:
 
 
 def test_extract_payment_payload_when_missing_accepted_raises_malformed() -> None:
-    """F-4: a payment lacking the top-level accepted object is a typed refusal."""
+    """A payment lacking the top-level accepted object is a typed refusal."""
     body = {"x402Version": 2, "payload": {"authorization": {"from": "0xa"}}}
     with pytest.raises(X402Error) as exc:
         extract_payment_payload(_payment_message(plaintext=json.dumps(body)))
@@ -247,7 +247,7 @@ def test_extract_payment_payload_when_missing_accepted_raises_malformed() -> Non
 
 
 def test_extract_payment_payload_when_missing_authorization_raises_malformed() -> None:
-    """F-4: a payment whose payload lacks authorization is refused, not deref'd."""
+    """A payment whose payload lacks authorization is refused, not deref'd."""
     body = {"x402Version": 2, "accepted": REQUIREMENT, "payload": {}}
     with pytest.raises(X402Error) as exc:
         extract_payment_payload(_payment_message(plaintext=json.dumps(body)))
@@ -332,7 +332,7 @@ async def test_fulfill_when_add_marker_false_emits_no_marker() -> None:
     assert client.replies[0]["metadata"] == {}
 
 
-# --- fulfill: F-1 hostile-payer refusals (ref valid, accepted tampered) ------
+# --- fulfill: hostile-payer refusals (ref valid, accepted tampered) ----------
 
 
 @respx.mock
@@ -384,7 +384,7 @@ async def test_fulfill_when_wrong_asset_refuses_before_facilitator() -> None:
     assert client.replies[0]["payload"]["errorReason"] == X402ErrorCode.REQUIREMENT_MISMATCH
 
 
-# --- fulfill: R-1 fail-closed on missing / forged / cross-quote ref ----------
+# --- fulfill: fail-closed on missing / forged / cross-quote ref --------------
 
 
 @respx.mock
@@ -461,7 +461,7 @@ async def test_fulfill_when_referenced_quote_signature_invalid_refuses() -> None
 
 @respx.mock
 async def test_fulfill_when_malformed_payload_threads_graceful_failure() -> None:
-    """F-4: a malformed payment body yields a graceful failure receipt, never a crash."""
+    """A malformed payment body yields a graceful failure receipt, never a crash."""
     verify_route = respx.post(f"{FAC_URL}/verify")
     client = FakeRefClient()
     malformed = _payment_message(plaintext=json.dumps({"payload": {}}))
@@ -536,7 +536,7 @@ async def test_fulfill_when_wrong_message_type_raises_before_facilitator() -> No
 
 @respx.mock
 async def test_standalone_verify_without_expected_fails_closed() -> None:
-    """No thread context + no ``expected`` → NO_QUOTE before the facilitator (F-1)."""
+    """No thread context + no ``expected`` → NO_QUOTE before the facilitator."""
     verify_route = respx.post(f"{FAC_URL}/verify")
 
     async with FacilitatorClient("x402-rs", base_url=FAC_URL) as fac:

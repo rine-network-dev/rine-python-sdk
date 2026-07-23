@@ -120,7 +120,7 @@ def _jittered_margin(rng: Callable[[], float]) -> float:
     """Draw a per-client token-refresh margin: base + uniform(0, jitter) seconds.
 
     Drawn once per client so a single client stays stable around the expiry
-    boundary while co-located clients desynchronize (D-4).
+    boundary while co-located clients desynchronize.
 
     Args:
         rng: Uniform ``[0, 1)`` source.
@@ -229,7 +229,7 @@ async def _fetch_oauth_token_async(
     *,
     rng: Callable[[], float] = random.random,
 ) -> tuple[str, int]:
-    """Async version of :func:`_fetch_oauth_token` (same D-3 retry semantics)."""
+    """Async version of :func:`_fetch_oauth_token` (same retry semantics)."""
     import asyncio
 
     form = _token_form(client_id, client_secret)

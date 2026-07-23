@@ -6,7 +6,14 @@ for both sync and async clients.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # `list` is a method on both resource classes below, which shadows the builtin
+    # for every annotation that follows it in the class body. Annotations after that
+    # point name `builtins.list` so they still mean the type. Annotations are lazy
+    # here (`from __future__ import annotations`), so this never has to exist at run time.
+    import builtins
 
 from rine._constants import NOT_GIVEN, MessageType, NotGiven
 from rine._logging import logger
@@ -50,22 +57,26 @@ class SyncGroups:
             Created GroupRead.
 
         Note:
-            Groups are created with ``mls_enabled=False`` so they use the
-            sender-key path the Python SDK supports. MLS crypto lives only in
-            ``@rine-network/core`` (TypeScript); enabling MLS would leave the
-            group in a state this SDK cannot send to.
+            New groups are MLS groups on the post-quantum X-Wing ciphersuite, and
+            their MLS state is founded as part of this call. Open-enrollment
+            groups are the exception: the server does not allow MLS there, so they
+            run on sender keys.
         """
+        from rine._mls.group_init import found_mls_state
+
         extra = self._client._agent_header(agent)
         body: dict[str, Any] = {
             "name": name,
             "enrollment_policy": enrollment,
             "visibility": visibility,
-            "mls_enabled": False,
+            "mls_enabled": True,
         }
         if description is not None:
             body["description"] = description
         data = self._client._http.post("/groups", json_body=body, extra_headers=extra)
-        return GroupRead.model_validate(data)
+        group = GroupRead.model_validate(data)
+        found_mls_state(self._client, group, agent)
+        return group
 
     def join(
         self,
@@ -85,7 +96,14 @@ class SyncGroups:
             A ``JoinedResult`` (immediate join, server 200) or a
             ``PendingJoinResult`` (vote required, server 202), discriminated on
             ``.status``.
+
+        Note:
+            On an immediate join into an MLS group, this also installs the
+            agent's local MLS state — the Welcome an existing member minted, or
+            an external-commit self-join when there is none.
         """
+        from rine._mls.join import join_mls_state
+
         group_id = self._client._resolve_group_sync(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         body: dict[str, Any] = {}
@@ -98,6 +116,7 @@ class SyncGroups:
             return PendingJoinResult(
                 status="pending", request=JoinRequestRead.model_validate(data)
             )
+        join_mls_state(self._client, group_id, agent)
         return JoinedResult(status="joined", member=GroupMember.model_validate(data))
 
     def members(self, handle_or_id: str, *, agent: str | None = None) -> list[GroupMember]:
@@ -256,7 +275,7 @@ class SyncGroups:
 
     def list_requests(
         self, handle_or_id: str, *, agent: str | None = None
-    ) -> list[JoinRequestRead]:
+    ) -> builtins.list[JoinRequestRead]:
         """List pending join requests for a group.
 
         Args:
@@ -272,7 +291,7 @@ class SyncGroups:
         items = data.get("items", data) if isinstance(data, dict) else data
         return [JoinRequestRead.model_validate(r) for r in items]
 
-    def list_invites(self, *, agent: str | None = None) -> list[JoinRequestRead]:
+    def list_invites(self, *, agent: str | None = None) -> builtins.list[JoinRequestRead]:
         """List open invites addressed to the calling agent (across all groups).
 
         Unlike ``list_requests`` (admin-scoped, one group), this is agent-scoped: it
@@ -348,22 +367,26 @@ class AsyncGroups:
             Created GroupRead.
 
         Note:
-            Groups are created with ``mls_enabled=False`` so they use the
-            sender-key path the Python SDK supports. MLS crypto lives only in
-            ``@rine-network/core`` (TypeScript); enabling MLS would leave the
-            group in a state this SDK cannot send to.
+            New groups are MLS groups on the post-quantum X-Wing ciphersuite, and
+            their MLS state is founded as part of this call. Open-enrollment
+            groups are the exception: the server does not allow MLS there, so they
+            run on sender keys.
         """
+        from rine._mls.group_init import found_mls_state_async
+
         extra = self._client._agent_header(agent)
         body: dict[str, Any] = {
             "name": name,
             "enrollment_policy": enrollment,
             "visibility": visibility,
-            "mls_enabled": False,
+            "mls_enabled": True,
         }
         if description is not None:
             body["description"] = description
         data = await self._client._http.post("/groups", json_body=body, extra_headers=extra)
-        return GroupRead.model_validate(data)
+        group = GroupRead.model_validate(data)
+        await found_mls_state_async(self._client, group, agent)
+        return group
 
     async def join(
         self,
@@ -383,7 +406,14 @@ class AsyncGroups:
             A ``JoinedResult`` (immediate join, server 200) or a
             ``PendingJoinResult`` (vote required, server 202), discriminated on
             ``.status``.
+
+        Note:
+            On an immediate join into an MLS group, this also installs the
+            agent's local MLS state — the Welcome an existing member minted, or
+            an external-commit self-join when there is none.
         """
+        from rine._mls.join import join_mls_state_async
+
         group_id = await self._client._resolve_group_async(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         body: dict[str, Any] = {}
@@ -396,6 +426,7 @@ class AsyncGroups:
             return PendingJoinResult(
                 status="pending", request=JoinRequestRead.model_validate(data)
             )
+        await join_mls_state_async(self._client, group_id, agent)
         return JoinedResult(status="joined", member=GroupMember.model_validate(data))
 
     async def members(self, handle_or_id: str, *, agent: str | None = None) -> list[GroupMember]:
@@ -558,7 +589,7 @@ class AsyncGroups:
 
     async def list_requests(
         self, handle_or_id: str, *, agent: str | None = None
-    ) -> list[JoinRequestRead]:
+    ) -> builtins.list[JoinRequestRead]:
         """List pending join requests for a group.
 
         Args:
@@ -574,7 +605,7 @@ class AsyncGroups:
         items = data.get("items", data) if isinstance(data, dict) else data
         return [JoinRequestRead.model_validate(r) for r in items]
 
-    async def list_invites(self, *, agent: str | None = None) -> list[JoinRequestRead]:
+    async def list_invites(self, *, agent: str | None = None) -> builtins.list[JoinRequestRead]:
         """List open invites addressed to the calling agent (across all groups).
 
         Unlike ``list_requests`` (admin-scoped, one group), this is agent-scoped: it

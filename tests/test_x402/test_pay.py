@@ -107,7 +107,7 @@ def test_build_payment_payload_when_built_echoes_resource_and_accepted_verbatim(
 
 
 def test_build_payment_payload_when_quote_id_given_stamps_signed_ref() -> None:
-    """R-1: the answered quote's id is stamped into extensions (payer binding)."""
+    """The answered quote's id is stamped into extensions (payer binding)."""
     req = _req("100000")
     pr = {"x402Version": 2, "accepts": [req], "extensions": {"k": 1}}
     source_extensions = pr["extensions"]

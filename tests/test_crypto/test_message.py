@@ -17,6 +17,7 @@ from rine._crypto.message import (
     encrypt_message,
 )
 from rine._crypto.sender_keys import generate_sender_key
+from tests.conftest import recipient_view
 from rine._utils import to_base64url
 
 SENDER_ID = "11111111-1111-1111-1111-111111111111"
@@ -25,7 +26,8 @@ GROUP_ID = "33333333-3333-3333-3333-333333333333"
 
 
 class TestEncryptMessage:
-    def test_encrypt_produces_hpke_v1(self, tmp_config_dir):
+    def test_encrypt_to_a_pq_recipient_produces_hpke_hybrid_v1(self, tmp_config_dir):
+        """A recipient that publishes an ML-KEM key gets the post-quantum envelope."""
         sender_keys = generate_agent_keys()
         recipient_keys = generate_agent_keys()
         save_agent_keys(tmp_config_dir, SENDER_ID, sender_keys)
@@ -33,12 +35,27 @@ class TestEncryptMessage:
         result = encrypt_message(
             tmp_config_dir,
             SENDER_ID,
-            recipient_keys.encryption.public_key,
+            recipient_view(recipient_keys),
+            {"hello": "world"},
+        )
+        assert result.encryption_version == "hpke-hybrid-v1"
+        assert result.sender_signing_kid == make_kid(SENDER_ID)
+        assert len(result.encrypted_payload) > 0
+
+    def test_encrypt_to_a_classical_recipient_produces_hpke_v1(self, tmp_config_dir):
+        """A recipient with no ML-KEM key still gets the classical envelope."""
+        sender_keys = generate_agent_keys()
+        recipient_keys = generate_agent_keys()
+        recipient_keys.pq_encryption = None
+        save_agent_keys(tmp_config_dir, SENDER_ID, sender_keys)
+
+        result = encrypt_message(
+            tmp_config_dir,
+            SENDER_ID,
+            recipient_view(recipient_keys),
             {"hello": "world"},
         )
         assert result.encryption_version == "hpke-v1"
-        assert result.sender_signing_kid == make_kid(SENDER_ID)
-        assert len(result.encrypted_payload) > 0
 
     def test_encrypt_produces_self_seal_blob(self, tmp_config_dir):
         """encrypt_message sets a self_encrypted_payload distinct from the recipient copy."""
@@ -49,7 +66,7 @@ class TestEncryptMessage:
         result = encrypt_message(
             tmp_config_dir,
             SENDER_ID,
-            recipient_keys.encryption.public_key,
+            recipient_view(recipient_keys),
             {"hello": "world"},
         )
         assert result.self_encrypted_payload is not None
@@ -58,7 +75,7 @@ class TestEncryptMessage:
         assert result.self_encrypted_payload != result.encrypted_payload
 
     def test_self_seal_round_trip_sender_reads_own_message(self, tmp_config_dir):
-        """REQ-SDK-PY-01: the sender can self-read its own message via the blob."""
+        """The sender can self-read its own message via the blob."""
         sender_keys = generate_agent_keys()
         recipient_keys = generate_agent_keys()
         save_agent_keys(tmp_config_dir, SENDER_ID, sender_keys)
@@ -68,7 +85,7 @@ class TestEncryptMessage:
         result = encrypt_message(
             tmp_config_dir,
             SENDER_ID,
-            recipient_keys.encryption.public_key,
+            recipient_view(recipient_keys),
             payload,
         )
 
@@ -110,7 +127,7 @@ class TestEncryptMessage:
         result = encrypt_message(
             tmp_config_dir,
             SENDER_ID,
-            recipient_keys.encryption.public_key,
+            recipient_view(recipient_keys),
             payload,
         )
 

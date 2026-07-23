@@ -334,6 +334,34 @@ class TestSyncGroupsJoin:
         with pytest.raises(NotFoundError):
             sync_client.groups.join("nonexistent-group")
 
+    @respx.mock
+    def test_join_mls_group_is_an_ordinary_join(self, sync_client, caplog):
+        """An MLS group joins like any other — no caveat, and nothing to warn about.
+
+        The join reads the group to decide whether MLS state must be installed;
+        a group whose MLS state has not been founded has none to install. What
+        installing it looks like is ``tests/test_mls_join.py``.
+        """
+        _mock_token()
+        _mock_agents()
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/join").mock(
+            return_value=httpx.Response(200, json=_MEMBER_PAYLOAD)
+        )
+        probe = respx.get(f"https://rine.network/groups/{GROUP_ID}").mock(
+            return_value=httpx.Response(
+                200, json={**_GROUP_PAYLOAD, "mls_enabled": True, "mls_group_id": None}
+            )
+        )
+
+        with caplog.at_level("WARNING"):
+            result = sync_client.groups.join(GROUP_ID)
+
+        assert isinstance(result, JoinedResult)
+        assert result.status == "joined"
+        assert "warning" not in JoinedResult.model_fields
+        assert probe.call_count == 1
+        assert caplog.records == []
+
 
 class TestSyncGroupsMembers:
     @respx.mock
@@ -507,6 +535,37 @@ class TestAsyncGroupsJoin:
 
         with pytest.raises(NotFoundError):
             await async_client.groups.join("ghost-group")
+        await async_client.close()
+
+    @respx.mock
+    async def test_join_mls_group_is_an_ordinary_join(self, async_client, caplog):
+        """An MLS group joins like any other — no caveat, and nothing to warn about.
+
+        The join reads the group to decide whether MLS state must be installed;
+        a group whose MLS state has not been founded has none to install. What
+        installing it looks like is ``tests/test_mls_join.py``.
+        """
+        respx.post("https://rine.network/oauth/token").mock(
+            return_value=httpx.Response(200, json=_TOKEN_RESPONSE)
+        )
+        _mock_agents()
+        respx.post(f"https://rine.network/groups/{GROUP_ID}/join").mock(
+            return_value=httpx.Response(200, json=_MEMBER_PAYLOAD)
+        )
+        probe = respx.get(f"https://rine.network/groups/{GROUP_ID}").mock(
+            return_value=httpx.Response(
+                200, json={**_GROUP_PAYLOAD, "mls_enabled": True, "mls_group_id": None}
+            )
+        )
+
+        with caplog.at_level("WARNING"):
+            result = await async_client.groups.join(GROUP_ID)
+
+        assert isinstance(result, JoinedResult)
+        assert result.status == "joined"
+        assert "warning" not in JoinedResult.model_fields
+        assert probe.call_count == 1
+        assert caplog.records == []
         await async_client.close()
 
 

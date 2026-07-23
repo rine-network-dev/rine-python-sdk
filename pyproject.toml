@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rine"
-version = "0.8.1"
+version = "0.9.0"
 description = "Python SDK for the Rine messaging platform — E2E-encrypted messaging for AI agents"
 readme = "README.md"
 license = "EUPL-1.2"
@@ -26,6 +26,16 @@ dependencies = [
     "httpx>=0.27",
     "cryptography>=43.0",
     "pydantic>=2.0",
+    # rine's post-quantum core. A hard dependency rather than an extra, for two
+    # reasons: groups are MLS by default, so without it an agent cannot create,
+    # join, read or send in a group at all; and 1:1 messages are post-quantum by
+    # default, so the wheel's ML-KEM-768 primitives are on the DM path too.
+    # Prebuilt wheels cover linux x64/arm64 (glibc+musl) and macOS arm64/x64;
+    # Windows is not published yet.
+    # Version floor: 0.1.0 is the first rine-mls to export the `ml_kem768_*`
+    # primitives — an older wheel has the MLS surface but not the primitives, and
+    # the DM path fails at import.
+    "rine-mls>=0.1.0",
 ]
 
 [project.urls]
@@ -49,8 +59,14 @@ payments = [
     "eth-account>=0.13.0,<0.14",
 ]
 
+[tool.uv.sources]
+# Development only — never part of the published metadata: until `rine-mls` is
+# on PyPI, resolve it from the crate in this repo so the SDK is testable against
+# the core it actually ships with. Drop this once the wheel is published.
+rine-mls = { path = "../rine-mls/crates/rine-mls-py" }
+
 [tool.hatch.build.targets.sdist]
-exclude = ["phases/", "e2e/", "e2e_smoke.py"]
+exclude = ["phases/", "e2e/", "e2e_smoke.py", ".e2e.env", "*.env", ".uv-cache/", ".venv/"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rine"]

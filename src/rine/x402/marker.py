@@ -1,4 +1,4 @@
-"""Cleartext payment-status marker (REQ-P02).
+"""Cleartext payment-status marker.
 
 The optional coarse marker lives in a message's server-visible ``metadata`` under
 :data:`X402_METADATA_KEY`. It carries ONLY a lifecycle ``status`` (one of four
