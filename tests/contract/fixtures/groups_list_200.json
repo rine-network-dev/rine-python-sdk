@@ -2,18 +2,23 @@
   "body": {
     "items": [
       {
+        "conversation_id": null,
         "created_at": "2020-01-01T00:00:00Z",
         "description": null,
         "enrollment_policy": "open",
         "handle": "#cg-open@corg.rine.network",
         "id": "00000000-0000-0000-0000-000000000000",
         "isolated": false,
+        "member_agent_ids": [
+          "00000000-0000-0000-0000-000000000000"
+        ],
         "member_count": 1,
         "mls_cipher_suite": null,
         "mls_enabled": true,
         "mls_group_id": null,
         "mls_pending": false,
         "name": "cg-open",
+        "notify_on_join": true,
         "org_id": "00000000-0000-0000-0000-000000000000",
         "visibility": "private",
         "vote_duration_hours": 72

@@ -22,7 +22,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from rine._crypto.envelope import encode_envelope
 from rine._crypto.sign import sign_payload
 from rine._utils import from_base64url, to_base64url
-from rine.errors import CryptoError
+from rine.errors import CryptoError, NoSenderKeyStateError
+from rine.sender_key_words import no_sender_key_state_detail
 
 VERSION_SENDER_KEY = 0x02
 SENDER_KEY_ID_SIZE = 16
@@ -106,9 +107,7 @@ def _advance_chain(
     """
     skip_count = target_index - state.message_index
     if skip_count > MAX_SKIP:
-        raise CryptoError(
-            f"Too many skipped messages: {skip_count} (max {MAX_SKIP})"
-        )
+        raise CryptoError(f"Too many skipped messages: {skip_count} (max {MAX_SKIP})")
 
     skipped: dict[int, bytes] = {}
     chain_key = state.chain_key
@@ -181,6 +180,37 @@ def seal_group(
     return bytes(out), updated
 
 
+def require_sender_key_state(
+    sender_key_states: dict[str, SenderKeyState],
+    sender_key_id: str,
+) -> SenderKeyState:
+    """The state for a sender key, or a refusal that says how to get one.
+
+    Placed here, at the only lookup that can miss, rather than at the read paths
+    that call it. There are three of them — ``inbox()``, ``read()`` and the
+    stream — and the one thing they share is that by the time they see this
+    failure they have already ingested every pending distribution the server
+    holds. A remedy written at any of them would either repeat that dead advice
+    or be written three times and drift.
+
+    The refusal is deliberately *not* the message-key wording a few lines below
+    it. Nothing was consumed here: this agent never had the key, or retired it
+    on the way out of the group.
+
+    The refusal carries the key id as a field as well as in its sentence: a
+    render that never ran the recovery has to re-say this refusal in weaker words
+    and needs the id to do it, and reading it back out of the paragraph would
+    make the wording load-bearing.
+
+    Raises:
+        NoSenderKeyStateError: When no state is held for that sender key.
+    """
+    state = sender_key_states.get(sender_key_id)
+    if state is None:
+        raise NoSenderKeyStateError(no_sender_key_state_detail(sender_key_id), sender_key_id)
+    return state
+
+
 def open_group(
     sender_key_states: dict[str, SenderKeyState],
     encrypted_payload: bytes,
@@ -195,7 +225,10 @@ def open_group(
         Tuple of (inner_envelope, sender_key_id, message_index, updated_state).
 
     Raises:
-        CryptoError: If sender key unknown, message key expired, or decryption fails.
+        NoSenderKeyStateError: When this agent holds no state for the sender key
+            the message names — a :class:`~rine.errors.CryptoError`, so the read
+            paths' self-heal still selects it.
+        CryptoError: If the message key expired or decryption fails.
     """
     min_len = 1 + SENDER_KEY_ID_SIZE + MESSAGE_INDEX_SIZE + NONCE_SIZE
     if len(encrypted_payload) < min_len:
@@ -204,27 +237,19 @@ def open_group(
     version = encrypted_payload[0]
     if version != VERSION_SENDER_KEY:
         raise CryptoError(
-            f"Unknown sender key version: 0x{version:02x} "
-            f"(expected 0x{VERSION_SENDER_KEY:02x})"
+            f"Unknown sender key version: 0x{version:02x} (expected 0x{VERSION_SENDER_KEY:02x})"
         )
 
     offset = 1
     sender_key_id = _bytes_to_uuid(encrypted_payload[offset : offset + SENDER_KEY_ID_SIZE])
     offset += SENDER_KEY_ID_SIZE
-    message_index = int.from_bytes(
-        encrypted_payload[offset : offset + MESSAGE_INDEX_SIZE], "big"
-    )
+    message_index = int.from_bytes(encrypted_payload[offset : offset + MESSAGE_INDEX_SIZE], "big")
     offset += MESSAGE_INDEX_SIZE
     nonce = encrypted_payload[offset : offset + NONCE_SIZE]
     offset += NONCE_SIZE
     ciphertext = encrypted_payload[offset:]
 
-    state = sender_key_states.get(sender_key_id)
-    if state is None:
-        raise CryptoError(
-            f"Unknown sender key id: {sender_key_id}. "
-            "Fetch pending sender key distributions first."
-        )
+    state = require_sender_key_state(sender_key_states, sender_key_id)
 
     if message_index < state.message_index:
         # Past message — look up in skipped key cache
@@ -308,6 +333,7 @@ def needs_rotation(state: SenderKeyState) -> bool:
         return True
     if state.created_at is not None:
         import time
+
         age_ms = int(time.time() * 1000) - state.created_at
         if age_ms > ROTATION_AGE_MS:
             return True

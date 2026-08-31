@@ -9,7 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from rine._actor import AGENT_HEADER
 from rine._mls.wire import mls_from_base64, mls_to_base64
+from rine._recipient_reads import refuse_a_substituted_group
 from rine.errors import ConflictError
 from rine.types import GroupRead
 
@@ -61,6 +63,17 @@ class MlsCommit:
     cipher_suite: int
     welcomes: tuple[MlsWelcome, ...] = ()
 
+    removes: tuple[str, ...] = ()
+    """The agent ids this commit's Remove proposals take out of the tree.
+
+    The server records the list and spends each name once, on ``DELETE
+    /groups/{id}/members/{id}`` — a commit that declares nobody can be named in
+    no removal. 🔴 It is **client-asserted**: the commit blob is opaque to a
+    passthrough server, so nothing there confirms that the commit really carries
+    a Remove for these agents. What declaring buys is that the claim is made
+    once, in advance, and is spendable once.
+    """
+
 
 def read_group(client: Any, agent_id: str, group_id: str) -> GroupRead:
     """Read a group as one of its members.
@@ -69,10 +82,30 @@ def read_group(client: Any, agent_id: str, group_id: str) -> GroupRead:
     group's own ``mls_cipher_suite`` decides which suite the MLS client is opened
     on, and a group created on the classical suite is unreadable through a client
     opened on the default one.
+
+    🔴 Because every such flow comes through here, the identity check is
+    load-bearing. :func:`rine._mls.join.install_mls_state` scopes its Welcome
+    pass by ``group.id``; a body naming a group the caller never asked about
+    would make that scope match no refusal, so a Welcome this client REFUSED
+    would be withheld rather than raised and the join would report success
+    holding no MLS state — measured, not hypothetical. TypeScript twin:
+    ``GroupsResource.get``.
+
+    The rule itself is :func:`rine._recipient_reads.refuse_a_substituted_group`
+    and is not restated here: the recipient ladder's UUID rung reads the same
+    route and refuses the same body, and one sentence held byte-symmetric with
+    TypeScript's cannot survive being written twice. The row is validated by
+    then, so the answered id is a string and the coercion the ladder needs does
+    not arise.
+
+    Raises:
+        GroupIdentityMismatchError: The response names a different group.
     """
-    return GroupRead.model_validate(
-        client.get(f"/groups/{group_id}", extra_headers={"X-Rine-Agent": agent_id})
+    group = GroupRead.model_validate(
+        client.get(f"/groups/{group_id}", extra_headers={AGENT_HEADER: agent_id})
     )
+    refuse_a_substituted_group(group_id, str(group.id))
+    return group
 
 
 def upload_key_packages(client: Any, agent_id: str, packages: list[bytes]) -> int:
@@ -210,6 +243,7 @@ def mls_commit(
         "welcomes": [
             {"agent_id": w.agent_id, "welcome": mls_to_base64(w.welcome)} for w in commit.welcomes
         ],
+        "removes": list(commit.removes),
     }
     data = client.post(
         f"/groups/{group_id}/mls/commit", json_body=body, extra_headers=extra_headers

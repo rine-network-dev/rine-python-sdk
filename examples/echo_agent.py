@@ -1,9 +1,15 @@
 """A minimal agent: receive -> decrypt -> reply -> acknowledge, in a loop.
 
-Polls the inbox for new messages, prints each decrypted payload, replies with
-an echo, then calls `mark_delivered()` so the next `inbox(status="new")` call
-only returns messages that arrived after this one — the SDK's documented
-idiom for a stateless poller that never reprocesses the same row twice.
+Polls the inbox for new messages, answers the ones that are questions, and
+calls `mark_delivered()` so the next `inbox(status="new")` call only returns
+messages that arrived after this one — the SDK's documented idiom for a
+stateless poller that never reprocesses the same row twice.
+
+Acknowledging is what finishes a row, not replying. A row left unacknowledged
+comes back on every poll for ever, so each one is acknowledged as soon as this
+agent is done with it — answered, recorded, or refused for a reason retrying
+cannot change. Only a failure of the *call* (a rate limit, a timeout, a server
+that is down) leaves a row for the next poll to pick up again.
 
 Prereqs: `pip install rine`; an onboarded identity in `.rine` (run
 `onboard.py` first, or point `RINE_CONFIG_DIR` at one).
@@ -14,17 +20,70 @@ from __future__ import annotations
 
 import time
 
-from rine import SyncRineClient
-from rine.errors import CryptoError
+from rine import MessageType, SyncRineClient
+from rine.errors import (
+    AuthorizationError,
+    ConflictError,
+    CryptoError,
+    NotFoundError,
+    RineError,
+    format_error,
+)
+from rine.types import DecryptedMessage
 
 POLL_INTERVAL_SECONDS = 3.0
+
+# The types worth answering. A reply is itself a `rine.v1.task_response`, so
+# echoing one back would leave two agents answering each other for ever, and
+# `rine.v1.receipt`/`rine.v1.error` close an exchange rather than open one
+# (PROTOCOL.md §4.1). Everything else is recorded, then acknowledged.
+ANSWERABLE_TYPES = frozenset({MessageType.TASK_REQUEST, MessageType.TEXT})
+
+# Refusals about this ROW: its conversation reached a terminal status
+# (`completed`/`rejected`/`canceled`/`failed`), the far side is revoked or
+# erased, a send policy forbids the answer, or the payload will not encrypt.
+# The next poll would earn the same refusal, so the row is finished rather
+# than retried. Every other error the SDK raises — `RateLimitError`,
+# `APITimeoutError`, `APIConnectionError`, a 5xx — is about the *call*, and is
+# deliberately not in this tuple.
+UNANSWERABLE = (ConflictError, NotFoundError, AuthorizationError, CryptoError)
+
+
+def handle(client: SyncRineClient, msg: DecryptedMessage) -> bool:
+    """Deal with one inbox row; True once this agent is done with it."""
+    if msg.decrypt_error:
+        # inbox() never raises on a single bad row — it sets decrypt_error and
+        # leaves plaintext None, after running its own key recovery. Nothing
+        # opens it later, so record it rather than re-fetching it for ever.
+        print(f"skipping {msg.id}: decrypt_error={msg.decrypt_error}")
+        return True
+
+    if msg.group_id is not None:
+        # A group post has no addressee, so reply() cannot answer it (the
+        # server refuses). The answer to a group is a send to its handle,
+        # which every member reads, not a 1:1 only the poster would see.
+        print(f"group post in {msg.group_handle} from {msg.sender_handle}: {msg.plaintext}")
+        return True
+
+    if msg.type not in ANSWERABLE_TYPES:
+        print(f"recording {msg.type} from {msg.sender_handle}")
+        return True
+
+    print(f"received from {msg.sender_handle}: {msg.plaintext}")
+    try:
+        client.reply(str(msg.id), {"echo": msg.plaintext})
+    except UNANSWERABLE as e:
+        print(f"cannot answer {msg.id}: {format_error(e)}")
+    except RineError as e:
+        print(f"deferring {msg.id} to the next poll: {format_error(e)}")
+        return False
+    return True
 
 
 def main() -> None:
     with SyncRineClient(config_dir=".rine") as client:
         me = client.whoami()
-        agent_handle = me.agents[0].handle
-        print(f"echo_agent listening as {agent_handle} (Ctrl+C to stop)")
+        print(f"echo_agent listening as {me.agents[0].handle} (Ctrl+C to stop)")
 
         try:
             while True:
@@ -33,28 +92,13 @@ def main() -> None:
                     time.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
-                delivered_ids: list[str] = []
+                finished: list[str] = []
                 for msg in page.items:
-                    if msg.decrypt_error:
-                        # inbox() never raises on a single bad row — it sets
-                        # decrypt_error instead. Acknowledge it anyway so a
-                        # permanently-undecryptable row does not loop forever.
-                        print(f"skipping {msg.id}: decrypt_error={msg.decrypt_error}")
-                        delivered_ids.append(str(msg.id))
-                        continue
+                    if handle(client, msg):
+                        finished.append(str(msg.id))
 
-                    print(f"received from {msg.sender_handle}: {msg.plaintext}")
-
-                    try:
-                        client.reply(str(msg.id), {"echo": msg.plaintext})
-                    except CryptoError as e:
-                        print(f"reply failed for {msg.id}: {e}")
-                        continue
-
-                    delivered_ids.append(str(msg.id))
-
-                if delivered_ids:
-                    marked = client.mark_delivered(delivered_ids)
+                if finished:
+                    marked = client.mark_delivered(finished)
                     print(f"acknowledged {marked} message(s)")
 
         except KeyboardInterrupt:

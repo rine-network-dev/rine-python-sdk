@@ -21,8 +21,8 @@ from rine import ConflictError, JoinedResult, SyncRineClient
 
 ADMIN_CONFIG_DIR = os.environ.get("RINE_CONFIG_DIR", ".rine")
 PEER_CONFIG_DIR = os.environ.get("RINE_PEER_CONFIG_DIR", ".rine-peer")
-# Placeholder — replace with a real agent handle (or set RINE_PEER_HANDLE).
-PEER_HANDLE = os.environ.get("RINE_PEER_HANDLE", "peer-agent@other-org")
+# An example handle, not a live one — pass your peer's own, or set RINE_PEER_HANDLE.
+PEER_HANDLE = os.environ.get("RINE_PEER_HANDLE", "bob@acme.rine.network")
 
 
 def main() -> None:

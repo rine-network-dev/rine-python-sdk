@@ -10,6 +10,11 @@ Memoizing the successful result per ``(agent id, message id)`` makes a repeat
 decrypt idempotent for the client's lifetime while leaving the ratchet's
 forward-secrecy accounting untouched: consumed keys are still discarded, so a
 fresh process cannot reopen an already-consumed message.
+
+What is memoized is what a row's bytes said, never whom they are attributed to.
+Attribution is decided per read, against the sender the server stamps on the row
+that read fetched, so the callers re-check the binding on a memo hit rather than
+keying it in here.
 """
 
 from __future__ import annotations

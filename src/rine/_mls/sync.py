@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from rine._actor import AGENT_HEADER
 from rine._logging import logger
 from rine._mls.api import fetch_group_info
 from rine._mls.external_join import ExternalJoin, external_join_mls_group
@@ -53,7 +54,7 @@ def sync_mls_group(
             of this process, which the next sync retries rather than blaming on
             the commit.
     """
-    headers = {"X-Rine-Agent": agent_id}
+    headers = {AGENT_HEADER: agent_id}
     group = open_mls_group(config_dir, agent_id, group_id, cipher_suite=cipher_suite)
     handshakes = fetch_handshakes(client, group_id, group.epoch(), headers)
 

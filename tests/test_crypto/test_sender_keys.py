@@ -7,7 +7,6 @@ import pytest
 from rine._crypto.envelope import decode_envelope
 from rine._crypto.keys import generate_signing_keypair
 from rine._crypto.sender_keys import (
-    MAX_SKIP,
     VERSION_SENDER_KEY,
     derive_message_key,
     generate_sender_key,
@@ -15,9 +14,7 @@ from rine._crypto.sender_keys import (
     open_group,
     seal_group,
 )
-from rine._utils import to_base64url
-from rine.errors import CryptoError
-
+from rine.errors import CryptoError, NoSenderKeyStateError
 
 GROUP_ID = "00000000-0000-0000-0000-000000000001"
 AGENT_ID = "00000000-0000-0000-0000-000000000002"
@@ -96,12 +93,33 @@ class TestSealOpenGroup:
         assert decode_envelope(inner_a).payload == b"msg-a"
         assert idx_a == 0
 
-    def test_unknown_sender_key_raises(self):
+    def test_open_group_when_no_state_is_held_then_refuses_with_a_way_out(self):
+        """The refusal names the cause and something the reader can do."""
         sk = generate_signing_keypair()
         state = generate_sender_key(GROUP_ID, AGENT_ID)
         ct, _ = seal_group(sk.private_key, "rine:test", state, b"test")
-        with pytest.raises(CryptoError, match="Unknown sender key"):
+
+        with pytest.raises(NoSenderKeyStateError) as excinfo:
             open_group({}, ct)
+
+        detail = str(excinfo.value)
+        assert state.sender_key_id in detail
+        assert "holds no sender key state" in detail
+        assert "post to the group again" in detail
+        assert "rejoin it" in detail
+        # The old sentence's remedy — "fetch pending sender key distributions
+        # first" — named a call every read path has already made before it can
+        # reach this refusal.
+        assert "Fetch pending" not in detail
+
+    def test_open_group_when_no_state_is_held_then_stays_a_crypto_error(self):
+        """The read paths retry a failed sender-key decrypt on ``CryptoError``.
+
+        Narrowing this refusal out of that branch would delete the self-heal
+        silently: the retry ingests pending distributions and tries once more,
+        which is exactly the case this refusal describes.
+        """
+        assert issubclass(NoSenderKeyStateError, CryptoError)
 
     def test_payload_too_short_raises(self):
         with pytest.raises(CryptoError, match="too short"):
@@ -120,6 +138,7 @@ class TestNeedsRotation:
 
     def test_rotates_on_age(self):
         import time
+
         state = generate_sender_key(GROUP_ID, AGENT_ID)
         state.created_at = int(time.time() * 1000) - (8 * 24 * 60 * 60 * 1000)
         assert needs_rotation(state)

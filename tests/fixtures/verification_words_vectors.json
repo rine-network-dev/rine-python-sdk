@@ -1,0 +1,53 @@
+{
+  "note": "Verification-words goldens. Derivation: SHA-256 of the raw 32-byte public key, first 55 bits, five 11-bit BIP39 English indices, most-significant group first. Reference implementation: src/rine/auth/service.py. Regenerate with rine-sdk/tests/fixtures/generate_verification_words_vectors.py.",
+  "one_bit_flip": [
+    "baseline",
+    "baseline-one-bit"
+  ],
+  "same_key": [
+    "baseline",
+    "baseline-padded-x"
+  ],
+  "vectors": [
+    {
+      "name": "baseline",
+      "description": "An ordinary Ed25519 signing key.",
+      "jwk": {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "kxlETJcW9iab6QzhdOVl-ksvNaPkGxj37pujDVTUGzI"
+      },
+      "words": "lazy squeeze topic alone replace"
+    },
+    {
+      "name": "baseline-one-bit",
+      "description": "The baseline key with the low bit of its last byte flipped. Its words must differ from the baseline's \u2014 that is the whole point of showing them to an operator.",
+      "jwk": {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "kxlETJcW9iab6QzhdOVl-ksvNaPkGxj37pujDVTUGzM"
+      },
+      "words": "spray bottom fortune that cram"
+    },
+    {
+      "name": "baseline-padded-x",
+      "description": "The baseline key whose `x` carries explicit base64url padding. Decodes to the same 32 bytes, so it must produce the same words.",
+      "jwk": {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "kxlETJcW9iab6QzhdOVl-ksvNaPkGxj37pujDVTUGzI="
+      },
+      "words": "lazy squeeze topic alone replace"
+    },
+    {
+      "name": "zero-key",
+      "description": "Thirty-two zero bytes.",
+      "jwk": {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      },
+      "words": "grid duck problem valid cloth"
+    }
+  ]
+}

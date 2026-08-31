@@ -132,7 +132,7 @@ def test_prepare_payment_reserves_journal_at_signing(tmp_path) -> None:
 
 
 def test_prepare_payment_when_same_message_id_twice_raises_already_paid(tmp_path) -> None:
-    """Same message id, same day → already-paid unless forced (S6 double-pay guard)."""
+    """Same message id, same day → already-paid unless forced (double-pay guard)."""
     agent_id = _setup(tmp_path)
     prepare_payment(
         str(tmp_path),

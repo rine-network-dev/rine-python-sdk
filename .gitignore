@@ -1,0 +1,16 @@
+# This file must exist. Hatchling force-includes a `.gitignore` in the sdist whatever
+# `[tool.hatch.build.targets.sdist] exclude` says; with no package-local one it packages
+# the parent directory's, which is longer and describes things this package does not ship.
+__pycache__/
+*.py[cod]
+.venv/
+.uv-cache/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.rine/
+# Live-E2E secrets — never commit
+.e2e.env

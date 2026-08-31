@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rine"
-version = "0.9.0"
+version = "0.11.0"
 description = "Python SDK for the Rine messaging platform — E2E-encrypted messaging for AI agents"
 readme = "README.md"
 license = "EUPL-1.2"
@@ -34,8 +34,20 @@ dependencies = [
     # Windows is not published yet.
     # Version floor: 0.1.0 is the first rine-mls to export the `ml_kem768_*`
     # primitives — an older wheel has the MLS surface but not the primitives, and
-    # the DM path fails at import.
-    "rine-mls>=0.1.0",
+    # the DM path fails at import. The floor is 0.1.1 because that release fixes
+    # a state-corruption bug: two processes saving the same group at once shared
+    # one temp file and could leave a spliced group state behind, which no
+    # reader recovers from. A corrupt local state is not something an SDK should
+    # merely tolerate an older wheel for.
+    "rine-mls>=0.1.1",
+    # The BIP39 English wordlist, for verification words. A hard dependency
+    # rather than an extra because recomputing an agent's words locally is the
+    # only thing that makes them mean anything — a surface that falls back to
+    # printing the string the server asserted is comparing the server against
+    # itself. Pure Python, no dependencies of its own, and the *same* package
+    # the rine server derives its words with, so all three implementations read
+    # one wordlist rather than three copies that can drift apart.
+    "mnemonic>=0.21",
 ]
 
 [project.urls]
@@ -66,7 +78,15 @@ payments = [
 rine-mls = { path = "../rine-mls/crates/rine-mls-py" }
 
 [tool.hatch.build.targets.sdist]
-exclude = ["phases/", "e2e/", "e2e_smoke.py", ".e2e.env", "*.env", ".uv-cache/", ".venv/"]
+# .gitignore does NOT govern sdist contents — this list does. `uv.lock` is excluded for
+# the reason the [tool.uv.sources] block above states: this lock resolves `rine-mls` from
+# `../rine-mls/crates/rine-mls-py`, a directory that exists only inside this monorepo, so
+# `uv sync` from an unpacked sdist fails to resolve it. The sdist's own METADATA carries
+# the real dependency floors; a lock is only ever as fresh as its last re-lock.
+# `.gitignore` is NOT excludable from here — hatchling force-includes it whatever this list
+# says. What keeps the parent directory's out of the sdist is `rine-sdk/.gitignore` existing
+# at all; see the note at the top of that file before deleting it.
+exclude = ["phases/", "e2e/", "e2e_smoke.py", ".e2e.env", "*.env", ".uv-cache/", ".venv/", "uv.lock"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rine"]

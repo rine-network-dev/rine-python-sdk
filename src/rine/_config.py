@@ -99,7 +99,7 @@ def load_credentials(config_dir: str) -> dict[str, CredentialEntry]:
         with open(path) as f:
             data: Any = json.load(f)
         if isinstance(data, dict):
-            return data  # type: ignore[return-value]
+            return data
         return {}
     except (FileNotFoundError, json.JSONDecodeError):
         return {}

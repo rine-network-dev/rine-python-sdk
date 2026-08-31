@@ -21,6 +21,7 @@ from typing import Any
 
 from rine._mls.api import MlsCommit, fetch_group_info, mls_commit
 from rine._mls.binding import open_mls_client
+from rine._mls.group_access import note_mls_state_changed
 from rine._mls.wire import api_error_code
 from rine.errors import CryptoError
 
@@ -129,4 +130,7 @@ def _attempt(join: ExternalJoin) -> int:
     # Only now: the server's epoch CAS is what decides whether this join happened
     # at all, so state adopted before it would be a fork no peer can see.
     group.save()
+    # An accepted external commit is an establishment: invalidate at the mutation
+    # rather than leaving it to whoever called the join.
+    note_mls_state_changed(join.config_dir, join.agent_id, join.group_id)
     return epoch

@@ -15,11 +15,13 @@ import pytest
 import respx
 
 from rine._constants import EncryptionVersion
+from rine._crypto.group_read_cache import delete_group_read_cache
 from rine._crypto.keys import (
     generate_agent_keys,
     save_agent_keys,
     signing_public_key_to_jwk,
 )
+from rine._crypto.sender_keys_helpers import mark_sender_keys_retired
 from rine._mls import (
     APP_MESSAGE_TAG,
     DEFAULT_CIPHER_SUITE,
@@ -38,15 +40,21 @@ from rine._mls.binding import (
     MlsStoreError,
     SelfMessageNotCachedError,
 )
-from rine._utils import from_base64url
-from rine.errors import NoMlsGroupStateError
+from rine._mls.catchup import reset_mls_catch_up_gate
+from rine._mls.failures import mls_boundary
+from rine._utils import from_base64url, to_base64url
+from rine.errors import CryptoError, NoMlsGroupStateError, SenderMismatchError
 from rine.types import GroupRead
+from tests.conftest import signing_fingerprint
 
 API = "https://rine.network"
 GROUP_ID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 WELCOME_ID = "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
 HANDSHAKE_ID = "55555555-6666-7777-8888-999999999999"
 MESSAGE_ID = "cccccccc-dddd-eeee-ffff-000000000001"
+SECOND_MESSAGE_ID = "cccccccc-dddd-eeee-ffff-000000000003"
+CONVERSATION_ID = "cccccccc-dddd-eeee-ffff-000000000002"
+IMPOSTOR_ID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 
 _GROUP_JSON = {
     "id": GROUP_ID,
@@ -97,9 +105,9 @@ class Peer:
         )
         return result.encrypted_payload
 
-    def read(self, client, encrypted_payload: str):
+    def read(self, client, encrypted_payload: str, sender_id: str):
         return decrypt_mls_group_message(
-            client, self.config_dir, self.agent_id, GROUP_ID, encrypted_payload
+            client, self.config_dir, self.agent_id, GROUP_ID, encrypted_payload, sender_id
         )
 
 
@@ -162,6 +170,43 @@ def _mock_agents(agent_id: str) -> None:
 def _mock_no_handshakes() -> respx.Route:
     return respx.get(f"{API}/groups/{GROUP_ID}/mls/handshakes").mock(
         return_value=httpx.Response(200, json={"handshakes": []})
+    )
+
+
+def _mock_groups_by_equality() -> None:
+    """Route ``GET /groups`` the way the server routes it: the filter is EQUALITY.
+
+    🔴 The filtering is the whole point, and a mock that answers every
+    ``?handle=`` with the group it holds is the shape that made this bug
+    invisible: the exact rung appears to answer, so nothing ever reaches the
+    fallback rung and nothing ever posts a spelling the server would refuse.
+    """
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        wanted = request.url.params.get("handle")
+        items = [g for g in [_GROUP_JSON] if wanted is None or g["handle"] == wanted]
+        return httpx.Response(200, json={"items": items})
+
+    respx.get(f"{API}/groups").mock(side_effect=answer)
+
+
+def _mock_posted_message(agent_id: str) -> respx.Route:
+    """Accept ``POST /messages`` and hand back a plausible group row."""
+    return respx.post(f"{API}/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": MESSAGE_ID,
+                "conversation_id": CONVERSATION_ID,
+                "from_agent_id": agent_id,
+                "group_id": GROUP_ID,
+                "type": "rine.v1.task_request",
+                "encrypted_payload": "x",
+                "encryption_version": EncryptionVersion.MLS_V1,
+                "sender_signing_kid": f"rine:{agent_id}",
+                "created_at": "2024-01-01T00:00:00Z",
+            },
+        )
     )
 
 
@@ -233,6 +278,43 @@ def _mint_key_package(sync_client, config_dir: str, agent_id: str) -> bytes:
     )
 
 
+def _mls_row(ciphertext: str, sender_id: str) -> dict:
+    """One ``mls-v1`` group row, shaped as the server serves it."""
+    return {
+        "id": MESSAGE_ID,
+        "conversation_id": CONVERSATION_ID,
+        "from_agent_id": sender_id,
+        "group_id": GROUP_ID,
+        "type": "rine.v1.task_request",
+        "encrypted_payload": ciphertext,
+        "encryption_version": EncryptionVersion.MLS_V1,
+        "sender_signing_kid": f"rine:{sender_id}",
+        "created_at": "2024-01-01T00:00:00Z",
+    }
+
+
+def _serve_honestly_then_renamed(row: dict) -> None:
+    """Serve one row as its own sender's, then the same id as another agent's."""
+    renamed = {**row, "from_agent_id": IMPOSTOR_ID, "sender_signing_kid": f"rine:{IMPOSTOR_ID}"}
+    respx.get(f"{API}/messages/{row['id']}").mock(
+        side_effect=[
+            httpx.Response(200, json=row),
+            httpx.Response(200, json=renamed),
+        ]
+    )
+
+
+def _mock_message_routes(agent_id: str, row: dict) -> None:
+    """Serve one row on every receive surface: inbox page, read-by-id, thread."""
+    respx.get(f"{API}/messages/{row['id']}").mock(return_value=httpx.Response(200, json=row))
+    respx.get(f"{API}/agents/{agent_id}/messages").mock(
+        return_value=httpx.Response(200, json={"items": [row], "total": 1})
+    )
+    respx.get(f"{API}/conversations/{CONVERSATION_ID}/messages").mock(
+        return_value=httpx.Response(200, json={"messages": [row], "truncated": False})
+    )
+
+
 def _join_group(sync_client, config_dir: str, agent_id: str, peer: Peer) -> None:
     """Get the agent under test into a group the peer founds."""
     _mock_token()
@@ -240,6 +322,13 @@ def _join_group(sync_client, config_dir: str, agent_id: str, peer: Peer) -> None
     bundle = peer.found(key_package)
     _mock_welcomes(agent_id, bundle.welcomes[0])
     process_mls_welcomes(sync_client._http, config_dir, agent_id)
+
+
+def _decrypt(sync_client, config_dir: str, agent_id: str, ciphertext: str, sender_id: str):
+    """Read one MLS row BELOW the client, so no in-process memo can answer it."""
+    return decrypt_mls_group_message(
+        sync_client._http, config_dir, agent_id, GROUP_ID, ciphertext, sender_id
+    )
 
 
 # --------------------------------------------------------------------------
@@ -257,7 +346,7 @@ class TestRoundTrip:
 
         ciphertext = peer.send(payload)
         result = decrypt_mls_group_message(
-            sync_client._http, tmp_config_dir, agent_id, GROUP_ID, ciphertext
+            sync_client._http, tmp_config_dir, agent_id, GROUP_ID, ciphertext, other_agent_id
         )
 
         assert json.loads(result.plaintext) == payload
@@ -289,7 +378,7 @@ class TestRoundTrip:
         sent = encrypt_mls_group_message(
             sync_client._http, tmp_config_dir, agent_id, GROUP, payload
         )
-        result = peer.read(sync_client._http, sent.encrypted_payload)
+        result = peer.read(sync_client._http, sent.encrypted_payload, agent_id)
 
         assert json.loads(result.plaintext) == payload
         assert result.verified is True
@@ -343,7 +432,7 @@ class TestSelfRead:
             sync_client._http, tmp_config_dir, agent_id, GROUP, payload
         )
         result = decrypt_mls_group_message(
-            sync_client._http, tmp_config_dir, agent_id, GROUP_ID, sent.encrypted_payload
+            sync_client._http, tmp_config_dir, agent_id, GROUP_ID, sent.encrypted_payload, agent_id
         )
 
         assert json.loads(result.plaintext) == payload
@@ -373,7 +462,7 @@ class TestReadRecovery:
         assert load_mls_group(open_mls_client(tmp_config_dir, agent_id), GROUP_ID) is None
 
         result = decrypt_mls_group_message(
-            sync_client._http, tmp_config_dir, agent_id, GROUP_ID, ciphertext
+            sync_client._http, tmp_config_dir, agent_id, GROUP_ID, ciphertext, other_agent_id
         )
 
         assert json.loads(result.plaintext) == {"before": "you installed anything"}
@@ -396,7 +485,7 @@ class TestReadRecovery:
 
         with pytest.raises(Exception, match=GROUP_ID):
             decrypt_mls_group_message(
-                sync_client._http, tmp_config_dir, agent_id, GROUP_ID, ciphertext
+                sync_client._http, tmp_config_dir, agent_id, GROUP_ID, ciphertext, other_agent_id
             )
 
     @respx.mock
@@ -404,7 +493,64 @@ class TestReadRecovery:
         self, sync_client, tmp_config_dir, agent_id
     ):
         with pytest.raises(Exception, match="names no group"):
-            decrypt_mls_group_message(sync_client._http, tmp_config_dir, agent_id, None, "BAAB")
+            decrypt_mls_group_message(
+                sync_client._http, tmp_config_dir, agent_id, None, "BAAB", agent_id
+            )
+
+
+class TestSenderBinding:
+    """The inner envelope must name the sender the server authenticated."""
+
+    @respx.mock
+    def test_a_message_attributed_to_another_agent_is_refused(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """A peer's message re-posted under a third agent's name never opens.
+
+        The refusal comes after the ratchet is persisted, deliberately: the
+        message's one-time key is spent exactly as an honest message would spend
+        it, so re-posting the same ciphertext is not a way to retry.
+        """
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_keys(peer)
+        _mock_group()
+        _mock_no_handshakes()
+        ciphertext = peer.send({"text": "the codeword is albatross"})
+
+        with pytest.raises(SenderMismatchError):
+            decrypt_mls_group_message(
+                sync_client._http,
+                tmp_config_dir,
+                agent_id,
+                GROUP_ID,
+                ciphertext,
+                IMPOSTOR_ID,
+            )
+
+        with pytest.raises(CryptoError):
+            decrypt_mls_group_message(
+                sync_client._http, tmp_config_dir, agent_id, GROUP_ID, ciphertext, other_agent_id
+            )
+
+    @respx.mock
+    def test_the_same_message_attributed_to_its_sender_reads(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """The false-positive guard for the refusal above."""
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_keys(peer)
+        _mock_no_handshakes()
+        ciphertext = peer.send({"text": "the codeword is albatross"})
+
+        result = decrypt_mls_group_message(
+            sync_client._http, tmp_config_dir, agent_id, GROUP_ID, ciphertext, other_agent_id
+        )
+
+        assert json.loads(result.plaintext) == {"text": "the codeword is albatross"}
+        assert result.verified is True
+        assert result.verification_status == "verified"
 
 
 class TestSync:
@@ -480,7 +626,7 @@ class TestEpochRetention:
     def test_a_message_from_an_earlier_epoch_still_reads_after_many_commits(
         self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
     ):
-        """DEC-8: the undelivered queue holds messages indefinitely, so backlog must.
+        """The undelivered queue holds messages indefinitely, so backlog must.
 
         The default retention reaches the full backlog. A message sent before six
         membership changes is exactly what a long-absent agent finds waiting.
@@ -499,7 +645,7 @@ class TestEpochRetention:
         assert sync_mls_group(sync_client._http, tmp_config_dir, agent_id, GROUP_ID).processed == 6
 
         result = decrypt_mls_group_message(
-            sync_client._http, tmp_config_dir, agent_id, GROUP_ID, old_message
+            sync_client._http, tmp_config_dir, agent_id, GROUP_ID, old_message, other_agent_id
         )
 
         assert json.loads(result.plaintext) == {"sent": "long before you came back"}
@@ -535,7 +681,7 @@ class TestSendPath:
         sent = encrypt_mls_group_message(
             sync_client._http, tmp_config_dir, agent_id, GROUP, {"for": "the latecomer"}
         )
-        result = latecomer.read(sync_client._http, sent.encrypted_payload)
+        result = latecomer.read(sync_client._http, sent.encrypted_payload, agent_id)
 
         assert json.loads(result.plaintext) == {"for": "the latecomer"}
 
@@ -571,22 +717,7 @@ class TestThroughTheClients:
             return_value=httpx.Response(200, json={"items": [_GROUP_JSON]})
         )
         _mock_agents(agent_id)
-        posted = respx.post(f"{API}/messages").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "id": MESSAGE_ID,
-                    "conversation_id": "cccccccc-dddd-eeee-ffff-000000000002",
-                    "from_agent_id": agent_id,
-                    "group_id": GROUP_ID,
-                    "type": "rine.v1.task_request",
-                    "encrypted_payload": "x",
-                    "encryption_version": EncryptionVersion.MLS_V1,
-                    "sender_signing_kid": f"rine:{agent_id}",
-                    "created_at": "2024-01-01T00:00:00Z",
-                },
-            )
-        )
+        posted = _mock_posted_message(agent_id)
 
         sync_client.send(_GROUP_JSON["handle"], {"task": "through the client"})
 
@@ -594,6 +725,35 @@ class TestThroughTheClients:
         assert body["encryption_version"] == EncryptionVersion.MLS_V1
         assert body["to_handle"] == _GROUP_JSON["handle"]
         assert from_base64url(body["encrypted_payload"])[0] == APP_MESSAGE_TAG
+
+    @respx.mock
+    def test_send_with_a_wrong_org_half_posts_the_handle_the_server_holds(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """The ladder's resolve is only half the fix; this is the other half.
+
+        The ladder resolves ``#test-group@acme…`` — a fabricated org half, which
+        is what a model writes when it copies the domain out of a tool
+        description — and the group is sealed for correctly. What used to reach
+        the wire was the caller's spelling, and ``POST /messages`` looks
+        ``to_handle`` up by exact equality: the server answered a bare ``Group
+        not found``, indistinguishable from the ladder never having run.
+
+        Measured, not hypothesised — it is the one hallucinated-handle
+        failure that survived the ladder against live models.
+        """
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_no_handshakes()
+        _mock_groups_by_equality()
+        _mock_agents(agent_id)
+        posted = _mock_posted_message(agent_id)
+
+        sync_client.send("#test-group@acme.rine.network", {"task": "wrong org"})
+
+        body = json.loads(posted.calls[0].request.content)
+        assert body["to_handle"] == _GROUP_JSON["handle"]
+        assert "acme" not in body["to_handle"]
 
     @respx.mock
     async def test_the_async_client_reads_an_mls_row_through_the_same_implementation(
@@ -610,22 +770,7 @@ class TestThroughTheClients:
             tmp_config_dir, {"default": {"client_id": "cid", "client_secret": "csecret"}}
         )
         _mock_agents(agent_id)
-        respx.get(f"{API}/messages/{MESSAGE_ID}").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "id": MESSAGE_ID,
-                    "conversation_id": "cccccccc-dddd-eeee-ffff-000000000002",
-                    "from_agent_id": other_agent_id,
-                    "group_id": GROUP_ID,
-                    "type": "rine.v1.task_request",
-                    "encrypted_payload": ciphertext,
-                    "encryption_version": EncryptionVersion.MLS_V1,
-                    "sender_signing_kid": f"rine:{other_agent_id}",
-                    "created_at": "2024-01-01T00:00:00Z",
-                },
-            )
-        )
+        _mock_message_routes(agent_id, _mls_row(ciphertext, other_agent_id))
 
         async with RineClient(config_dir=tmp_config_dir, api_url=API, agent=agent_id) as client:
             msg = await client.read(MESSAGE_ID)
@@ -633,3 +778,506 @@ class TestThroughTheClients:
         assert json.loads(msg.plaintext) == {"async": "reads what sync writes"}
         assert msg.decrypt_error is None
         assert msg.verified is True
+
+
+class TestRowsSeenTwice:
+    """One row, two receive surfaces. The MLS message key is single-use."""
+
+    @respx.mock
+    def test_read_after_inbox_on_an_mls_row_still_returns_plaintext(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """An MLS group row seen twice by one client yields plaintext twice.
+
+        Forward secrecy consumed the generation the first decrypt used, so the
+        second can only come from the memo. This is the ordinary
+        ``inbox()``-then-``read()`` sequence every rine integration performs.
+        """
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_keys(peer)
+        _mock_agents(agent_id)
+        _mock_group()
+        _mock_no_handshakes()
+        payload = {"task": "read me twice"}
+        _mock_message_routes(agent_id, _mls_row(peer.send(payload), other_agent_id))
+
+        page = sync_client.inbox()
+        again = sync_client.read(MESSAGE_ID)
+
+        assert json.loads(page.items[0].plaintext) == payload
+        assert again.decrypt_error is None
+        assert json.loads(again.plaintext) == payload
+
+    @respx.mock
+    async def test_read_after_inbox_on_an_mls_row_still_returns_plaintext_async(
+        self, tmp_config_dir, agent_id, other_agent_id, tmp_path, saved_agent_keys, sync_client
+    ):
+        """The async client carries the same guarantee, through the same memo."""
+        from rine import RineClient
+        from rine._config import save_credentials
+
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_keys(peer)
+        _mock_agents(agent_id)
+        _mock_group()
+        _mock_no_handshakes()
+        save_credentials(
+            tmp_config_dir, {"default": {"client_id": "cid", "client_secret": "csecret"}}
+        )
+        payload = {"task": "read me twice, asynchronously"}
+        _mock_message_routes(agent_id, _mls_row(peer.send(payload), other_agent_id))
+
+        async with RineClient(config_dir=tmp_config_dir, api_url=API, agent=agent_id) as client:
+            page = await client.inbox()
+            again = await client.read(MESSAGE_ID)
+
+        assert json.loads(page.items[0].plaintext) == payload
+        assert again.decrypt_error is None
+        assert json.loads(again.plaintext) == payload
+
+    @respx.mock
+    def test_thread_over_an_mls_group_conversation_is_re_readable(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """Rendering a group transcript twice renders it, never ``[unavailable]``."""
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_keys(peer)
+        _mock_agents(agent_id)
+        _mock_group()
+        _mock_no_handshakes()
+        _mock_message_routes(
+            agent_id, _mls_row(peer.send({"text": "hello group"}), other_agent_id)
+        )
+
+        first = sync_client.thread(CONVERSATION_ID)
+
+        assert first[0].text == "hello group"
+        assert sync_client.thread(CONVERSATION_ID) == first
+
+
+class TestTheOnDiskReadCacheOnTheMlsPath:
+    """The re-read guarantee, in the regime that is the default.
+
+    :class:`TestRowsSeenTwice` above cannot stand in for this. It reads through
+    the client, whose in-process ``MessageMemo`` answers the second read on its
+    own — it was green before the on-disk cache existed and it stays green with
+    the cache neutered. These cases call :func:`decrypt_mls_group_message`
+    directly, which is below the memo, so the only thing that can answer twice
+    is ``lookup_group_read``. The control arm deletes the cache file and asks
+    again, which is what makes the replay attributable to it.
+    """
+
+    @respx.mock
+    def test_second_decrypt_of_an_mls_row_returns_the_same_plaintext(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """Two decrypts, one ciphertext, and no client in between to remember it."""
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_keys(peer)
+        _mock_agents(agent_id)
+        _mock_group()
+        handshakes = _mock_no_handshakes()
+        reset_mls_catch_up_gate()
+        payload = {"task": "opened twice, below the memo"}
+        ciphertext = peer.send(payload)
+
+        first = _decrypt(sync_client, tmp_config_dir, agent_id, ciphertext, other_agent_id)
+        second = _decrypt(sync_client, tmp_config_dir, agent_id, ciphertext, other_agent_id)
+
+        assert json.loads(first.plaintext) == payload
+        assert json.loads(second.plaintext) == payload
+        assert second.sender_kid == first.sender_kid
+        assert second.verification_status == "verified"
+        # The replay opened no MLS state and asked the server nothing new: the
+        # first read's catch-up is the only handshake request either made.
+        assert handshakes.call_count == 1
+
+    @respx.mock
+    def test_second_decrypt_when_the_cache_is_removed_then_the_secret_is_gone(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """The control arm. One variable changes: the cache file.
+
+        MLS deletes the secret-tree entry at the first decrypt, so the recovery
+        path cannot bring it back either — the row is simply unreadable again.
+        """
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_keys(peer)
+        _mock_agents(agent_id)
+        _mock_group()
+        _mock_no_handshakes()
+        reset_mls_catch_up_gate()
+        ciphertext = peer.send({"task": "opened once"})
+
+        _decrypt(sync_client, tmp_config_dir, agent_id, ciphertext, other_agent_id)
+        delete_group_read_cache(tmp_config_dir, agent_id, GROUP_ID)
+
+        with pytest.raises(CryptoError):
+            _decrypt(sync_client, tmp_config_dir, agent_id, ciphertext, other_agent_id)
+
+    @respx.mock
+    def test_replay_when_the_group_is_retired_then_the_cache_stays_shut(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """A retirement closes this cache with everything else, in BOTH regimes.
+
+        A leave writes a retirement marker beside the keys it wipes and deletes
+        the cache in the same breath, so today this is defensive rather than
+        live. It still has to hold: the marker has to be re-armable, and a
+        message opened while it was absent must stop opening once it is back.
+        The sender-key twin is ``_crypto.message._replayed_envelope`` and the
+        TypeScript twin gates both regimes in one place
+        (``rine-core/src/crypto/message.ts``); this path was the one hole.
+        """
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_keys(peer)
+        _mock_agents(agent_id)
+        _mock_group()
+        _mock_no_handshakes()
+        reset_mls_catch_up_gate()
+        ciphertext = peer.send({"task": "opened once, then retired"})
+
+        _decrypt(sync_client, tmp_config_dir, agent_id, ciphertext, other_agent_id)
+        mark_sender_keys_retired(tmp_config_dir, agent_id, GROUP_ID)
+
+        # Same control arm as the case above: the secret-tree entry is spent, so
+        # with the cache shut there is nothing left to answer with.
+        with pytest.raises(CryptoError):
+            _decrypt(sync_client, tmp_config_dir, agent_id, ciphertext, other_agent_id)
+
+    @respx.mock
+    def test_a_replay_naming_a_different_sender_is_refused(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """A replay is verified against the sender the row names NOW.
+
+        The same rule the sender-key path holds, reached through the MLS branch:
+        the cache answers what the bytes said, never who they were attributed to
+        the first time.
+        """
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_keys(peer)
+        _mock_agents(agent_id)
+        _mock_group()
+        _mock_no_handshakes()
+        reset_mls_catch_up_gate()
+        ciphertext = peer.send({"task": "opened once, then renamed"})
+
+        _decrypt(sync_client, tmp_config_dir, agent_id, ciphertext, other_agent_id)
+
+        with pytest.raises(SenderMismatchError):
+            _decrypt(sync_client, tmp_config_dir, agent_id, ciphertext, IMPOSTOR_ID)
+
+
+class TestRepeatReadKeepsTheBinding:
+    """Who a row is from is decided on every read, not once per client.
+
+    A row already opened is answered from the memo, so nothing re-derives the
+    verdict — the message's one-time key is spent by then. The binding is what
+    has to be held again, or a row re-served under another name comes back
+    verified as an agent that never signed it.
+    """
+
+    @respx.mock
+    def test_a_row_re_served_under_another_sender_is_not_replayed_as_verified(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """Read once honestly, then served again with the sender renamed."""
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_keys(peer)
+        _mock_agents(agent_id)
+        _mock_group()
+        _mock_no_handshakes()
+        _serve_honestly_then_renamed(_mls_row(peer.send({"text": "albatross"}), other_agent_id))
+
+        first = sync_client.read(MESSAGE_ID)
+        second = sync_client.read(MESSAGE_ID)
+
+        assert first.verified is True
+        assert second.verified is False
+        assert second.verification_status == "sender-mismatch"
+        assert second.plaintext is None
+        assert second.decrypt_error is not None
+
+    @respx.mock
+    async def test_a_row_re_served_under_another_sender_is_not_replayed_as_verified_async(
+        self, tmp_config_dir, agent_id, other_agent_id, tmp_path, saved_agent_keys, sync_client
+    ):
+        """The async client shares the memo's contract, and its refusal."""
+        from rine import RineClient
+        from rine._config import save_credentials
+
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_keys(peer)
+        _mock_agents(agent_id)
+        _mock_group()
+        _mock_no_handshakes()
+        save_credentials(
+            tmp_config_dir, {"default": {"client_id": "cid", "client_secret": "csecret"}}
+        )
+        _serve_honestly_then_renamed(_mls_row(peer.send({"text": "albatross"}), other_agent_id))
+
+        async with RineClient(config_dir=tmp_config_dir, api_url=API, agent=agent_id) as client:
+            first = await client.read(MESSAGE_ID)
+            second = await client.read(MESSAGE_ID)
+
+        assert first.verified is True
+        assert second.verified is False
+        assert second.verification_status == "sender-mismatch"
+        assert second.plaintext is None
+
+
+class TestRotationOnAGroupRow:
+    """A peer's key rotation reaches the caller from either client."""
+
+    @respx.mock
+    async def test_a_rotated_sender_key_is_reported_on_an_mls_row_by_both_clients(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path, saved_agent_keys
+    ):
+        """The async client runs MLS on a worker thread; the signal must survive that.
+
+        Both clients hold the same superseded copy of the peer's signing key, so
+        the cached key fails, the one refetch finds the peer's real one, and the
+        rotation is reported. A worker with a cache of its own starts empty, has
+        no stale key to fail on, and reports nothing.
+        """
+        from rine import RineClient
+        from rine._config import save_credentials
+        from rine._crypto.keys import public_keys_body
+
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_keys(peer)
+        _mock_agents(agent_id)
+        _mock_group()
+        _mock_no_handshakes()
+        save_credentials(
+            tmp_config_dir, {"default": {"client_id": "cid", "client_secret": "csecret"}}
+        )
+        superseded = public_keys_body(generate_agent_keys())
+        _mock_message_routes(agent_id, _mls_row(peer.send({"text": "one"}), other_agent_id))
+        respx.get(f"{API}/messages/{SECOND_MESSAGE_ID}").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    **_mls_row(peer.send({"text": "two"}), other_agent_id),
+                    "id": SECOND_MESSAGE_ID,
+                },
+            )
+        )
+
+        sync_client._http._keys_cache.set(other_agent_id, superseded)
+        from_sync = sync_client.read(MESSAGE_ID)
+        async with RineClient(config_dir=tmp_config_dir, api_url=API, agent=agent_id) as client:
+            client._http._keys_cache.set(other_agent_id, superseded)
+            from_async = await client.read(SECOND_MESSAGE_ID)
+
+        assert from_sync.key_changed is not None
+        assert from_sync.key_changed.agent_id == other_agent_id
+        assert from_sync.key_changed.current_fingerprint == signing_fingerprint(peer.keys)
+        assert from_async.key_changed == from_sync.key_changed
+
+
+class TestFailedReadKeepsTheRow:
+    """A read that cannot deliver plaintext must not spend the row's key."""
+
+    @respx.mock
+    def test_read_that_fails_after_the_ratchet_step_reports_the_same_failure_twice(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """A failure after the MLS decrypt must leave the message where it was.
+
+        The ciphertext is a well-formed MLS frame around a malformed inner
+        envelope, so the ratchet step succeeds and everything after it fails.
+        Persisting the advance there turns the second read's honest "envelope
+        too short" into "invalid generation 0" — a fault report that no longer
+        describes the fault, and a plaintext that would have been recoverable
+        for a transient failure is gone.
+        """
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_agents(agent_id)
+        _mock_group()
+        _mock_no_handshakes()
+        framed = peer.group.encrypt_application_message(b"\x01")
+        peer.group.save()
+        _mock_message_routes(agent_id, _mls_row(to_base64url(framed), other_agent_id))
+
+        first = sync_client.read(MESSAGE_ID)
+        second = sync_client.read(MESSAGE_ID)
+
+        assert first.plaintext is None
+        assert first.decrypt_error is not None
+        assert second.decrypt_error == first.decrypt_error
+
+
+class TestReadDegrades:
+    """``read()`` carries ``inbox()``'s contract: a bad row never raises."""
+
+    @respx.mock
+    def test_read_an_mls_row_this_agent_cannot_open_sets_decrypt_error(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """No state, no Welcome, no GroupInfo: the row degrades rather than raising."""
+        _unreachable_group(sync_client, tmp_path, agent_id, other_agent_id)
+
+        msg = sync_client.read(MESSAGE_ID)
+
+        assert msg.plaintext is None
+        assert msg.decrypt_error is not None
+
+    @respx.mock
+    async def test_read_an_mls_row_this_agent_cannot_open_sets_decrypt_error_async(
+        self, tmp_config_dir, agent_id, other_agent_id, tmp_path, saved_agent_keys, sync_client
+    ):
+        """The async client degrades identically — one contract, not two."""
+        from rine import RineClient
+        from rine._config import save_credentials
+
+        _unreachable_group(sync_client, tmp_path, agent_id, other_agent_id)
+        save_credentials(
+            tmp_config_dir, {"default": {"client_id": "cid", "client_secret": "csecret"}}
+        )
+
+        async with RineClient(config_dir=tmp_config_dir, api_url=API, agent=agent_id) as client:
+            msg = await client.read(MESSAGE_ID)
+
+        assert msg.plaintext is None
+        assert msg.decrypt_error is not None
+
+    @respx.mock
+    def test_a_core_failure_the_sdk_does_not_name_reaches_the_caller_as_a_rine_error(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """A frame the core refuses by a class the SDK never re-exported.
+
+        ``UnexpectedVersionTagError`` is one of the ten ``rine_mls`` classes with
+        no SDK name, so a caller could not write an ``except`` for it even if it
+        wanted to. It must arrive normalised, carrying the core's own code.
+        """
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_group()
+        _mock_no_handshakes()
+
+        with pytest.raises(CryptoError) as caught:
+            decrypt_mls_group_message(
+                sync_client._http,
+                tmp_config_dir,
+                agent_id,
+                GROUP_ID,
+                to_base64url(b"\x00"),
+                other_agent_id,
+            )
+
+        assert caught.value.code
+
+    def test_every_mls_core_failure_class_crosses_the_boundary_as_a_rine_error(self):
+        """Enumerated off the wheel, so a class added upstream fails here first.
+
+        The core's code enum is ``#[non_exhaustive]``: a new code lands on the
+        base class, which no ``except`` list over the leaves would catch.
+        """
+        import rine_mls
+
+        classes = [rine_mls.RineMlsError, *rine_mls.RineMlsError.__subclasses__()]
+        assert len(classes) > 15
+
+        for cls in classes:
+            with pytest.raises(CryptoError) as caught:
+                _raise_through_the_boundary(cls)
+            assert caught.value.code == getattr(cls, "code", None)
+
+
+def _unreachable_group(sync_client, tmp_path, agent_id: str, other_agent_id: str) -> None:
+    """Serve an MLS row for a group this agent can never establish state for."""
+    _mock_token()
+    peer = Peer(tmp_path, other_agent_id)
+    peer.found()
+    ciphertext = peer.send({"not": "for you"})
+    _mock_agents(agent_id)
+    _mock_group()
+    _mock_welcomes(agent_id)
+    respx.get(f"{API}/groups/{GROUP_ID}/mls/group-info").mock(
+        return_value=httpx.Response(200, json={"group_info": None, "epoch": None})
+    )
+    _mock_message_routes(agent_id, _mls_row(ciphertext, other_agent_id))
+
+
+@mls_boundary
+def _raise_through_the_boundary(cls: type[BaseException]) -> None:
+    """Stand in for the compiled core raising one of its own classes."""
+    raise cls("boom")
+
+
+class TestAReadSaysWhatItDidToTheGroupState:
+    """The eager catch-up's own result, carried out to the caller.
+
+    Reading a closed-group message advances this agent's MLS state behind the
+    read: it applies whatever commits it finds, lands on an epoch, and can
+    discover that the agent has been removed. All three were computed on every
+    read and thrown away, so the one surface that already knew a member had
+    been evicted said nothing about it.
+
+    What is deliberately absent is *distance*. "You were N epochs behind" needs
+    the group's confirmed epoch from the server — a second round trip on the
+    hottest path in the product — and ``groups.sync`` is where that question is
+    asked.
+    """
+
+    @respx.mock
+    def test_read_when_a_group_row_is_opened_then_it_reports_the_catch_up_it_ran(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_keys(peer)
+        _mock_agents(agent_id)
+        _mock_group()
+        _mock_no_handshakes()
+        reset_mls_catch_up_gate()
+        _mock_message_routes(agent_id, _mls_row(peer.send({"task": "hello"}), other_agent_id))
+
+        msg = sync_client.read(MESSAGE_ID)
+
+        assert msg.catch_up is not None
+        assert msg.catch_up.processed == 0, "a current member with nothing pending"
+        assert msg.catch_up.epoch >= 0
+        assert msg.catch_up.evicted is False
+
+    @respx.mock
+    def test_read_when_the_row_was_already_opened_then_it_reports_no_catch_up(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """A replay applied nothing, so it must claim nothing.
+
+        The gate is reset between the two reads on purpose: without that, a
+        silent second read would be indistinguishable from the once-a-minute
+        floor swallowing it. Reset, the only reason this read reports no work is
+        that it did none — it came from the memo.
+        """
+        peer = Peer(tmp_path, other_agent_id)
+        _join_group(sync_client, tmp_config_dir, agent_id, peer)
+        _mock_keys(peer)
+        _mock_agents(agent_id)
+        _mock_group()
+        _mock_no_handshakes()
+        reset_mls_catch_up_gate()
+        _mock_message_routes(agent_id, _mls_row(peer.send({"task": "twice"}), other_agent_id))
+
+        first = sync_client.inbox().items[0]
+        reset_mls_catch_up_gate()
+        again = sync_client.read(MESSAGE_ID)
+
+        assert first.catch_up is not None
+        assert again.plaintext == first.plaintext
+        assert again.catch_up is None

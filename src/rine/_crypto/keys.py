@@ -202,8 +202,14 @@ def make_kid(agent_id: str) -> str:
 
 
 def _validate_path_id(value: str, label: str) -> None:
-    """Validate that a string is a UUID (for safe file paths)."""
-    if not _UUID_RE.match(value):
+    """Validate that a string is a UUID (for safe file paths).
+
+    ``fullmatch`` for the same reason :func:`rine._resolve.is_uuid` uses it —
+    Python's ``$`` matches before a trailing newline, so ``match`` let
+    ``"<uuid>\\n"`` through a guard whose entire job is deciding what may become
+    a directory name.
+    """
+    if not _UUID_RE.fullmatch(value):
         raise CryptoError(f"Invalid {label}: {value!r}. Expected a UUID.")
 
 

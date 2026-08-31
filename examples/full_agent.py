@@ -16,16 +16,18 @@ Prerequisites
 
 Run it
 ------
-    python full_agent.py
+    RINE_ORG_EMAIL=you@your-domain.example python full_agent.py
 
 Credentials are written to (and reused from) the Rine config directory
 (`RINE_CONFIG_DIR`, else ~/.config/rine, else ./.rine). Re-running the script
 reuses the identity it created on the first run instead of onboarding again.
 
-Override any of these before running:
+Set a contact address on the first run: registration checks that the email
+domain has MX records, so it has to be an address that can receive mail.
+
+    RINE_ORG_EMAIL   contact email — required to register a new org
     RINE_ORG_SLUG    URL-safe org id  (2-32 chars, [a-z0-9] + interior hyphens)
     RINE_ORG_NAME    human-readable org name
-    RINE_ORG_EMAIL   contact email
     RINE_AGENT_NAME  agent name
     RINE_X402_FACILITATOR   facilitator preset/URL; enables the payment branch
 
@@ -44,7 +46,9 @@ from rine import (
     ConflictError,
     MessageType,
     RineClient,
+    RineError,
     async_onboard,
+    format_error,
     resolve_api_url,
     resolve_config_dir,
 )
@@ -54,8 +58,12 @@ from rine.types import AgentRead, DecryptedMessage
 
 ORG_SLUG = os.environ.get("RINE_ORG_SLUG", "acme-demo")
 ORG_NAME = os.environ.get("RINE_ORG_NAME", "Acme Demo")
-ORG_EMAIL = os.environ.get("RINE_ORG_EMAIL", "ops@example.com")
 AGENT_NAME = os.environ.get("RINE_AGENT_NAME", "concierge")
+
+# Registration does a live MX lookup on the email domain, so there is no
+# placeholder that works: supply an address that can receive mail. Only read on
+# the first run — a second run reuses the credentials already in the config dir.
+ORG_EMAIL = os.environ.get("RINE_ORG_EMAIL")
 
 # Set to a facilitator preset ("payai", "cdp", "x402-rs") or an https base URL
 # to turn on the x402 payment branch. Left unset, the agent simply skips it.
@@ -68,22 +76,27 @@ async def ensure_identity(client: RineClient) -> AgentRead:
     Onboarding solves a proof-of-work challenge and saves org credentials to the
     config dir. A second run finds the credentials already present: `async_onboard`
     then raises `ConflictError` (slug/email already registered), so we fall through
-    to the existing identity instead of registering twice.
+    to the existing identity instead of registering twice. Without
+    `RINE_ORG_EMAIL` there is nothing to register with, so this run goes straight
+    to the saved credentials.
     """
     api_url = resolve_api_url()
     config_dir = resolve_config_dir()
 
-    try:
-        result = await async_onboard(
-            api_url=api_url,
-            config_dir=config_dir,
-            email=ORG_EMAIL,
-            org_slug=ORG_SLUG,
-            org_name=ORG_NAME,
-        )
-        print(f"onboarded org {result.org_id}")
-    except ConflictError:
-        print(f"org '{ORG_SLUG}' already registered — reusing saved credentials")
+    if not ORG_EMAIL:
+        print("RINE_ORG_EMAIL is unset — using the credentials already in the config dir")
+    else:
+        try:
+            result = await async_onboard(
+                api_url=api_url,
+                config_dir=config_dir,
+                email=ORG_EMAIL,
+                org_slug=ORG_SLUG,
+                org_name=ORG_NAME,
+            )
+            print(f"onboarded org {result.org_id}")
+        except ConflictError:
+            print(f"org '{ORG_SLUG}' already registered — reusing saved credentials")
 
     # Reuse an existing agent if this org already has one; otherwise create it.
     who = await client.whoami()
@@ -133,7 +146,14 @@ async def handle_task(client: RineClient, agent: AgentRead, msg: DecryptedMessag
     result = {"status": "ok", "echo": task}
 
     # `reply` stays in the message's conversation and defaults to a task_response.
-    reply = await client.reply(str(msg.id), result, agent=str(agent.id))
+    # A refusal here is about this one message — its conversation reached a
+    # terminal status, the counterparty was revoked — so report it and carry on
+    # serving. One unanswerable thread must not stop the agent.
+    try:
+        reply = await client.reply(str(msg.id), result, agent=str(agent.id))
+    except RineError as e:
+        print(f"  cannot answer {msg.id}: {format_error(e)}")
+        return
     print(f"  replied ({reply.id})")
 
 
@@ -161,9 +181,13 @@ async def serve(client: RineClient, agent: AgentRead, *, rounds: int = 12) -> No
     """Poll the inbox, dispatch each new message, and acknowledge it.
 
     `inbox(status="new")` returns only undelivered mail; `mark_delivered` acks the
-    rows we handled so the next poll returns strictly newer messages. A row that
-    could not be decrypted carries `decrypt_error` (the inbox never raises on one
-    bad message) — skip it, don't ack, so it can be retried.
+    rows we handled so the next poll returns strictly newer messages. Every row is
+    acked, including one that could not be decrypted (`decrypt_error` — the inbox
+    never raises on one bad message) and one whose reply was refused: an unacked
+    row comes back on every poll, and `inbox()` has already run its own key
+    recovery before setting `decrypt_error`, so re-fetching it would never end.
+    `echo_agent.py` shows the finer-grained version, which holds a row back only
+    when the *call* failed rather than the row.
     """
     print(f"listening as @{agent.handle} (Ctrl-C to stop)...")
     for _ in range(rounds):
@@ -173,8 +197,7 @@ async def serve(client: RineClient, agent: AgentRead, *, rounds: int = 12) -> No
         for msg in page:
             if msg.decrypt_error:
                 print(f"  skipping undecryptable message {msg.id}: {msg.decrypt_error}")
-                continue
-            if msg.type == MessageType.X402_PAYMENT and X402_FACILITATOR:
+            elif msg.type == MessageType.X402_PAYMENT and X402_FACILITATOR:
                 await handle_payment(client, agent, msg)
             elif msg.type == MessageType.TASK_REQUEST:
                 await handle_task(client, agent, msg)

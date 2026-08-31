@@ -6,7 +6,14 @@ for both sync and async clients.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # `list` is a method on both resource classes below, which shadows the builtin for
+    # every annotation that follows it in the class body. Annotations after that point
+    # name `builtins.list` so they still mean the type. Annotations are lazy here
+    # (`from __future__ import annotations`), so this never has to exist at run time.
+    import builtins
 
 from rine.types import WebhookCreated, WebhookJobRead, WebhookJobSummary, WebhookRead
 
@@ -83,9 +90,7 @@ class SyncWebhooks:
         Returns:
             Updated WebhookRead.
         """
-        data = self._client._http.patch(
-            f"/webhooks/{webhook_id}", json_body={"active": active}
-        )
+        data = self._client._http.patch(f"/webhooks/{webhook_id}", json_body={"active": active})
         return WebhookRead.model_validate(data)
 
     def delete(self, webhook_id: str) -> None:
@@ -103,7 +108,7 @@ class SyncWebhooks:
         status: str | None = None,
         limit: int = 20,
         offset: int = 0,
-    ) -> list[WebhookJobRead]:
+    ) -> builtins.list[WebhookJobRead]:
         """List webhook delivery attempts.
 
         Args:
@@ -118,9 +123,7 @@ class SyncWebhooks:
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if status is not None:
             params["status"] = status
-        data = self._client._http.get(
-            f"/webhooks/{webhook_id}/deliveries", params=params
-        )
+        data = self._client._http.get(f"/webhooks/{webhook_id}/deliveries", params=params)
         items = data.get("items", data) if isinstance(data, dict) else data
         return [WebhookJobRead.model_validate(j) for j in items]
 
@@ -133,9 +136,7 @@ class SyncWebhooks:
         Returns:
             WebhookJobSummary with counts.
         """
-        data = self._client._http.get(
-            f"/webhooks/{webhook_id}/deliveries/summary"
-        )
+        data = self._client._http.get(f"/webhooks/{webhook_id}/deliveries/summary")
         return WebhookJobSummary.model_validate(data)
 
 
@@ -231,7 +232,7 @@ class AsyncWebhooks:
         status: str | None = None,
         limit: int = 20,
         offset: int = 0,
-    ) -> list[WebhookJobRead]:
+    ) -> builtins.list[WebhookJobRead]:
         """List webhook delivery attempts.
 
         Args:
@@ -246,9 +247,7 @@ class AsyncWebhooks:
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if status is not None:
             params["status"] = status
-        data = await self._client._http.get(
-            f"/webhooks/{webhook_id}/deliveries", params=params
-        )
+        data = await self._client._http.get(f"/webhooks/{webhook_id}/deliveries", params=params)
         items = data.get("items", data) if isinstance(data, dict) else data
         return [WebhookJobRead.model_validate(j) for j in items]
 
@@ -261,7 +260,5 @@ class AsyncWebhooks:
         Returns:
             WebhookJobSummary with counts.
         """
-        data = await self._client._http.get(
-            f"/webhooks/{webhook_id}/deliveries/summary"
-        )
+        data = await self._client._http.get(f"/webhooks/{webhook_id}/deliveries/summary")
         return WebhookJobSummary.model_validate(data)

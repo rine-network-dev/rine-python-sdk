@@ -14,9 +14,11 @@ from rine._constants import MessageType
 from rine._crypto.keys import (
     encryption_public_key_to_jwk,
     generate_agent_keys,
+    public_keys_body,
     save_agent_keys,
     signing_public_key_to_jwk,
 )
+from rine._crypto.message import encrypt_message
 from rine._crypto.sender_keys_helpers import load_sender_key_states
 from rine.errors import (
     AuthorizationError,
@@ -47,6 +49,7 @@ from rine.types import (
     WebhookRead,
     WhoAmI,
 )
+from tests.conftest import recipient_view, signing_fingerprint
 
 AGENT_ID = "00000000-1111-2222-3333-444444444444"
 OTHER_AGENT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -353,13 +356,71 @@ class TestResolveGroupAsync:
         await async_client.close()
 
     @respx.mock
-    async def test_resolve_group_returns_id_for_uuid(self, async_client):
-        """_resolve_group_async passes through UUIDs without network call."""
+    async def test_resolve_group_reads_a_uuids_own_row_and_leaves_the_roster_alone(
+        self, async_client
+    ):
+        """A UUID is resolved through ``GET /groups/{id}``, not the list.
+
+        It used to reach the wire unvalidated, so an id naming no group of this
+        org came back as the server's bare 404 — measured recovery rate 0/6.
+        Matching the id against ``GET /groups`` fixed the sentence,
+        which charged every UUID group verb an unpaginated, member-counting
+        listing on the RESOLVED path. The indexed row answers the same question
+        for one row's worth of work, so the roster must stay untouched here.
+        """
         group_uuid = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+        _mock_token()
+        row = respx.get(f"https://rine.network/groups/{group_uuid}").mock(
+            return_value=httpx.Response(
+                200,
+                json={"id": group_uuid, "name": "ops", "handle": "#ops@myorg.rine.network"},
+            )
+        )
+        roster = respx.get("https://rine.network/groups").mock(
+            return_value=httpx.Response(200, json={"items": []})
+        )
 
         result = await async_client._resolve_group_async(group_uuid)
 
         assert result == group_uuid
+        assert row.called
+        assert not roster.called, "the resolved path bought a listing it does not read"
+        await async_client.close()
+
+    @respx.mock
+    async def test_resolve_group_refuses_a_uuid_this_org_has_no_group_for(self, async_client):
+        """The product half, which the single-row read moved but did not change.
+
+        The refusal still names what there WAS to find, and the roster it names
+        them from is now bought here and nowhere else — on the path that is
+        already an error, where one more read costs a caller nothing.
+        """
+        unknown = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+        _mock_token()
+        respx.get(f"https://rine.network/groups/{unknown}").mock(
+            return_value=httpx.Response(404, json={"detail": "Group not found"})
+        )
+        roster = respx.get("https://rine.network/groups").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "id": "aaaaaaaa-0000-4000-8000-000000000001",
+                            "name": "ops",
+                            "handle": "#ops@myorg.rine.network",
+                        }
+                    ]
+                },
+            )
+        )
+
+        with pytest.raises(NotFoundError) as excinfo:
+            await async_client._resolve_group_async(unknown)
+
+        assert f"Group not found: {unknown}" in excinfo.value.detail
+        assert "#ops@myorg.rine.network" in excinfo.value.detail
+        assert roster.called
         await async_client.close()
 
 
@@ -1316,6 +1377,24 @@ _GROUP_PAYLOAD = {
     "created_at": "2024-01-01T00:00:00Z",
 }
 
+
+def _mock_group_by_id() -> None:
+    """``GET /groups/{id}`` — the one row a group UUID is resolved through.
+
+    Every group verb below names its group by id, and the resolve now reads that
+    id's own row before the verb's own request: an id this caller cannot read is
+    refused here instead of travelling to the wire. It
+    used to cost nothing, which is why these tests never mocked the route.
+
+    🔴 The ROW, not the roster. This rung first shipped as a match against
+    ``GET /groups``, so a mock left on that route keeps passing an assertion
+    about traffic the client no longer spends.
+    """
+    respx.get(f"https://rine.network/groups/{GROUP_ID}").mock(
+        return_value=httpx.Response(200, json=_GROUP_PAYLOAD)
+    )
+
+
 _JOIN_REQUEST_PAYLOAD = {
     "id": "dddddddd-eeee-ffff-0000-111111111111",
     "group_id": GROUP_ID,
@@ -1356,6 +1435,7 @@ class TestGroupUpdate:
     async def test_group_update_full(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         route = respx.patch(f"https://rine.network/groups/{GROUP_ID}").mock(
             return_value=httpx.Response(200, json=_GROUP_PAYLOAD)
         )
@@ -1383,6 +1463,7 @@ class TestGroupUpdate:
     async def test_group_update_single_field(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         route = respx.patch(f"https://rine.network/groups/{GROUP_ID}").mock(
             return_value=httpx.Response(200, json=_GROUP_PAYLOAD)
         )
@@ -1397,6 +1478,7 @@ class TestGroupUpdate:
     async def test_group_update_not_found(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         respx.patch(f"https://rine.network/groups/{GROUP_ID}").mock(
             return_value=httpx.Response(404, json={"detail": "Group not found"})
         )
@@ -1409,6 +1491,7 @@ class TestGroupUpdate:
     async def test_group_update_not_admin(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         respx.patch(f"https://rine.network/groups/{GROUP_ID}").mock(
             return_value=httpx.Response(403, json={"detail": "Not admin"})
         )
@@ -1423,6 +1506,7 @@ class TestGroupDelete:
     async def test_group_delete_success(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         respx.delete(f"https://rine.network/groups/{GROUP_ID}").mock(
             return_value=httpx.Response(204)
         )
@@ -1436,6 +1520,7 @@ class TestGroupDelete:
     async def test_group_delete_not_found(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         respx.delete(f"https://rine.network/groups/{GROUP_ID}").mock(
             return_value=httpx.Response(404, json={"detail": "Group not found"})
         )
@@ -1448,6 +1533,7 @@ class TestGroupDelete:
     async def test_group_delete_not_admin(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         respx.delete(f"https://rine.network/groups/{GROUP_ID}").mock(
             return_value=httpx.Response(403, json={"detail": "Not admin"})
         )
@@ -1462,19 +1548,27 @@ class TestGroupRemoveMember:
     async def test_group_remove_member_success(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         respx.delete(f"https://rine.network/groups/{GROUP_ID}/members/{OTHER_AGENT_ID}").mock(
             return_value=httpx.Response(204)
         )
 
         result = await async_client.groups.remove_member(GROUP_ID, OTHER_AGENT_ID)
 
-        assert result is None
+        # Same answer as the sync peer's: a kick the server took without a
+        # Remove commit is a delivery-filter removal, and the sentence says so.
+        assert result.left is False
+        assert result.encryption == "sender-key"
+        assert result.mls_removal_epoch is None
+        assert result.local_state_retired is False
+        assert "no cryptographic eviction" in result.message
         await async_client.close()
 
     @respx.mock
     async def test_group_remove_member_not_found(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         respx.delete(f"https://rine.network/groups/{GROUP_ID}/members/{OTHER_AGENT_ID}").mock(
             return_value=httpx.Response(404, json={"detail": "Not found"})
         )
@@ -1487,6 +1581,7 @@ class TestGroupRemoveMember:
     async def test_group_remove_member_not_admin(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         respx.delete(f"https://rine.network/groups/{GROUP_ID}/members/{OTHER_AGENT_ID}").mock(
             return_value=httpx.Response(403, json={"detail": "Not admin"})
         )
@@ -1499,6 +1594,7 @@ class TestGroupRemoveMember:
     async def test_group_remove_member_last_admin(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         respx.delete(f"https://rine.network/groups/{GROUP_ID}/members/{AGENT_ID}").mock(
             return_value=httpx.Response(422, json={"detail": "Last admin"})
         )
@@ -1513,6 +1609,7 @@ class TestGroupVoting:
     async def test_group_list_requests_success(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         respx.get(f"https://rine.network/groups/{GROUP_ID}/requests").mock(
             return_value=httpx.Response(200, json={"items": [_JOIN_REQUEST_PAYLOAD], "total": 1})
         )
@@ -1528,6 +1625,7 @@ class TestGroupVoting:
     async def test_group_list_requests_empty(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         respx.get(f"https://rine.network/groups/{GROUP_ID}/requests").mock(
             return_value=httpx.Response(200, json={"items": [], "total": 0})
         )
@@ -1541,6 +1639,7 @@ class TestGroupVoting:
     async def test_group_list_requests_not_found(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         respx.get(f"https://rine.network/groups/{GROUP_ID}/requests").mock(
             return_value=httpx.Response(404, json={"detail": "Group not found"})
         )
@@ -1553,7 +1652,14 @@ class TestGroupVoting:
     async def test_group_vote_approve_success(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         req_id = _JOIN_REQUEST_PAYLOAD["id"]
+        respx.get(f"https://rine.network/groups/{GROUP_ID}/requests").mock(
+            return_value=httpx.Response(200, json={"items": [_JOIN_REQUEST_PAYLOAD], "total": 1})
+        )
+        respx.get(f"https://rine.network/groups/{GROUP_ID}").mock(
+            return_value=httpx.Response(200, json=_GROUP_PAYLOAD)
+        )
         respx.post(f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote").mock(
             return_value=httpx.Response(200, json=_VOTE_RESPONSE_PAYLOAD)
         )
@@ -1569,6 +1675,7 @@ class TestGroupVoting:
     async def test_group_vote_deny_success(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         req_id = _JOIN_REQUEST_PAYLOAD["id"]
         deny_payload = {**_VOTE_RESPONSE_PAYLOAD, "your_vote": "deny", "status": "pending"}
         respx.post(f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote").mock(
@@ -1584,7 +1691,11 @@ class TestGroupVoting:
     async def test_group_vote_already_voted(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         req_id = _JOIN_REQUEST_PAYLOAD["id"]
+        respx.get(f"https://rine.network/groups/{GROUP_ID}/requests").mock(
+            return_value=httpx.Response(200, json={"items": [_JOIN_REQUEST_PAYLOAD], "total": 1})
+        )
         respx.post(f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote").mock(
             return_value=httpx.Response(409, json={"detail": "Already voted"})
         )
@@ -1597,7 +1708,11 @@ class TestGroupVoting:
     async def test_group_vote_not_pending(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         req_id = _JOIN_REQUEST_PAYLOAD["id"]
+        respx.get(f"https://rine.network/groups/{GROUP_ID}/requests").mock(
+            return_value=httpx.Response(200, json={"items": [_JOIN_REQUEST_PAYLOAD], "total": 1})
+        )
         respx.post(f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote").mock(
             return_value=httpx.Response(422, json={"detail": "Request not pending"})
         )
@@ -1610,7 +1725,11 @@ class TestGroupVoting:
     async def test_group_vote_not_found(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         req_id = _JOIN_REQUEST_PAYLOAD["id"]
+        respx.get(f"https://rine.network/groups/{GROUP_ID}/requests").mock(
+            return_value=httpx.Response(200, json={"items": [_JOIN_REQUEST_PAYLOAD], "total": 1})
+        )
         respx.post(f"https://rine.network/groups/{GROUP_ID}/requests/{req_id}/vote").mock(
             return_value=httpx.Response(404, json={"detail": "Not found"})
         )
@@ -1623,6 +1742,7 @@ class TestGroupVoting:
     async def test_group_list_requests_not_member(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         respx.get(f"https://rine.network/groups/{GROUP_ID}/requests").mock(
             return_value=httpx.Response(403, json={"detail": "Not a member"})
         )
@@ -1635,6 +1755,7 @@ class TestGroupVoting:
     async def test_group_update_sends_agent_header(self, async_client):
         _mock_token()
         _mock_agents()
+        _mock_group_by_id()
         route = respx.patch(f"https://rine.network/groups/{GROUP_ID}").mock(
             return_value=httpx.Response(200, json=_GROUP_PAYLOAD)
         )
@@ -1643,6 +1764,46 @@ class TestGroupVoting:
 
         headers = route.calls[0].request.headers
         assert headers.get("x-rine-agent") == AGENT_ID
+        await async_client.close()
+
+    @respx.mock
+    async def test_constructor_agent_handle_reaches_header_and_resolves_once(self, async_client):
+        """A client built with ``agent=<handle>`` names that actor on every call.
+
+        The lookup is memoised: the org's agents are fetched once, not per request.
+        """
+        _mock_token()
+        agents = respx.get("https://rine.network/agents").mock(
+            return_value=httpx.Response(200, json={"items": [_AGENT_PAYLOAD]})
+        )
+        route = respx.get("https://rine.network/groups").mock(
+            return_value=httpx.Response(200, json={"items": []})
+        )
+        client = async_client.with_options(agent="test-agent@myorg.rine.network")
+
+        await client.groups.list()
+        await client.groups.list()
+
+        assert [c.request.headers.get("x-rine-agent") for c in route.calls] == [AGENT_ID] * 2
+        assert agents.call_count == 1
+        await client.close()
+        await async_client.close()
+
+    @respx.mock
+    async def test_no_constructor_agent_sends_no_header(self, async_client):
+        """Without a configured agent the header stays absent — the server auto-selects."""
+        _mock_token()
+        agents = respx.get("https://rine.network/agents").mock(
+            return_value=httpx.Response(200, json={"items": [_AGENT_PAYLOAD]})
+        )
+        route = respx.get("https://rine.network/groups").mock(
+            return_value=httpx.Response(200, json={"items": []})
+        )
+
+        await async_client.groups.list()
+
+        assert route.calls[0].request.headers.get("x-rine-agent") is None
+        assert agents.call_count == 0
         await async_client.close()
 
 
@@ -1959,4 +2120,83 @@ class TestGroupSendActingAgent:
 
         body = json.loads(msg_route.calls[-1].request.content)
         assert body["sender_signing_kid"] == f"rine:{OTHER_AGENT_ID}"
+        await async_client.close()
+
+
+class TestRotatedSenderSurfacesKeyChange:
+    """A peer's key rotation reaches the caller, it does not stop at the crypto layer."""
+
+    @respx.mock
+    async def test_read_when_sender_rotated_past_cached_key_sets_key_changed(
+        self, async_client, tmp_config_dir, saved_agent_keys
+    ):
+        _mock_token()
+        _mock_agents()
+        sender_keys = generate_agent_keys()
+        rotated_away = generate_agent_keys()
+        save_agent_keys(tmp_config_dir, OTHER_AGENT_ID, sender_keys)
+        sealed = encrypt_message(
+            tmp_config_dir, OTHER_AGENT_ID, recipient_view(saved_agent_keys), {"text": "hi"}
+        )
+        respx.get(f"https://rine.network/messages/{_MESSAGE_PAYLOAD['id']}").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    **_MESSAGE_PAYLOAD,
+                    "from_agent_id": OTHER_AGENT_ID,
+                    "to_agent_id": AGENT_ID,
+                    "encrypted_payload": sealed.encrypted_payload,
+                    "encryption_version": sealed.encryption_version,
+                    "sender_signing_kid": sealed.sender_signing_kid,
+                },
+            )
+        )
+        respx.get(f"https://rine.network/agents/{OTHER_AGENT_ID}/keys").mock(
+            return_value=httpx.Response(200, json=public_keys_body(sender_keys))
+        )
+        # The client last saw this peer under a key it has since rotated away from.
+        async_client._http._keys_cache.set(OTHER_AGENT_ID, public_keys_body(rotated_away))
+
+        msg = await async_client.read(_MESSAGE_PAYLOAD["id"])
+
+        assert msg.decrypt_error is None
+        assert msg.verified is True
+        assert msg.key_changed is not None
+        assert msg.key_changed.agent_id == OTHER_AGENT_ID
+        assert msg.key_changed.previous_fingerprint == signing_fingerprint(rotated_away)
+        assert msg.key_changed.current_fingerprint == signing_fingerprint(sender_keys)
+        await async_client.close()
+
+    @respx.mock
+    async def test_read_when_sender_key_unchanged_leaves_key_changed_unset(
+        self, async_client, tmp_config_dir, saved_agent_keys
+    ):
+        _mock_token()
+        _mock_agents()
+        sender_keys = generate_agent_keys()
+        save_agent_keys(tmp_config_dir, OTHER_AGENT_ID, sender_keys)
+        sealed = encrypt_message(
+            tmp_config_dir, OTHER_AGENT_ID, recipient_view(saved_agent_keys), {"text": "hi"}
+        )
+        respx.get(f"https://rine.network/messages/{_MESSAGE_PAYLOAD['id']}").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    **_MESSAGE_PAYLOAD,
+                    "from_agent_id": OTHER_AGENT_ID,
+                    "to_agent_id": AGENT_ID,
+                    "encrypted_payload": sealed.encrypted_payload,
+                    "encryption_version": sealed.encryption_version,
+                    "sender_signing_kid": sealed.sender_signing_kid,
+                },
+            )
+        )
+        respx.get(f"https://rine.network/agents/{OTHER_AGENT_ID}/keys").mock(
+            return_value=httpx.Response(200, json=public_keys_body(sender_keys))
+        )
+
+        msg = await async_client.read(_MESSAGE_PAYLOAD["id"])
+
+        assert msg.verified is True
+        assert msg.key_changed is None
         await async_client.close()

@@ -1,5 +1,6 @@
 """Crypto layer — re-exports for internal use."""
 
+from rine._crypto._agent_keys import fetch_recipient_keys_async, fetch_recipient_keys_sync
 from rine._crypto.dm_envelope import RecipientKeys
 from rine._crypto.envelope import InnerEnvelope, decode_envelope, encode_envelope
 from rine._crypto.hpke import open as hpke_open
@@ -28,8 +29,6 @@ from rine._crypto.message import (
     decrypt_message_sync,
     encrypt_group_message,
     encrypt_message,
-    fetch_recipient_keys_async,
-    fetch_recipient_keys_sync,
     get_agent_public_keys,
 )
 from rine._crypto.pq_keys import (

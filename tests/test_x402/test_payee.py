@@ -14,7 +14,7 @@ serves the referenced quote by id).
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
@@ -32,6 +32,10 @@ from rine.x402.errors import X402Error, X402ErrorCode
 from rine.x402.facilitator import FacilitatorClient
 from rine.x402.payee_settle import settle, verify
 from rine.x402.types import X402_QUOTE_REF_KEY
+
+if TYPE_CHECKING:
+    from rine._render_recovery import RenderRecovery
+    from rine.sender_key_words import SenderKeyRefusal
 
 FAC_URL = "https://fac.local"
 PAYMENT_ID = "11111111-0000-0000-0000-000000000001"
@@ -141,12 +145,28 @@ class FakeRefClient:
         """Resolve the acting payee agent id (binds the ref check)."""
         return PAYEE_AGENT_ID
 
-    def _agent_header(self, agent: str | None = None) -> dict[str, str]:
+    async def _agent_header(self, agent: str | None = None) -> dict[str, str]:
         """The X-Rine-Agent header the loader forwards on the by-id fetch."""
         return {"X-Rine-Agent": PAYEE_AGENT_ID}
 
-    async def _decrypt_thread_row(self, agent_id: str, msg: DecryptedMessage) -> DecryptedMessage:
-        """Fake the self-seal decrypt: attach the quote plaintext + verification."""
+    async def _decrypt_thread_row(
+        self,
+        agent_id: str,
+        msg: DecryptedMessage,
+        refusal: SenderKeyRefusal,
+        *,
+        recovery: RenderRecovery | None,
+    ) -> DecryptedMessage:
+        """Fake the self-seal decrypt: attach the quote plaintext + verification.
+
+        ``refusal`` and ``recovery`` are unused here and still declared: this
+        double stands in for the real signature, and a double that quietly
+        accepts fewer arguments than the thing it replaces is how a caller
+        drifts unnoticed. ``recovery`` has no default for the same reason it has
+        none on the real method — a settle path must state that it runs no
+        sender-key scan rather than inherit that answer.
+        """
+        assert recovery is None, "the settle path must not spend a distribution scan"
         msg.verification_status = self._verification_status  # type: ignore[assignment]
         if self._verification_status == "invalid":
             msg.decrypt_error = "forged sender signature"

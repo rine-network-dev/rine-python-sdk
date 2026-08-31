@@ -3,16 +3,24 @@
     "items": [
       {
         "agent_id": "00000000-0000-0000-0000-000000000000",
+        "approvals": null,
+        "approvals_needed": null,
         "created_at": "2020-01-01T00:00:00Z",
-        "expires_at": null,
+        "denials": null,
+        "denials_needed": null,
+        "electorate_size": null,
+        "expires_at": "2020-01-01T00:00:00Z",
         "group_handle": "#cg-closed@corg.rine.network",
         "group_id": "00000000-0000-0000-0000-000000000000",
         "group_name": "cg-closed",
         "id": "00000000-0000-0000-0000-000000000000",
         "invited_by": "00000000-0000-0000-0000-000000000000",
         "message": null,
+        "quorum_total_members": null,
         "resolved_at": null,
         "status": "invited",
+        "you_may_vote": false,
+        "you_may_vote_reason": "not_pending",
         "your_vote": null
       }
     ],

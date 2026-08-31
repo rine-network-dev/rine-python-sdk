@@ -11,6 +11,7 @@ import json
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from rine.sender_key_words import SenderKeyRefusal
     from rine.types import DecryptedMessage, ThreadEntry
 
 UNAVAILABLE = "[unavailable]"
@@ -59,12 +60,29 @@ def _render_parsed(value: object, *, fallback: str) -> str:
         return fallback
 
 
-def to_thread_entry(msg: DecryptedMessage) -> ThreadEntry:
-    """Map a decrypted message to a role-tagged :class:`ThreadEntry`."""
+def to_thread_entry(msg: DecryptedMessage, refusal: SenderKeyRefusal) -> ThreadEntry:
+    """Map a decrypted message to a role-tagged :class:`ThreadEntry`.
+
+    ``refusal`` is one render's "explain once, then mark" state and is required
+    rather than defaulted: a transcript is rendered by a loop, and the choice
+    between the full sentence and the bounded marker belongs to the render, not
+    to the row. Defaulting it would let a caller loop over rows and silently get
+    the paragraph on every one of them, which is the behaviour the tier exists
+    to remove. Build one per transcript.
+
+    Args:
+        msg: The decrypted (or refused) row.
+        refusal: This render's sender-key refusal state.
+
+    Returns:
+        The rendered turn.
+    """
     from rine.types import ThreadEntry
 
     if msg.decrypt_error is not None or msg.plaintext is None:
-        text = UNAVAILABLE
+        # A row this reader cannot open says so; the one cause with a move for
+        # the operator to make says which move, on the first row that has it.
+        text = refusal.text_for(msg) or UNAVAILABLE
     else:
         text = render_text(msg.plaintext, msg.content_type)
     return ThreadEntry(

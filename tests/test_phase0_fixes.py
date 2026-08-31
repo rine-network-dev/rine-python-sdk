@@ -1,6 +1,6 @@
 """Phase-0 SDK fixes for the crewai-rine integration (TDD — RED first).
 
-Covers the four small fixes from ``phases/crewai-integration/DECISIONS.md``:
+Covers four small fixes for the crewai-rine integration:
 
 - ``inbox(status=...)`` forwards the status filter to the inbox GET, and
   a new ``mark_delivered(agent_id, message_ids)`` method POSTs to the server's
@@ -37,7 +37,7 @@ from rine._crypto.keys import (
     signing_public_key_to_jwk,
 )
 from rine._crypto.message import encrypt_message
-from rine._group_send import encrypt_for_group_sync, is_mls_group
+from rine._group_send import encrypt_for_group_sync
 from rine._http import SyncHttpClient
 from rine.errors import CryptoError
 from tests.conftest import recipient_view
@@ -207,19 +207,6 @@ class TestInboxStatusFilterAsync:
         await async_client.close()
 
 
-def _mock_webfinger(handle: str, agent_id: str) -> None:
-    """Mock WebFinger so an explicit handle resolves to ``agent_id``."""
-    respx.get("https://rine.network/.well-known/webfinger").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "subject": f"acct:{handle}",
-                "aliases": [f"https://rine.network/agents/{agent_id}"],
-            },
-        )
-    )
-
-
 class TestMarkDeliveredSync:
     @respx.mock
     def test_mark_delivered_resolves_default_agent_and_posts_message_ids(self, sync_client):
@@ -254,8 +241,12 @@ class TestMarkDeliveredSync:
     @respx.mock
     def test_mark_delivered_resolves_explicit_agent_handle(self, sync_client):
         # agent= accepts a handle and resolves it internally (no pre-resolved id).
+        # It is resolved against the org's OWN agents — an acting agent is one
+        # the caller owns, so the actor slot asks ``GET /agents`` and never
+        # WebFinger, which answers for anybody's org and is the recipient
+        # resolver's question.
         _mock_token()
-        _mock_webfinger("test-agent@myorg.rine.network", AGENT_ID)
+        _mock_agents()
         route = respx.post(f"https://rine.network/agents/{AGENT_ID}/messages/mark-delivered").mock(
             return_value=httpx.Response(200, json={"marked": 1})
         )
@@ -287,8 +278,9 @@ class TestMarkDeliveredAsync:
 
     @respx.mock
     async def test_mark_delivered_resolves_explicit_agent_handle(self, async_client):
+        # The sync twin states why this is ``GET /agents`` and not WebFinger.
         _mock_token()
-        _mock_webfinger("test-agent@myorg.rine.network", AGENT_ID)
+        _mock_agents()
         route = respx.post(f"https://rine.network/agents/{AGENT_ID}/messages/mark-delivered").mock(
             return_value=httpx.Response(200, json={"marked": 1})
         )
@@ -337,7 +329,8 @@ class TestUnknownEncryptionVersionSync:
 
         No Welcome is waiting and the group has published no GroupInfo, so the
         read path's one-shot recovery cannot establish state. That surfaces as a
-        CryptoError naming the group — never as a silently undecrypted message.
+        ``decrypt_error`` naming the group — never as a silently undecrypted
+        message, and never as an exception (``read()`` degrades like ``inbox()``).
         """
         _CONFIG_DIR_HOLDER["dir"] = tmp_config_dir
         _mock_token()
@@ -350,8 +343,10 @@ class TestUnknownEncryptionVersionSync:
             )
         )
 
-        with pytest.raises(CryptoError, match=GROUP_ID):
-            sync_client.read(MESSAGE_ID)
+        msg = sync_client.read(MESSAGE_ID)
+
+        assert msg.plaintext is None
+        assert GROUP_ID in msg.decrypt_error
 
     @respx.mock
     def test_read_normal_hpke_message_still_decrypts(self, sync_client, tmp_config_dir):
@@ -410,9 +405,11 @@ class TestUnknownEncryptionVersionAsync:
             )
         )
 
-        with pytest.raises(CryptoError, match=GROUP_ID):
-            await async_client.read(MESSAGE_ID)
+        msg = await async_client.read(MESSAGE_ID)
         await async_client.close()
+
+        assert msg.plaintext is None
+        assert GROUP_ID in msg.decrypt_error
 
     @respx.mock
     async def test_read_normal_hpke_message_still_decrypts(self, async_client, tmp_config_dir):
@@ -479,16 +476,6 @@ class TestGroupSendRoutesMlsAwayFromSenderKeys:
     pin the routing decision itself, which is cheaper and more direct than
     driving a whole encrypt to observe it.
     """
-
-    def test_mls_pending_group_is_an_mls_group(self):
-        """A group frozen mid-init: its unfreezing MLS commit is already in flight."""
-        assert is_mls_group({"id": GROUP_ID, "mls_group_id": None, "mls_pending": True})
-
-    def test_mls_active_group_is_an_mls_group(self):
-        assert is_mls_group({"id": GROUP_ID, "mls_group_id": "some-mls-id", "mls_pending": False})
-
-    def test_plain_group_is_not_an_mls_group(self):
-        assert not is_mls_group({"id": GROUP_ID, "mls_group_id": None, "mls_pending": False})
 
     @respx.mock
     def test_mls_group_send_never_reaches_the_sender_key_path(

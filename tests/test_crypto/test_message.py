@@ -112,6 +112,7 @@ class TestEncryptMessage:
             SENDER_ID,
             result.self_encrypted_payload,
             MockClient(),
+            SENDER_ID,
         )
         assert json.loads(decrypted.plaintext) == payload
         assert decrypted.verified is True
@@ -153,6 +154,7 @@ class TestEncryptMessage:
             RECIPIENT_ID,
             result.encrypted_payload,
             MockClient(),
+            SENDER_ID,
         )
         assert json.loads(decrypted.plaintext) == payload
         assert decrypted.verified is True

@@ -12,31 +12,64 @@ from typing import TYPE_CHECKING, Any, Literal
 import httpx
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Awaitable, Callable
+    from uuid import UUID
 
+    from rine._crypto.message import DecryptResult
     from rine._mls import MlsCutoverResult
 
 
+from rine._actor import AGENT_HEADER, ResolvedActor, normalize_actor, refuse_if_not_addressee
 from rine._base_client import BaseRineClient
 from rine._constants import NOT_GIVEN, EncryptionVersion, MessageType, NotGiven
+from rine._crypto._agent_keys import fetch_recipient_keys_async
+from rine._crypto._sender_verify import refuse_if_sender_differs
 from rine._crypto.message import (
     decrypt_group_message_async,
     decrypt_message_async,
     encrypt_message,
-    fetch_recipient_keys_async,
 )
 from rine._crypto.sender_keys import SenderKeyState
-from rine._crypto.sender_keys_helpers import load_sender_key_states, save_sender_key_state
+from rine._crypto.sender_keys_helpers import (
+    lift_retirement_if_member,
+    load_sender_key_states,
+    save_sender_key_state,
+    sender_keys_retired,
+)
+from rine._group_join import (
+    DirectoryHandleScan,
+    ambiguous_invitation_join_refusal,
+    bare_name_join_refusal,
+    is_exact_group_handle,
+    is_invitation_of_that_name,
+    unresolved_handle_join_refusal,
+)
+from rine._group_recovery import SenderKeyScan, unscanned_beyond_page
+from rine._group_ref import (
+    is_bare_reference,
+    is_sigil_group_reference,
+    sigiled_group_ref,
+)
 from rine._http import AsyncHttpClient
 from rine._logging import logger
 from rine._onboard import create_agent as _create_agent
+from rine._recipient import GroupTarget, RecipientTarget, group_target_by_id
+from rine._recipient_ladder import group_ladder, recipient_ladder
+from rine._recipient_reads import (
+    AsyncReferenceReads,
+    answered_group_id,
+    group_read_refused,
+    refuse_a_substituted_group,
+    walk_async,
+)
+from rine._render_recovery import RenderRecovery
 from rine._resolve import (
     is_uuid,
-    match_group_by_local_name,
     normalize_handle,
     resolve_agent,
     resolve_to_uuid_async,
 )
+from rine._resources.group_ops import unwrap_items
 from rine._resources.groups import AsyncGroups
 from rine._resources.webhooks import AsyncWebhooks
 from rine._thread import to_thread_entry
@@ -45,9 +78,18 @@ from rine._verify import async_verify_identity as _async_verify_identity
 from rine.errors import (
     ConfigError,
     CryptoError,
+    NoSenderKeyStateError,
     NotFoundError,
-    SignatureVerificationError,
+    RineApiError,
     UnsupportedTargetError,
+)
+from rine.sender_key_words import SenderKeyRefusal
+from rine.thread_words import (
+    blank_as_absent,
+    conversation_transcript_path,
+    group_transcript_path,
+    named_conversation_uuid,
+    refuse_if_two_transcript_references,
 )
 from rine.types import (
     AgentCardRead,
@@ -92,7 +134,7 @@ class RineClient(BaseRineClient):
     Example::
 
         async with RineClient() as client:
-            await client.send("agent@org", {"task": "hello"})
+            await client.send("kofi@acme.rine.network", {"task": "hello"})
     """
 
     def __init__(
@@ -161,24 +203,68 @@ class RineClient(BaseRineClient):
 
     # --- Agent resolution helpers ---
 
-    def _agent_header(self, agent: str | None = None) -> dict[str, str] | None:
-        """Build X-Rine-Agent header dict."""
-        aid = agent or self._get_agent_header()
-        return {"X-Rine-Agent": aid} if aid else None
+    async def _agent_header(self, agent: str | None = None) -> dict[str, str] | None:
+        """Build X-Rine-Agent header dict.
+
+        Priority: the per-call ``agent`` override, then the constructor's agent —
+        resolved once via :meth:`_resolve_agent_id` and memoised, so a client built
+        with ``agent=`` names its actor on every request without re-resolving. Stays
+        ``None`` when no agent was configured; the server then auto-selects.
+
+        The header carries what the *wire* accepts, not what the caller typed: a
+        bare name is resolved here too (see :meth:`_needs_actor_resolution`), and
+        through the same :meth:`_resolve_agent_id` this client's other rung uses,
+        so the two cannot disagree about which agent a name meant. Both share one
+        memoised ``GET /agents``, so a call site that asks both spends one lookup.
+        """
+        aid = normalize_actor(agent) or self._get_agent_header()
+        if self._needs_actor_resolution(aid):
+            aid = await self._resolve_agent_id(aid)
+        return self._actor_header_dict(aid)
 
     async def _resolve_agent_id(self, agent: str | None = None) -> str:
-        """Resolve agent ID, fetching agents list if needed."""
+        """The acting agent's UUID — :meth:`resolve_actor` without the warning."""
+        return (await self.resolve_actor(agent)).agent_id
+
+    async def resolve_actor(self, agent: str | None = None) -> ResolvedActor:
+        """Which agent this call acts as, and anything the caller should be told.
+
+        The one **public, per-call** resolve step. A surface that wants to show
+        the caller a one-agent fallback resolves here first and passes the
+        resolved UUID down; every inner path short-circuits a UUID without a
+        lookup, so nothing re-resolves and no second warning is minted.
+
+        **Every spelling of the actor is answered from this org's own agents** —
+        an acting agent must be an agent the caller owns — and never through
+        :func:`rine._resolve.resolve_to_uuid_async`: that function is also the
+        **recipient / invitee / target** resolver, it holds only an API URL and
+        an unauthenticated WebFinger client, and teaching it bare names would
+        make ``invite(invitee="ops")`` silently resolve the *caller's* ``ops``
+        against a peer org's roster.
+
+        🔴 The other direction is the one that shipped. A handle-spelled *actor*
+        sent to that resolver asked WebFinger who owns the handle — a question
+        about somebody else's org — and, finding nobody, handed the handle back
+        as though it were an id. Nothing refused it, so it surfaced two calls
+        later from the key store as ``Invalid agent_id: 'x@org'. Expected a
+        UUID.``: a filesystem path-safety guard, read by a caller who had merely
+        named an agent this org does not have, while the same mistake spelled as
+        a bare name was answered by :func:`rine._actor.unknown_actor_refusal`.
+        There is no foreign-org fallback for this slot.
+        """
+        agent = normalize_actor(agent)
         if agent:
-            return await resolve_to_uuid_async(self._api_url, agent)
-        if self._resolved_agent_id:
-            return self._resolved_agent_id
-        if not isinstance(self._agent, NotGiven):
-            agents = await self._fetch_agents()
-            self._resolved_agent_id = resolve_agent(agents, explicit=self._agent)
-            return self._resolved_agent_id
+            # A UUID is the answer already, and spending a ``GET /agents`` on one
+            # would fetch a list ``resolve_agent`` then never reads.
+            if is_uuid(agent):
+                return ResolvedActor(agent)
+            return resolve_agent(await self._fetch_agents(), explicit=agent)
+        if self._resolved_actor:
+            return self._resolved_actor
         agents = await self._fetch_agents()
-        self._resolved_agent_id = resolve_agent(agents)
-        return self._resolved_agent_id
+        named = None if isinstance(self._agent, NotGiven) else self._agent
+        self._resolved_actor = resolve_agent(agents, explicit=named, origin=self._actor_origin)
+        return self._resolved_actor
 
     async def _fetch_agents(self) -> list[dict[str, Any]]:
         """Fetch org's agents."""
@@ -188,28 +274,321 @@ class RineClient(BaseRineClient):
         self._agents_cache = data.get("items", data) if isinstance(data, dict) else data
         return self._agents_cache
 
+    async def _fetch_own_groups(self, agent: str | None) -> list[dict[str, Any]]:
+        """Every group this org belongs to, unfiltered — the one rung the server cannot take.
+
+        ``GET /groups?handle=`` matches a FULL ``#name@org`` handle only, so both
+        callers that start from a bare name have to list and decide locally. What
+        is done with the list lives in :mod:`rine._group_ref`; this is the fetch
+        and nothing else, which is the same seam ``fetchOwnGroups``
+        (``rine-core/src/resolve-group.ts``) holds on the TypeScript side.
+
+        ``agent`` becomes the ``X-Rine-Agent`` attribution header. It does not
+        select whose list comes back: the route is org-scoped either way.
+        """
+        extra = await self._agent_header(agent)
+        return list(unwrap_items(await self._http.get("/groups", extra_headers=extra)))
+
+    async def _readable_group_by_id(
+        self, group_id: str, agent: str | None
+    ) -> dict[str, Any] | None:
+        """The group one id names, or ``None`` when this caller may not read it.
+
+        One indexed row, where naming a group by UUID used to spend an
+        unpaginated, member-counting ``GET /groups``. It is also what keeps a
+        vacated group reachable — ``has_read_access`` grants on ``group.org_id``
+        before it looks at any seat, so a group this org created and then vacated
+        is readable by id while being invisible to the roster.
+
+        Which statuses mean *"not for you"*, and why they must be
+        indistinguishable, is :func:`rine._recipient_reads.group_read_refused`'s
+        — stated once so the two clients cannot disagree about it. Everything
+        else propagates.
+
+        The caller's own spelling goes on the wire: the route types its path
+        parameter ``group_id: uuid.UUID``, which parses an upper-cased id to the
+        same value, so there is no client-side fold left to get wrong.
+
+        🔴 **What comes back is checked HERE, inside the read.** A rung that
+        could be passed through could not be substituted; a rung that reads a
+        row can be, and every group verb then acts on whatever group that row
+        named. TypeScript puts the same comparison inside ``readableGroupById``,
+        where no caller of the id route can skip it — so it sits inside this
+        method rather than in the ladder that calls it, and the two stacks are
+        structurally the same. Five more surfaces route through the ladder; a
+        future rung that yields
+        :class:`~rine._recipient_reads.GroupById` cannot forget a line it never
+        has to write.
+
+        Raises:
+            GroupIdentityMismatchError: The body named a different group.
+        """
+        extra = await self._agent_header(agent)
+        try:
+            found = await self._http.get(f"/groups/{group_id}", extra_headers=extra)
+        except RineApiError as error:
+            if group_read_refused(error):
+                return None
+            raise
+        row = dict(found)
+        refuse_a_substituted_group(group_id, answered_group_id(row))
+        return row
+
+    def _reference_reads(self, agent: str | None) -> AsyncReferenceReads:
+        """The five reads a ladder may ask for, bound to this client and actor.
+
+        The whole of what :mod:`rine._recipient_ladder` is allowed to do to the
+        wire. ``agent`` is captured here rather than threaded through the rungs,
+        because it is an attribution header and never changes what a rung means.
+        """
+        return AsyncReferenceReads(
+            own_groups=lambda: self._fetch_own_groups(agent),
+            group_by_id=lambda group_id: self._readable_group_by_id(group_id, agent),
+            seated_by_handle=self._seated_group_row_by_handle,
+            own_agents=self._fetch_agents,
+            agent_id_for=lambda reference: resolve_to_uuid_async(self._api_url, reference),
+        )
+
+    async def resolve_group(self, reference: str, agent: str | None = None) -> GroupTarget:
+        """The group a reference names, with everything the resolve already knows.
+
+        The entry point every group verb resolves through, and the one to call
+        when a caller needs more than the id — the row, or the handle the send
+        path addresses. Resolving twice to get two columns is the shape this
+        record exists to remove.
+
+        The rungs, their order and their refusals are
+        :func:`rine._recipient_ladder.group_ladder`'s, so this client and the
+        synchronous one cannot answer the same reference differently.
+
+        ``agent`` is sent as the ``X-Rine-Agent`` attribution header. It does not
+        select whose list is searched: ``GET /groups`` is org-scoped, so a bare
+        name resolves against every group an agent of the org belongs to.
+
+        Raises:
+            NotFoundError: No group of this org answers to the reference.
+            ConfigError: More than one does.
+        """
+        return await walk_async(group_ladder(reference), self._reference_reads(agent))
+
+    async def resolve_group_for_join(
+        self, reference: str, agent: str | None = None
+    ) -> GroupTarget:
+        """The group a JOIN reference names — the one ladder aimed outside the org.
+
+        🔴 Answers with the id and nothing else, on every rung. That is not this
+        method being lazy: a join's target is by definition a group this org
+        holds no seat in, so ``GET /groups`` cannot describe it, and the two
+        rungs that CAN see it — a pending invitation and the public directory —
+        are read for an id. See :meth:`_resolve_group_for_join_async`.
+        """
+        return group_target_by_id(
+            await self._resolve_group_for_join_async(reference, agent), reference
+        )
+
+    async def resolve_recipient(self, to: str, agent: str | None = None) -> RecipientTarget:
+        """What a ``send()`` recipient names, and which namespace answered it.
+
+        The reference is normalised the way :meth:`send` normalises it, and the
+        record still carries the caller's own spelling — a refusal quotes what
+        was written, never what normalisation made of it.
+
+        Raises:
+            NotFoundError: Nothing in the named namespace answers to it.
+            ConfigError: More than one group does, or the bare name is an
+                agent's.
+        """
+        return await walk_async(
+            recipient_ladder(normalize_handle(to), to), self._reference_reads(agent)
+        )
+
     async def _resolve_group_async(self, handle_or_id: str, agent: str | None = None) -> str:
         """Resolve a group UUID, full handle, or bare name to a group ID.
 
-        ``agent`` selects which agent's group list is searched when ``handle_or_id``
-        is a bare name (multi-agent orgs).
+        :meth:`resolve_group`'s id. Kept because thirteen call sites want an id
+        and should not have to know which column holds it.
+
+        The rungs are :func:`rine._recipient_ladder.group_ladder`'s — a UUID,
+        the server's exact ``?handle=`` lookup, and then the local-part fallback
+        — and that is where they are gated (``GROUP_HANDLE_FALLBACK_SITES`` in
+        ``tests/test_client-server-contract_group0.py``) and described. The twin
+        is ``resolveGroupByHandle`` (``rine-core/src/resolve-group.ts``).
+        """
+        return (await self.resolve_group(handle_or_id, agent)).id
+
+    async def _seated_group_row_by_handle(self, handle_or_id: str) -> dict[str, Any] | None:
+        """The group ``GET /groups?handle=`` answers with, or ``None``.
+
+        🔴 **Org-scoped, and that is the whole point of naming it so.** The route
+        joins ``GroupMember`` to this org's agents, so it answers for a group
+        this org already holds a seat in and for no other. Every group verb but
+        one wants exactly that. :meth:`_resolve_group_for_join_async` is the one
+        that does not, which is why it takes this as a rung rather than as the
+        answer.
+
+        The ROW rather than the id, because the filter already returned one: the
+        member ladder needs the group's own handle to address a send, and a rung
+        that answered with an id alone made
+        :meth:`resolve_group` come back with ``handle=None`` from a read that
+        had the handle in hand. :meth:`_seated_group_id_by_handle` is the
+        projection for the callers that only ever wanted the id.
+
+        The handle is sigiled but not otherwise normalised: the server
+        normalises ``?handle=`` its own way, and doing it twice here would only
+        add a second opinion.
+        """
+        data = await self._http.get("/groups", params={"handle": sigiled_group_ref(handle_or_id)})
+        items = data.get("items", []) if isinstance(data, dict) else data
+        return dict(items[0]) if items else None
+
+    async def _seated_group_id_by_handle(self, handle_or_id: str) -> str | None:
+        """The id that filter answered with — :meth:`_seated_group_row_by_handle`'s.
+
+        The join ladder's first rung, which wants to know only WHETHER this org
+        is already seated. Kept as its own name because that is the question it
+        asks; it is one line and holds no lookup of its own.
+        """
+        row = await self._seated_group_row_by_handle(handle_or_id)
+        return str(row["id"]) if row is not None else None
+
+    async def _scan_public_directory(self, handle: str) -> DirectoryHandleScan:
+        """Walk the public directory for that handle, within one join's budget.
+
+        The one rung that can see a group this caller has no relationship with.
+        ``GET /directory/groups`` searches ``name`` and ``description`` and never
+        ``handle``, so the query is the handle's local part — the same string as
+        ``Group.name`` — and the ILIKE it runs is a candidate generator whose
+        rows are then filtered to an exact handle.
+
+        Everything that decides — the query, the exactness test, the page budget
+        and the shortfall — is :class:`~rine._group_join.DirectoryHandleScan`'s,
+        so the sync and async clients cannot drift on any of it. This is the
+        fetch, and nothing else.
+
+        🔴 **Authenticated on the wire, and deliberately not through**
+        :meth:`discover_groups`. Both stacks now send the org's bearer token on
+        this read; the TypeScript ladder always did, and a join that disclosed
+        the caller on eve and mastra while disclosing nothing on the three Python
+        connectors made any single statement about the rung false of one of them.
+        The route takes no identity (``src/rine/api/directory_groups.py`` declares
+        no auth dependency and rate-limits on the client IP), so the rows, the
+        ``total_estimate`` and the budget are unchanged by the header — what
+        changes is only that the two stacks now disclose the same thing.
+
+        :meth:`discover_groups` stays anonymous: it is the public discovery verb,
+        usable before an org has credentials, and narrowing it is not this rung's
+        call to make.
+        """
+        scan = DirectoryHandleScan(handle)
+        while (query := scan.next_query()) is not None:
+            if scan.offer(await self._directory_groups_page(**query, authenticated=True)):
+                break
+        return scan
+
+    async def _invited_group_id_by_bare_name(self, name: str, agent: str | None) -> str:
+        """The group one of this agent's pending invitations calls ``name``.
+
+        🔴 **The only rung a bare name gets, and two matches is a refusal.** A
+        bare name carries no org, so two orgs inviting this agent to a group
+        called ``ops`` are indistinguishable in the reference — and seating an
+        agent in the wrong one cannot be undone. The candidates are printed
+        instead. Nothing wider is searched; see
+        :data:`~rine._group_join.BARE_NAME_IS_ONLY_AN_INVITATION`.
+
+        Raises:
+            NotFoundError: No invitation answers to the name, or more than one
+                does.
+        """
+        matched = [
+            invite
+            for invite in await self.groups.list_invites(agent=agent)
+            if is_invitation_of_that_name(invite.group_handle, invite.group_name, name)
+        ]
+        if len(matched) == 1:
+            return str(matched[0].group_id)
+        if matched:
+            raise NotFoundError(
+                ambiguous_invitation_join_refusal(
+                    name,
+                    [
+                        str(invite.group_handle or invite.group_name or invite.group_id)
+                        for invite in matched
+                    ],
+                )
+            )
+        raise NotFoundError(bare_name_join_refusal(name))
+
+    async def _resolve_group_for_join_async(
+        self, handle_or_id: str, agent: str | None = None
+    ) -> str:
+        """Resolve a group reference for JOIN — the one verb aimed outside the org.
+
+        🔴 Deliberately **not** :meth:`_resolve_group_async`. That ladder searches
+        the groups this org is already in, which for a join is the one set the
+        target cannot be in; a handle read straight off ``discover_groups()``
+        came back ``Group not found`` there with the server never refusing
+        anything. The rungs, the bounds and every refusal are
+        :mod:`rine._group_join`'s, and its module docstring is where the reasons
+        live.
+
+        Raises:
+            NotFoundError: No rung resolved the reference.
         """
         if is_uuid(handle_or_id):
             return handle_or_id
-        # Bare name (no ``@``): the server's ?handle= filter only matches a full
-        # ``#name@org`` handle, so list the acting agent's groups and match on the
-        # handle's local part (parity with ``groups.list()`` / crewai inspect).
         if "@" not in handle_or_id:
-            extra = self._agent_header(agent)
-            data = await self._http.get("/groups", extra_headers=extra)
-            groups = data.get("items", data) if isinstance(data, dict) else data
-            return match_group_by_local_name(groups, handle_or_id)
-        handle = handle_or_id if handle_or_id.startswith("#") else f"#{handle_or_id}"
-        data = await self._http.get("/groups", params={"handle": handle})
-        items = data.get("items", []) if isinstance(data, dict) else data
-        if items:
-            return str(items[0]["id"])
-        raise NotFoundError(f"Group not found: {handle_or_id}")
+            return await self._invited_group_id_by_bare_name(handle_or_id, agent)
+        seated = await self._seated_group_id_by_handle(handle_or_id)
+        if seated is not None:
+            return seated
+        for invite in await self.groups.list_invites(agent=agent):
+            if is_exact_group_handle(invite.group_handle, handle_or_id):
+                return str(invite.group_id)
+        scan = await self._scan_public_directory(handle_or_id)
+        if scan.found is not None:
+            return scan.found
+        raise NotFoundError(unresolved_handle_join_refusal(handle_or_id, scan.unread))
+
+    async def _group_handle_for_bare_recipient(self, name: str, agent: str | None) -> str:
+        """The group handle a bare ``send()`` recipient names, or a refusal.
+
+        The agent list is asked FIRST, and it is the memoised one ``send()`` has
+        already fetched to resolve the acting agent, so the guard normally costs
+        no request: a bare name that is also an agent's name refuses here rather
+        than reaching the group tier. Only a name no agent of this org answers to
+        is looked for among the groups.
+
+        The **handle** comes back rather than the id because the group send path
+        addresses ``to_handle`` — returning it lets the bare spelling rejoin the
+        ``#handle`` path at the point it diverged, instead of growing a second
+        send with its own encryption branch to keep in step.
+
+        The reading, the guard and their order are the bare arm of
+        :func:`rine._recipient_ladder.recipient_ladder`; this is that answer's
+        handle.
+        """
+        return str((await self.resolve_recipient(name, agent)).handle)
+
+    async def _group_handle_for_sigil_recipient(self, name: str, agent: str | None) -> str:
+        """The full group handle a ``#name`` (org-less) ``send()`` recipient names.
+
+        The same ladder :meth:`_resolve_group_async` already runs for every other
+        group verb — ``groups.update``, the member and invite verbs, the vote,
+        :meth:`thread` — reached through the one entry point that answers with
+        the row, because the send path addresses ``to_handle``. ``send()`` was
+        the single verb in the family that refused the spelling its siblings
+        accept: it read the leading ``#`` as "this is already a full handle" and
+        asked ``GET /groups?handle=#ops``, a filter that matches ``#name@org``
+        only, so an org-less sigil was a guaranteed refusal with no roster and no
+        candidates behind it.
+
+        🔴 :func:`~rine._group_ref.refuse_if_a_bare_agent_name` deliberately does
+        NOT run here, unlike on the bare path: that guard is for the ambiguity of
+        an *unsigiled* word between two namespaces, and a caller who typed ``#``
+        has already said which one they mean. The argument has one owner and is
+        not restated here — :func:`~rine._group_ref.is_sigil_group_reference`.
+        """
+        return str((await self.resolve_recipient(name, agent)).handle)
 
     # --- Messaging ---
 
@@ -229,8 +608,19 @@ class RineClient(BaseRineClient):
         Auto-detects encryption: recipients starting with ``#`` use Sender Keys
         (group encryption); all others use HPKE (1:1 encryption).
 
+        A recipient that is neither a UUID nor a handle is a **group name**:
+        the agent namespace refuses a bare word before any request
+        (:func:`rine._resolve.resolve_to_uuid_async`), so it is resolved through
+        :meth:`_group_handle_for_bare_recipient` and sent exactly as a
+        ``#handle`` send is — one send path, one encryption branch. A ``#name``
+        with no org takes the same ladder through
+        :meth:`_group_handle_for_sigil_recipient`, so the spelling every other
+        group verb accepts is accepted here too.
+
         Args:
-            to: Recipient handle, UUID, or group handle (``#group@org``).
+            to: Recipient handle, UUID, group handle (``#logistics@acme.rine.network``),
+                ``#name`` without the org, or the bare name of a group this org
+                is in.
             payload: JSON-serializable message payload.
             message_type: Message type (default: ``rine.v1.task_request``).
             agent: Agent to send as (for multi-agent orgs).
@@ -244,14 +634,19 @@ class RineClient(BaseRineClient):
 
         Example::
 
-            msg = await client.send("agent@org", {"task": "summarize"})
+            msg = await client.send("kofi@acme.rine.network", {"task": "summarize"})
         """
         to = normalize_handle(to)
         agent_id = await self._resolve_agent_id(agent)
-        extra = self._agent_header(agent)
+        extra = await self._agent_header(agent)
         headers = dict(extra) if extra else {}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
+
+        if is_bare_reference(to):
+            to = await self._group_handle_for_bare_recipient(to, agent)
+        elif is_sigil_group_reference(to):
+            to = await self._group_handle_for_sigil_recipient(to, agent)
 
         is_group = to.startswith("#")
 
@@ -297,16 +692,19 @@ class RineClient(BaseRineClient):
 
         The encryption itself is the sync client's, run on a worker thread: one
         implementation of the group protocol, not two that can drift.
+
+        🔴 ``to_handle`` is the RESOLVED group's handle, never ``to``. See
+        :meth:`rine.SyncRineClient._encrypt_group`, which carries the reason.
         """
         from rine._group_send import encrypt_for_group_sync
         from rine._mls.bridge import with_sync_http
 
-        result, _ = await with_sync_http(
+        result, group = await with_sync_http(
             self,
             lambda http: encrypt_for_group_sync(http, self._config_dir, agent_id, to, payload),
         )
         return result, {
-            "to_handle": to,
+            "to_handle": group.handle,
             "type": msg_type,
             "encrypted_payload": result.encrypted_payload,
             "encryption_version": result.encryption_version,
@@ -345,7 +743,7 @@ class RineClient(BaseRineClient):
                 print(msg.plaintext)
         """
         agent_id = await self._resolve_agent_id(agent)
-        extra = self._agent_header(agent)
+        extra = await self._agent_header(agent)
         params: dict[str, Any] = {}
         if limit:
             params["limit"] = limit
@@ -366,14 +764,17 @@ class RineClient(BaseRineClient):
                 msg = await self._decrypt_message(agent_id, msg)
             except CryptoError as e:
                 msg = await self._self_heal_group_decrypt(agent_id, msg, e)
-            except Exception as e:
-                msg.decrypt_error = str(e)
-                logger.debug("Inbox decrypt failed for %s", msg.id, exc_info=True)
+            except Exception as e:  # noqa: BLE001 — degrade, never raise (inbox's contract)
+                # The shared degrade, not a second copy of it: this arm once set
+                # ``decrypt_error`` by hand, which meant every field the degrade
+                # learns to carry — the cause code among them — was carried on
+                # three paths out of four.
+                msg = self._apply_decrypt_failure(msg, e)
             messages.append(msg)
 
         return CursorPage[DecryptedMessage](
             items=messages,
-            total=data.get("total", len(messages)) if isinstance(data, dict) else len(messages),
+            total=self._page_total(data, messages),
             next_cursor=data.get("next_cursor") if isinstance(data, dict) else None,
             prev_cursor=data.get("prev_cursor") if isinstance(data, dict) else None,
         )
@@ -411,66 +812,92 @@ class RineClient(BaseRineClient):
         """Fetch and decrypt a single message.
 
         Retries group decryption on missing sender key (fetches pending
-        SK distributions first).
+        SK distributions first). Never raises on an unreadable row: a message
+        this agent cannot open or verify comes back with ``decrypt_error`` set
+        and ``plaintext = None``, exactly as it would from :meth:`inbox`. Check
+        ``decrypt_error`` before touching ``plaintext``.
+
+        Reading a **group** message a second time is answered from a local copy,
+        not from the group's cryptography, which spends a message's key on first
+        use. This client keeps the newest 256 received messages per group — and
+        at most 1 MiB of them, oldest dropped first — in its config directory, as
+        plaintext under owner-only permissions and not encrypted at rest.
+        Leaving a group from this client deletes that group's copy; being
+        removed by somebody else does not, and the copy stays readable on this
+        machine until the config directory is destroyed.
 
         Args:
             message_id: Message UUID.
             agent: Agent to read as.
 
         Returns:
-            Decrypted message.
+            Decrypted message, or the message carrying ``decrypt_error``.
         """
         agent_id = await self._resolve_agent_id(agent)
-        extra = self._agent_header(agent)
+        extra = await self._agent_header(agent)
         data = await self._http.get(f"/messages/{message_id}", extra_headers=extra)
         msg = DecryptedMessage.model_validate(data)
         try:
             return await self._decrypt_message(agent_id, msg)
-        except CryptoError:
-            # Retry: fetch pending sender key distributions
-            if msg.encryption_version == EncryptionVersion.SENDER_KEY_V1:
-                await self._fetch_pending_sk_distributions(agent_id)
-                return await self._decrypt_message(agent_id, msg)
-            raise
+        except CryptoError as e:
+            return await self._self_heal_group_decrypt(agent_id, msg, e)
+        except Exception as e:  # noqa: BLE001 — degrade, never raise (inbox's contract)
+            return self._apply_decrypt_failure(msg, e)
 
     async def _decrypt_message(self, agent_id: str, msg: DecryptedMessage) -> DecryptedMessage:
-        """Decrypt a message in-place."""
+        """Decrypt a message in-place.
+
+        Every branch is told which sender the server authenticated for the row, so
+        an envelope signed by anyone else is refused rather than rendered as
+        verified content from an agent that did not write it.
+        """
+        sender = self._expected_sender(agent_id, msg)
         if msg.encryption_version in (
             EncryptionVersion.HPKE_V1,
             EncryptionVersion.HPKE_HYBRID_V1,
         ):
             result = await decrypt_message_async(
-                self._config_dir, agent_id, msg.encrypted_payload, self._http
+                self._config_dir, agent_id, msg.encrypted_payload, self._http, sender
             )
         elif msg.encryption_version == EncryptionVersion.SENDER_KEY_V1 and msg.group_id:
-            # The sender-key ratchet consumes its message key, so a second
-            # decrypt of the same row would fail; serve it from the memo.
-            memoized = self._decrypt_memo.get(agent_id, str(msg.id))
-            if memoized is not None:
-                result = memoized
-            else:
-                result = await decrypt_group_message_async(
+            result = await self._memoized_group_decrypt(
+                agent_id,
+                msg,
+                sender,
+                lambda: decrypt_group_message_async(
                     self._config_dir,
                     agent_id,
                     str(msg.group_id),
                     msg.encrypted_payload,
                     self._http,
-                )
-                self._decrypt_memo.set(agent_id, str(msg.id), result)
+                    sender,
+                ),
+            )
         elif msg.encryption_version == EncryptionVersion.MLS_V1:
             from rine._mls.bridge import with_sync_http
             from rine._mls.messages import decrypt_mls_group_message
 
             # MLS recovers inside the decrypt (install pending Welcomes, sync
             # commits, retry once), so there is nothing for the sender-key
-            # self-heal to add. A sender reading its own message back is served
-            # by the MLS core's self-read cache, not by the memo. The decrypt is
-            # the sync client's, run on a worker thread.
+            # self-heal to add — but the memo it shares with the sender-key path
+            # still is: the core's self-read cache answers only for a message
+            # THIS agent sent, never for a peer's. The decrypt is the sync
+            # client's, run on a worker thread.
             group_id = None if msg.group_id is None else str(msg.group_id)
-            result = await with_sync_http(
-                self,
-                lambda http: decrypt_mls_group_message(
-                    http, self._config_dir, agent_id, group_id, msg.encrypted_payload
+            result = await self._memoized_group_decrypt(
+                agent_id,
+                msg,
+                sender,
+                lambda: with_sync_http(
+                    self,
+                    lambda http: decrypt_mls_group_message(
+                        http,
+                        self._config_dir,
+                        agent_id,
+                        group_id,
+                        msg.encrypted_payload,
+                        sender,
+                    ),
                 ),
             )
         else:
@@ -486,32 +913,108 @@ class RineClient(BaseRineClient):
         msg.plaintext = result.plaintext
         msg.verified = result.verified
         msg.verification_status = result.verification_status
+        # A sender that rotated past this client's cached key is reported, not
+        # quietly absorbed — the caller decides what a rotation means to it.
+        msg.key_changed = result.key_changed
+        msg.catch_up = self._reported_catch_up(result)
         return msg
+
+    async def _memoized_group_decrypt(
+        self,
+        agent_id: str,
+        msg: DecryptedMessage,
+        sender: str,
+        decrypt: Callable[[], Awaitable[DecryptResult]],
+    ) -> DecryptResult:
+        """Decrypt a group row once per client, replaying repeats from the memo.
+
+        Both group schemes step a single-use ratchet, so a row this client has
+        already opened cannot be re-derived — and every receive surface sees rows
+        more than once (``inbox()`` re-polls, ``read()`` after ``inbox()``,
+        ``thread()`` over a group conversation). See :mod:`rine._crypto._decrypt_memo`.
+
+        The memo answers what a row's bytes said, never who sent them, so a
+        replay is held against the sender the server names on the row being read
+        now. Without that, a row served again under a different sender would come
+        back carrying the first read's ``verified``.
+        """
+        memoized = self._decrypt_memo.get(agent_id, str(msg.id))
+        if memoized is not None:
+            refuse_if_sender_differs(memoized.sender_kid, sender)
+            return memoized
+        result = await decrypt()
+        # Stored without the catch-up: this read applied those commits, and a
+        # later read served from the memo applies nothing. Reporting the same
+        # work twice would make the field mean "some read once did this".
+        self._decrypt_memo.set(agent_id, str(msg.id), result.as_replay())
+        return result
 
     async def _self_heal_group_decrypt(
         self, agent_id: str, msg: DecryptedMessage, error: CryptoError
     ) -> DecryptedMessage:
         """Retry one failed group decrypt after ingesting pending sender keys.
 
-        Mirrors ``read()``'s self-heal for the best-effort receive path: a group
-        message whose sender key has not been ingested yet arrives before its
-        distribution DM is opened, and would otherwise stay undecryptable
-        forever. Never raises — the failure is reported as ``decrypt_error``.
+        A group message whose sender key has not been ingested yet arrives before
+        its distribution DM is opened, and would otherwise stay undecryptable
+        forever. Shared by ``inbox()`` and ``read()``. Never raises — the failure
+        is reported as ``decrypt_error``.
         """
         if msg.encryption_version != EncryptionVersion.SENDER_KEY_V1:
-            msg.decrypt_error = str(error)
-            logger.debug("Inbox decrypt failed for %s", msg.id, exc_info=error)
-            return msg
+            return self._apply_decrypt_failure(msg, error)
         try:
+            if await self._retirement_blocks_read(agent_id, msg.group_id):
+                return self._apply_decrypt_failure(msg, error)
             await self._fetch_pending_sk_distributions(agent_id)
             return await self._decrypt_message(agent_id, msg)
         except Exception as e:  # noqa: BLE001 — degrade, never raise (inbox is best-effort)
-            msg.decrypt_error = str(e)
-            logger.debug("Inbox self-heal failed for %s", msg.id, exc_info=True)
-            return msg
+            return self._apply_decrypt_failure(msg, e)
+
+    async def _retirement_blocks_read(self, agent_id: str, group_id: UUID | None) -> bool:
+        """Whether a retired group's keys stay refused, lifting the marker if not.
+
+        🔴 The READ path's half of the retirement-marker lift. Without it the
+        marker is spent only by SENDING —
+        :func:`rine._sender_key_ops.get_or_create_sender_key_sync`
+        is reachable from a group send and from nothing else — so a re-admitted
+        agent that reads before it sends, and a read-only member that never sends
+        at all, refused every distribution its new peers made it, permanently.
+
+        A membership read that fails is not a lift: a departed agent is refused
+        ``GET /groups/{id}/members`` outright and a transport failure proves
+        nothing, so both keep the refusal.
+        """
+        if group_id is None:
+            return False
+        gid = str(group_id)
+        if not sender_keys_retired(self._config_dir, agent_id, gid):
+            return False
+        try:
+            data = await self._http.get(f"/groups/{gid}/members")
+        except Exception:
+            logger.debug("group member read failed for group %s", gid, exc_info=True)
+            return True
+        items = data.get("items", data) if isinstance(data, dict) else data
+        members = (str(m["agent_id"]) for m in items)
+        return not lift_retirement_if_member(self._config_dir, agent_id, gid, members)
 
     async def _fetch_pending_sk_distributions(self, agent_id: str) -> int:
-        """Fetch and ingest pending sender key distributions."""
+        """Ingest what one page of the distribution inbox holds, and count it.
+
+        🔴 Returns an ``int`` and stays an ``int``. Every read path in this SDK
+        calls it, so widening it is a breaking change on the hottest path there
+        is. The one caller that needs more than the count, the sync verb, calls
+        :meth:`_scan_pending_sk_distributions` instead; this is that method with
+        the second number dropped, never a second implementation of it.
+        """
+        return (await self._scan_pending_sk_distributions(agent_id)).ingested
+
+    async def _scan_pending_sk_distributions(self, agent_id: str) -> SenderKeyScan:
+        """The same pass, reporting what it did not reach as well as what it installed.
+
+        The whole of the scan lives here and
+        :meth:`_fetch_pending_sk_distributions` is one line over it, so the two
+        cannot come to disagree about what a pass does.
+        """
         from rine._crypto.message import decrypt_message_async
         from rine._utils import from_base64url
 
@@ -520,18 +1023,41 @@ class RineClient(BaseRineClient):
             params={"type": MessageType.SENDER_KEY_DISTRIBUTION, "limit": 100},
         )
         items = data.get("items", []) if isinstance(data, dict) else data
+        # The page is always read to the end here, so what the pass did not open
+        # is exactly what the listing holds beyond it.
+        unscanned = unscanned_beyond_page(data, len(items))
         ingested = 0
 
         for raw in items:
             try:
-                full = await self._http.get(f"/messages/{raw['id']}")
+                full = await self._http.get(
+                    f"/messages/{raw['id']}",
+                    extra_headers=self._actor_header_dict(agent_id),
+                )
+                # The distribution DM is verified against the sender the server
+                # stamped on the row it was listed as, never against the agent id
+                # inside its own payload.
                 result = await decrypt_message_async(
-                    self._config_dir, agent_id, full["encrypted_payload"], self._http
+                    self._config_dir,
+                    agent_id,
+                    full["encrypted_payload"],
+                    self._http,
+                    str(full["from_agent_id"]),
                 )
                 if not result.verified:
                     continue
                 payload = json.loads(result.plaintext)
                 group_id = payload["group_id"]
+                # A group this agent retired never takes key material again.
+                # The DMs that carried these keys are still in the inbox after a
+                # leave, so without this the wipe would hold only until the next
+                # group read that misses. The TypeScript twin refuses in
+                # ``ingestSenderKeyDistribution``. The marker is spent by
+                # MEMBERSHIP, and ``_self_heal_group_decrypt`` lifts it before
+                # this scan runs — a re-admitted agent that only reads would
+                # otherwise refuse every distribution forever.
+                if sender_keys_retired(self._config_dir, agent_id, group_id):
+                    continue
                 states = load_sender_key_states(self._config_dir, agent_id, group_id)
                 if any(s.sender_key_id == payload["sender_key_id"] for s in states):
                     continue
@@ -547,7 +1073,7 @@ class RineClient(BaseRineClient):
                 ingested += 1
             except Exception:
                 logger.debug("SK ingestion failed", exc_info=True)
-        return ingested
+        return SenderKeyScan(ingested=ingested, unscanned=unscanned)
 
     async def reply(
         self,
@@ -565,22 +1091,43 @@ class RineClient(BaseRineClient):
             message_id: Message UUID to reply to.
             payload: JSON-serializable reply payload.
             message_type: Message type.
-            agent: Agent to reply as.
+            agent: Agent to reply as — the agent the original was addressed to.
+                Any other agent of the org is refused, because the reply is filed
+                from the agent that acts.
             metadata: Optional cleartext (server-visible) message metadata, e.g.
                 the x402 payment-status marker.
             content_type: Optional payload content type (e.g. ``application/json``).
 
         Returns:
             MessageRead of the reply.
+
+        Raises:
+            ReplyAttributionError: The acting agent is not the original's addressee.
         """
         agent_id = await self._resolve_agent_id(agent)
-        # Fetch original to get sender info
-        original = await self._http.get(f"/messages/{message_id}")
+        # Fetch the original to recover the peer. The read is NAMED: the row is
+        # authorised for the org, so the header is what decides whose delivery
+        # mark it moves — and it is the same agent the reply is signed as.
+        original = await self._http.get(
+            f"/messages/{message_id}",
+            extra_headers=self._actor_header_dict(agent_id),
+        )
+        refuse_if_not_addressee(
+            agent_id,
+            str(message_id),
+            original.get("to_agent_id"),
+            original.get("from_agent_id"),
+        )
         recipient_id = str(original.get("from_agent_id", ""))
         recipient = await fetch_recipient_keys_async(self._http, recipient_id)
         result = encrypt_message(self._config_dir, agent_id, recipient, payload)
 
-        extra = self._agent_header(agent)
+        # The RESOLVED id, not the caller's spelling. ``/messages/{id}/reply``
+        # files the reply from the agent this header names, and the header takes
+        # a UUID or a handle — a bare agent NAME, which ``agent=`` accepts and
+        # ``_resolve_agent_id`` resolves, is refused on the wire. This is also the
+        # id the payload was just sealed under.
+        extra = self._actor_header_dict(agent_id)
         reply_body: dict[str, Any] = {
             "type": message_type,
             "encrypted_payload": result.encrypted_payload,
@@ -632,7 +1179,7 @@ class RineClient(BaseRineClient):
             )
 
         agent_id = await self._resolve_agent_id(agent)
-        extra = self._agent_header(agent)
+        extra = await self._agent_header(agent)
 
         # Build the full encrypted body (same as send() does).
         _, body = await self._encrypt_dm(agent_id, to, payload, message_type)
@@ -704,7 +1251,7 @@ class RineClient(BaseRineClient):
         items = data.get("items", []) if isinstance(data, dict) else data
         return CursorPage[AgentSummary](
             items=[AgentSummary.model_validate(a) for a in items],
-            total=data.get("total", len(items)) if isinstance(data, dict) else len(items),
+            total=self._page_total(data, items),
             next_cursor=data.get("next_cursor") if isinstance(data, dict) else None,
         )
 
@@ -753,23 +1300,38 @@ class RineClient(BaseRineClient):
         Returns:
             CursorPage of GroupSummary.
         """
-        params: dict[str, Any] = {}
-        if q:
-            params["q"] = q
-        if limit:
-            params["limit"] = limit
-        if cursor:
-            params["cursor"] = cursor
+        return await self._directory_groups_page(
+            q=q, limit=limit, cursor=cursor, authenticated=False
+        )
 
+    async def _directory_groups_page(
+        self,
+        *,
+        q: str | None,
+        limit: int | None,
+        cursor: str | None,
+        authenticated: bool,
+    ) -> CursorPage[GroupSummary]:
+        """One ``GET /directory/groups`` page, asked with or without identity.
+
+        🔴 ``authenticated`` is the ONLY thing the two callers differ in, and it
+        is a wire-disclosure choice rather than a behaviour one: the route
+        (``src/rine/api/directory_groups.py``) declares no auth dependency, so an
+        ``Authorization`` header changes neither the rows nor ``total_estimate``
+        nor the rate-limit bucket, which is keyed on the client IP either way.
+
+        :meth:`discover_groups` is the PUBLIC discovery verb and stays anonymous,
+        because it is documented as usable before an org has credentials at all.
+        The join ladder's directory rung sends the token, matching what the
+        TypeScript ladder has always sent, so one verb does not disclose two
+        different things depending on which SDK the caller is running.
+        """
         data = await self._http.get(
-            "/directory/groups", params=params or None, authenticated=False
+            "/directory/groups",
+            params=self._directory_group_params(q, limit, cursor),
+            authenticated=authenticated,
         )
-        items = data.get("items", []) if isinstance(data, dict) else data
-        return CursorPage[GroupSummary](
-            items=[GroupSummary.model_validate(g) for g in items],
-            total=data.get("total", len(items)) if isinstance(data, dict) else len(items),
-            next_cursor=data.get("next_cursor") if isinstance(data, dict) else None,
-        )
+        return self._directory_group_page(data)
 
     # --- Identity ---
 
@@ -800,8 +1362,8 @@ class RineClient(BaseRineClient):
         from rine._config import load_credentials
 
         creds = load_credentials(self._config_dir)
-        entry = creds.get("default", {})
-        poll_url = entry.get("poll_url")
+        entry = creds.get("default")
+        poll_url = entry.get("poll_url") if entry else None
         if not poll_url:
             raise ConfigError("No poll URL. Create an agent first.")
         data = await self._http.get(poll_url, authenticated=False)
@@ -1077,6 +1639,19 @@ class RineClient(BaseRineClient):
         self-blob is sealed to the sender's own keys, hybrid when it has an
         ML-KEM key, and the reader dispatches on the blob's own version byte.
 
+        A conversation is fetched, never recovered: unlike :meth:`inbox`,
+        :meth:`read` and :meth:`thread`, no row here triggers a distribution
+        fetch. So a group row sealed under an absent sender key comes back
+        saying that this read did not go looking, pointing at :meth:`read`, and
+        carrying **no** ``decrypt_error_code`` — a row refused here is often
+        opened by the very next :meth:`read`. Every such row carries that whole
+        sentence in ``decrypt_error``.
+
+        This method hands back rows for a caller's own renderer, and a caller
+        cannot be charged for a fetch it did not ask for — :meth:`thread`, which
+        renders the same rows itself, spends one scan for the whole transcript
+        and states the verdict it thereby earns.
+
         Args:
             conversation_id: Conversation UUID.
             agent: Agent to read as.
@@ -1089,14 +1664,49 @@ class RineClient(BaseRineClient):
         Raises:
             NotFoundError: If the conversation is not found or not accessible.
         """
-        agent_id = await self._resolve_agent_id(agent)
-        extra = self._agent_header(agent)
-        params = {"limit": limit} if limit else None
-        data = await self._http.get(
-            f"/conversations/{conversation_id}/messages",
-            params=params,
-            extra_headers=extra,
+        return await self._transcript_rows(
+            conversation_transcript_path(conversation_id),
+            agent=agent,
+            limit=limit,
+            refusal=SenderKeyRefusal(),
+            recovery=None,
         )
+
+    async def _transcript_rows(
+        self,
+        path: str,
+        *,
+        agent: str | None,
+        limit: int | None,
+        refusal: SenderKeyRefusal,
+        recovery: RenderRecovery | None,
+    ) -> list[DecryptedMessage]:
+        """Fetch and decrypt one transcript's rows under one render's refusal.
+
+        Split out of :meth:`get_conversation_messages` so :meth:`thread` can hand
+        the same :class:`~rine.sender_key_words.SenderKeyRefusal` to the decrypt
+        and to the render.
+
+        ``recovery`` is the transcript's one distribution scan, and it is
+        required rather than defaulted because it is the whole difference
+        between the two readers: :meth:`thread` renders the rows itself and
+        passes a :class:`~rine._render_recovery.RenderRecovery`, so a row that
+        still will not open has earned the verdict; :meth:`get_conversation_messages`
+        passes ``None``, fetches nothing, and its refused rows carry no
+        ``decrypt_error_code`` for a renderer to recognise them by — the refusal
+        is what remembers them.
+
+        It takes the *route* rather than a conversation id because a transcript
+        has two of them — a conversation's and a group's — answering with the
+        same ``ConversationMessagesPage`` and needing the identical decrypt,
+        header and render. Deciding which route in the caller keeps the two
+        reference shapes out of a function that has no opinion about them
+        (:mod:`rine.thread_words` is where that opinion lives).
+        """
+        agent_id = await self._resolve_agent_id(agent)
+        extra = await self._agent_header(agent)
+        params = {"limit": limit} if limit else None
+        data = await self._http.get(path, params=params, extra_headers=extra)
         # The endpoint returns `{messages, truncated}` (ConversationMessagesPage),
         # NOT a cursor `{items}` page. Read the `messages` key.
         raw_items = data.get("messages", []) if isinstance(data, dict) else data
@@ -1104,16 +1714,54 @@ class RineClient(BaseRineClient):
         messages: list[DecryptedMessage] = []
         for raw in raw_items:
             msg = DecryptedMessage.model_validate(raw)
-            messages.append(await self._decrypt_thread_row(agent_id, msg))
+            messages.append(
+                await self._decrypt_thread_row(agent_id, msg, refusal, recovery=recovery)
+            )
         return messages
 
-    async def _decrypt_thread_row(self, agent_id: str, msg: DecryptedMessage) -> DecryptedMessage:
+    async def _decrypt_thread_row(
+        self,
+        agent_id: str,
+        msg: DecryptedMessage,
+        refusal: SenderKeyRefusal,
+        *,
+        recovery: RenderRecovery | None,
+    ) -> DecryptedMessage:
         """Decrypt a thread row direction-aware, never raising.
 
         For a ``direction == "sent"`` 1:1 row, swap in the ``self_encrypted_payload``
         before delegating to the existing ``_decrypt_message`` (no new crypto).
         A sent row with no self-blob, or any decrypt failure, sets
         ``decrypt_error``/``plaintext = None`` instead of raising.
+
+        ``recovery`` decides which of the two refusals a missing sender key
+        earns here, and it is required so every call site has to answer the
+        question. Given a budget, the FIRST row that fails for want of sender-key
+        state spends it on :meth:`_self_heal_group_decrypt` — the same ingest-and-
+        retry ``inbox()`` and ``read()`` run — and every row of the render after
+        it, including the ones that still will not open, is answered by a scan
+        that did run: the earned verdict, with ``decrypt_error_code``. Given
+        ``None``, nothing goes looking and ``refusal`` writes the weaker
+        sentence.
+
+        🔴 The budget is spent only for :class:`~rine.errors.NoSenderKeyStateError`,
+        never for any other :class:`~rine.errors.CryptoError`. An MLS row's
+        failure buys nothing from a sender-key distribution scan — the self-heal
+        refuses a non-``sender-key-v1`` row outright — and burning the budget on
+        it would silently downgrade every later sender-key row of the same
+        transcript to a sentence no scan had earned. That narrowing is exact,
+        not defensive: :class:`~rine.errors.NoSenderKeyStateError` is raised from
+        the sender-key decrypt and from nowhere else, so the self-heal's
+        version check can never be the arm a spent budget bought.
+
+        ⚠️ One arm does spend the budget without scanning: a group whose sender
+        keys this agent retired, where :meth:`_retirement_blocks_read` refuses
+        before the listing. Deliberate, and not a downgrade — a transcript is one
+        group, so every later row of it would reach that same refusal, and the
+        verdict they take with the budget spent is byte-identical to the one they
+        would take through the self-heal. Re-testing the retirement per row is
+        what the budget exists to stop: that check is itself a
+        ``GET /groups/{id}/members``.
         """
         is_group = msg.group_id is not None
         if msg.direction == "sent" and not is_group:
@@ -1132,42 +1780,81 @@ class RineClient(BaseRineClient):
             msg.encryption_version = EncryptionVersion.HPKE_V1
         try:
             return await self._decrypt_message(agent_id, msg)
-        except SignatureVerificationError as e:
-            # A forged/tampered sender signature: fail-closed (no plaintext leak)
-            # but PRESERVE the "invalid" status so consumers can distinguish a
-            # forged turn from an honestly-unverifiable one. ``_decrypt_message``
-            # never assigns verification_status when the decrypt call raises, so
-            # set it here — mirrors the TS SDK, which tags such a row "invalid".
-            msg.decrypt_error = str(e)
-            msg.verification_status = "invalid"
-            logger.debug("Thread decrypt failed for %s", msg.id, exc_info=True)
-            return msg
         except Exception as e:  # noqa: BLE001 — degrade, never raise (inbox pattern)
-            msg.decrypt_error = str(e)
-            logger.debug("Thread decrypt failed for %s", msg.id, exc_info=True)
-            return msg
+            if recovery is not None and isinstance(e, NoSenderKeyStateError) and recovery.spend():
+                return await self._self_heal_group_decrypt(agent_id, msg, e)
+            return self._apply_decrypt_failure(
+                msg, e, no_recovery=refusal if recovery is None else None
+            )
 
     async def thread(
-        self, conversation_id: str, *, agent: str | None = None, limit: int | None = None
+        self,
+        conversation_id: str | None = None,
+        *,
+        group: str | None = None,
+        agent: str | None = None,
+        limit: int | None = None,
     ) -> list[ThreadEntry]:
-        """Get the both-sided, role-tagged transcript of a conversation.
+        """Get the both-sided, role-tagged transcript of a conversation or a group.
 
-        Calls :meth:`get_conversation_messages` then renders each row to a
+        Fetches the conversation's rows — the same rows
+        :meth:`get_conversation_messages` returns — and renders each to a
         :class:`ThreadEntry`. A row with ``decrypt_error`` or no plaintext
-        renders ``text = "[unavailable]"``; otherwise the ``{"text": ...}``
-        payload shape is unwrapped to its string and any other plaintext is
-        stringified (mirroring the TypeScript SDK render contract).
+        renders ``text = "[unavailable]"``, except the one refusal below;
+        otherwise the ``{"text": ...}`` payload shape is unwrapped to its string
+        and any other plaintext is stringified (mirroring the TypeScript SDK
+        render contract).
+
+        The one refusal with a move for the operator to make is spelled out
+        rather than flattened: the **first** row in this transcript sealed under
+        a sender key this agent holds no state for carries the whole
+        explanation, and every later one carries
+        :data:`~rine.sender_key_words.SENDER_KEY_UNAVAILABLE_PREVIEW`. The
+        budget is per call, so a second ``thread()`` explains again.
+
+        A transcript that meets a group row it cannot open **goes looking**,
+        once: the first such row ingests every pending sender-key distribution
+        and retries, exactly as :meth:`read` does, and the rest of the render
+        reads the state that scan installed. One scan answers the whole
+        transcript because the scan is untargeted, so a row that still will not
+        open afterwards carries the earned verdict and ``decrypt_error_code``. A
+        transcript with nothing to recover pays nothing. The reader that fetches
+        nothing at all is :meth:`get_conversation_messages`, which hands rows to
+        a caller's own renderer.
+
+        That scan opens the pending distribution DMs by id, so the server marks
+        those DMs delivered. It touches the distribution DMs only, never the
+        transcript's own rows, and only when a row failed.
+
+        A **group** is named the way every other group verb takes it — a handle,
+        a bare name or a UUID — and resolved the same way they all resolve it.
+        ``conversation_id`` stays first and positional.
 
         Args:
-            conversation_id: Conversation UUID.
+            conversation_id: Conversation UUID. Name this or ``group``, never both.
+            group: Group handle (``#name@org``), bare name, or UUID.
             agent: Agent to read as.
             limit: Max turns (most-recent window).
 
         Returns:
             List of ThreadEntry, ordered oldest→newest.
+
+        Raises:
+            ConfigError: Both references were named, or neither, or
+                ``conversation_id`` is not a spelling the wire reads as a UUID.
+            NotFoundError: ``group`` names no group this caller can see.
         """
-        messages = await self.get_conversation_messages(conversation_id, agent=agent, limit=limit)
-        return [to_thread_entry(m) for m in messages]
+        conversation_id, group = blank_as_absent(conversation_id), blank_as_absent(group)
+        refuse_if_two_transcript_references(conversation_id, group)
+        if group is not None:
+            path = group_transcript_path(await self._resolve_group_async(group, agent))
+        else:
+            path = conversation_transcript_path(named_conversation_uuid(conversation_id))
+        refusal = SenderKeyRefusal()
+        messages = await self._transcript_rows(
+            path, agent=agent, limit=limit, refusal=refusal, recovery=RenderRecovery()
+        )
+        return [to_thread_entry(m, refusal) for m in messages]
 
     # --- Agent Cards ---
 
@@ -1385,7 +2072,7 @@ class RineClient(BaseRineClient):
         token = await self._http._get_token()
         headers = {"Authorization": f"Bearer {token}", "User-Agent": "rine-python"}
         if agent_id:
-            headers["X-Rine-Agent"] = agent_id
+            headers[AGENT_HEADER] = agent_id
 
         async with (
             httpx.AsyncClient() as http,

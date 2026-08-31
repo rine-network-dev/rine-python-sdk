@@ -2,7 +2,7 @@
 
 A file lock held across the read → enforce → write of the daily-spend journal so
 two processes of the same agent cannot both slip a payment past the daily cap
-(the S2 cross-process TOCTOU fix). Byte-compatible with the TypeScript lock: same
+(the cross-process TOCTOU fix). Byte-compatible with the TypeScript lock: same
 path (``keys/{agent_id}/wallet-spend.lock``), same JSON body (``{"pid": <int>,
 "acquired_at": <ms>}`` + newline, 0600), same ``STALE_MS``/``ACQUIRE_TIMEOUT_MS``/
 ``POLL_MS`` constants, and the same **rename-steal** protocol — so a Python and a

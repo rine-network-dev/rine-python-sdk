@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from rine._constants import MessageType
+from rine._crypto._sender_verify import is_authenticity_failure
+from rine.sender_key_words import SenderKeyRefusal
 from rine.types import DecryptedMessage
 from rine.x402.errors import X402Error, X402ErrorCode
 from rine.x402.messages import parse_x402_payload
@@ -63,7 +65,7 @@ async def load_referenced_quote(
             "out-of-band quote)",
         )
     payee_agent_id = await client._resolve_agent_id(agent)
-    extra = client._agent_header(agent)
+    extra = await client._agent_header(agent)
     try:
         raw = await client._http.get(f"/messages/{ref}", extra_headers=extra)
     except Exception as exc:  # noqa: BLE001 — any fetch failure is a fail-closed refusal
@@ -88,8 +90,16 @@ async def load_referenced_quote(
             f"Referenced quote {ref} has no self-sealed copy the payee can reopen "
             "(legacy pre-self-seal) — refusing to settle",
         )
-    row = await client._decrypt_thread_row(payee_agent_id, msg)
-    if row.verification_status == "invalid":
+    # A one-row reopen of a 1:1 self-sealed quote — guarded above, so it cannot
+    # reach the sender-key path at all — and it runs no recovery before it gives
+    # up: it is handed a refusal of its own and no scan budget, rather than
+    # borrowing the earned verdict. Nothing here renders the sentence: the
+    # refusal below is a fail-closed boolean on ``decrypt_error``. Both
+    # parameters are required precisely so this call site had to answer the
+    # question — a settle path must not grow a distribution scan by inheriting a
+    # default.
+    row = await client._decrypt_thread_row(payee_agent_id, msg, SenderKeyRefusal(), recovery=None)
+    if is_authenticity_failure(row.verification_status):
         raise X402Error(
             X402ErrorCode.NO_QUOTE,
             f"Referenced quote {ref} failed sender-signature verification — refusing to settle",

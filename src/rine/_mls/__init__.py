@@ -5,6 +5,15 @@ rest of this package (and the rest of the SDK) goes through the names re-exporte
 here. New groups run the post-quantum X-Wing ciphersuite by default.
 """
 
+from rine._mls.add_members import add_mls_group_members
+from rine._mls.admission import (
+    MlsAdmissionOutcome,
+    MlsAdmissionResult,
+    MlsAdmissionSkipReason,
+    MlsReclamation,
+    MlsReclamationDecline,
+    MlsReclamationDeclineReason,
+)
 from rine._mls.api import (
     MlsCommit,
     MlsGroupInfo,
@@ -34,8 +43,9 @@ from rine._mls.binding import (
 )
 from rine._mls.external_join import ExternalJoin, external_join_mls_group
 from rine._mls.failures import is_recoverable_mls_failure, is_unprocessable_commit
+from rine._mls.founding import claim_founding_key_packages, mls_founding_batch_sizes
 from rine._mls.group_access import load_mls_group, mls_group_id_bytes, open_mls_group
-from rine._mls.group_init import MlsInitOutcome, init_mls_group
+from rine._mls.group_init import init_mls_group
 from rine._mls.join import (
     install_mls_state,
     install_mls_state_by_id,
@@ -50,14 +60,26 @@ from rine._mls.key_packages import (
     publish_mls_key_packages,
     replenish_mls_key_packages,
 )
+from rine._mls.leave import RetiredGroupState, retire_local_group_state, wipe_mls_state
 from rine._mls.messages import decrypt_mls_group_message, encrypt_mls_group_message
+from rine._mls.orphans import OrphanLeaf, orphan_leaves, reclaim_orphan_leaves
+from rine._mls.removal import MlsRemovalCommit, remove_mls_group_member
+from rine._mls.resync import (
+    MLS_RESYNC_REQUIRED,
+    MlsRecoveryResult,
+    MlsRecoveryRung,
+    recover_mls_group,
+)
 from rine._mls.sync import MlsSyncResult, sync_mls_group
 from rine._mls.sync_api import MlsHandshake, fetch_handshakes, mls_ack, mls_nack
+from rine._mls.tree import GroupTree, read_group_tree
+from rine._mls.welcome_guard import MlsWelcomeRefusedError
 from rine._mls.welcomes import MlsWelcomeOutcome, process_mls_welcomes
 from rine._mls.wire import api_error_code, mls_from_base64, mls_to_base64
 
 __all__ = [
     "APP_MESSAGE_TAG",
+    "MLS_RESYNC_REQUIRED",
     "CLASSICAL_CIPHER_SUITE",
     "DEFAULT_CIPHER_SUITE",
     "EPOCH_RETENTION_ENV",
@@ -65,19 +87,33 @@ __all__ = [
     "KEY_PACKAGE_MAX_BATCH",
     "KEY_PACKAGE_TARGET",
     "ExternalJoin",
+    "GroupTree",
+    "MlsAdmissionOutcome",
+    "MlsAdmissionResult",
+    "MlsAdmissionSkipReason",
     "MlsCommit",
     "MlsCoreError",
     "MlsCutoverResult",
     "MlsGroupInfo",
     "MlsHandshake",
-    "MlsInitOutcome",
     "MlsKeyPackageStatus",
     "MlsMemberStatus",
+    "MlsReclamation",
+    "MlsReclamationDecline",
+    "MlsReclamationDeclineReason",
+    "MlsRecoveryResult",
+    "MlsRecoveryRung",
+    "MlsRemovalCommit",
     "MlsSyncResult",
     "MlsWelcome",
     "MlsWelcomeDelivery",
     "MlsWelcomeOutcome",
+    "MlsWelcomeRefusedError",
+    "OrphanLeaf",
+    "RetiredGroupState",
+    "add_mls_group_members",
     "api_error_code",
+    "claim_founding_key_packages",
     "claim_key_package",
     "claim_key_packages",
     "decrypt_mls_group_message",
@@ -99,6 +135,7 @@ __all__ = [
     "load_mls_group",
     "mls_ack",
     "mls_commit",
+    "mls_founding_batch_sizes",
     "mls_from_base64",
     "mls_group_id_bytes",
     "mls_init",
@@ -106,10 +143,17 @@ __all__ = [
     "mls_to_base64",
     "open_mls_client",
     "open_mls_group",
+    "orphan_leaves",
     "process_mls_welcomes",
     "publish_mls_key_packages",
     "read_group",
+    "read_group_tree",
+    "reclaim_orphan_leaves",
+    "recover_mls_group",
+    "remove_mls_group_member",
+    "retire_local_group_state",
     "replenish_mls_key_packages",
     "sync_mls_group",
     "upload_key_packages",
+    "wipe_mls_state",
 ]

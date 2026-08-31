@@ -422,11 +422,11 @@ class TestThread:
         assert entries[0].text.startswith("hi peer")
         assert entries[1].text == "got it, albatross noted"
         assert entries[1].sender_handle == "peer@myorg.rine.network"
-        # F4: a successfully-decrypted+verified row carries its signature status.
+        # A successfully-decrypted+verified row carries its signature status.
         assert entries[1].verification_status == "verified"
         # Undecryptable legacy sent row renders [unavailable].
         assert entries[2].text == "[unavailable]"
-        # F4: a degraded row reports its (non-"verified") status — never silently
+        # A degraded row reports its (non-"verified") status — never silently
         # "verified" — so a downstream consumer can exclude untrusted turns.
         assert entries[2].verification_status != "verified"
         await async_client.close()
@@ -446,7 +446,7 @@ class TestThread:
         assert [e.direction for e in entries] == ["sent", "received", "sent"]
         assert entries[0].text.startswith("hi peer")
         assert entries[1].text == "got it, albatross noted"
-        # F4: signature status is carried through (verified turn vs degraded turn).
+        # Signature status is carried through (verified turn vs degraded turn).
         assert entries[1].verification_status == "verified"
         assert entries[2].text == "[unavailable]"
         assert entries[2].verification_status != "verified"
@@ -469,7 +469,7 @@ class TestThread:
     async def test_async_thread_forged_signature_is_unavailable(
         self, async_client, tmp_config_dir
     ):
-        """F3 (fail-closed) — a forged-signature received turn is [unavailable].
+        """Fail-closed — a forged-signature received turn is [unavailable].
 
         A received row whose sender signature does NOT match the key
         ``/agents/{id}/keys`` returns degrades to [unavailable] and never enters
@@ -519,7 +519,7 @@ class TestThread:
 
     @respx.mock
     async def test_async_thread_forwards_agent_override(self, async_client, tmp_config_dir):
-        """F5 — thread(agent=...) forwards the X-Rine-Agent override header.
+        """thread(agent=...) forwards the X-Rine-Agent override header.
 
         A non-default agent must read its OWN thread (self-sealed sent rows are
         sealed to one specific agent).

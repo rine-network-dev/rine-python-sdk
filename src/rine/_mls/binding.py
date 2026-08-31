@@ -53,6 +53,7 @@ AppMessage = rine_mls.AppMessage
 #: Base class for every failure raised by the MLS core. Re-exported so callers
 #: can catch MLS failures without importing the wheel.
 MlsCoreError = rine_mls.RineMlsError
+EpochConflictError = rine_mls.EpochConflictError
 UnreadableKeyPackageError = rine_mls.UnreadableKeyPackageError
 KeyPackageBatchTooLargeError = rine_mls.KeyPackageBatchTooLargeError
 CipherSuiteMismatchError = rine_mls.CipherSuiteMismatchError
@@ -63,11 +64,14 @@ MlsPoisonedError = rine_mls.MlsPoisonedError
 GroupInactiveError = rine_mls.GroupInactiveError
 SelfMessageNotCachedError = rine_mls.SelfMessageNotCachedError
 
-#: Environment knob for epoch retention. Unset (the default) retains the
-#: full backlog, so an agent returning after many commits can still decrypt
-#: everything the undelivered queue held for it. Set it to a positive integer to
-#: keep only that many epochs — a narrower forward-secrecy window bought by
-#: giving up backlog reach.
+#: Environment knob for epoch retention. Unset (the default) is rine's shipped
+#: window, ``EPOCH_RETENTION_DEFAULT`` — the native core decides the number, so
+#: the Python and TypeScript stacks cannot disagree about it. It is derived from
+#: the server's own 90-day message retention at the peak modelled churn, so an
+#: agent returning after many commits still decrypts what the undelivered queue
+#: holds for it. There is no "keep everything" setting: a smaller integer keeps
+#: only that many epochs — a narrower forward-secrecy window bought by giving up
+#: backlog reach, permanently, because the epoch secret is the only copy.
 EPOCH_RETENTION_ENV = "RINE_MLS_EPOCH_RETENTION"
 
 
@@ -75,7 +79,7 @@ def epoch_retention_limit() -> int | None:
     """Read the configured epoch-retention limit.
 
     Returns:
-        The number of epochs to retain, or ``None`` for the full backlog.
+        The number of epochs to retain, or ``None`` for the shipped window.
 
     Raises:
         ConfigError: If the environment value is not a positive integer.
@@ -88,7 +92,7 @@ def epoch_retention_limit() -> int | None:
     except ValueError:
         raise ConfigError(
             f"{EPOCH_RETENTION_ENV} must be a positive integer (epochs to retain), "
-            f"got {raw!r}. Leave it unset to retain the full backlog."
+            f"got {raw!r}. Leave it unset for rine's shipped window."
         ) from None
     if limit < 1:
         raise ConfigError(
@@ -146,6 +150,7 @@ __all__ = [
     "AppMessage",
     "CipherSuiteMismatchError",
     "CommitBundle",
+    "EpochConflictError",
     "GroupInactiveError",
     "KeyPackageBatchTooLargeError",
     "MlsClient",

@@ -8,7 +8,15 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    # Imported for annotations only — the runtime import stays inside the functions
+    # that actually open a client, which is where it has always been. CredentialEntry
+    # is annotation-only too: the one `cast` naming it passes a string.
+    import httpx
+
+    from rine._types import CredentialEntry
 
 from rine._config import cache_token, load_credentials, save_credentials
 from rine._crypto.keys import generate_agent_keys, public_keys_body, save_agent_keys
@@ -34,17 +42,17 @@ def validate_slug(slug: str) -> bool:
     return bool(_SLUG_RE.match(slug))
 
 
-def _raise_registration_error(resp: object) -> None:
+def _raise_registration_error(resp: httpx.Response) -> None:
     """Raise the appropriate SDK error from a failed registration response.
 
     Uses the same error parsing as the main HTTP layer so that server-provided
     detail messages (e.g. "Email already in use") are surfaced accurately.
     """
-    detail = _parse_error_detail(resp)  # type: ignore[arg-type]
-    if resp.status_code == 429:  # type: ignore[union-attr]
-        retry_val = _parse_retry_after(resp)  # type: ignore[arg-type]
-        raise RateLimitError(detail=detail, retry_after=retry_val, raw=resp.text)  # type: ignore[union-attr]
-    raise_for_status(resp.status_code, detail, raw=resp.text)  # type: ignore[union-attr]
+    detail = _parse_error_detail(resp)
+    if resp.status_code == 429:
+        retry_val = _parse_retry_after(resp)
+        raise RateLimitError(detail=detail, retry_after=retry_val, raw=resp.text)
+    raise_for_status(resp.status_code, detail, raw=resp.text)
 
 
 def register(
@@ -57,6 +65,10 @@ def register(
     profile: str = "default",
 ) -> RegistrationResult:
     """Register a new org via PoW challenge.
+
+    Exported from the package root under two names: ``rine.register``, which is
+    what the TypeScript SDK and the CLI call it, and ``rine.onboard``, which is
+    what this SDK has always called it. They are the same object.
 
     Args:
         api_url: API base URL.
@@ -150,6 +162,10 @@ async def async_register(
     profile: str = "default",
 ) -> RegistrationResult:
     """Register a new org via PoW challenge (async variant).
+
+    Exported from the package root as both ``rine.async_register`` and
+    ``rine.async_onboard`` — the same object under the two spellings the product
+    uses, exactly as its sync twin is.
 
     Args:
         api_url: API base URL.
@@ -292,9 +308,13 @@ def create_agent(
     # Save poll_url to credentials if present
     if agent.poll_url:
         creds = load_credentials(config_dir)
-        entry = creds.get(client._profile, {})
-        entry["poll_url"] = agent.poll_url  # type: ignore[typeddict-unknown-key]
-        creds[client._profile] = entry  # type: ignore[assignment]
+        # A profile with no entry yet starts as an empty mapping that this block fills
+        # in. The cast names that one unsound step explicitly, which is what the pair of
+        # blanket ignores here used to hide; `poll_url` itself is a declared NotRequired
+        # key of CredentialEntry, so the write below needs no exemption at all.
+        entry: CredentialEntry = creds.get(client._profile) or cast("CredentialEntry", {})
+        entry["poll_url"] = agent.poll_url
+        creds[client._profile] = entry
         save_credentials(config_dir, creds)
 
     apply_identity_verification(client, agent, verify=verify_identity, svid=svid, log=log)

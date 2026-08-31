@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 
+from rine._actor import AGENT_HEADER
 from rine._config import (
     cache_token,
     get_cached_token,
@@ -46,7 +47,9 @@ _TOKEN_FORM_HEADERS = {"Content-Type": "application/x-www-form-urlencoded"}
 
 def _backoff_delay(attempt: int, base: float = 0.5, max_delay: float = 8.0) -> float:
     """Exponential backoff with jitter."""
-    delay = min(base * (2**attempt), max_delay)
+    # Annotated because mypy types ``int ** int`` as Any (the result is float for a
+    # negative exponent), which would otherwise propagate out through the return.
+    delay: float = min(base * (2**attempt), max_delay)
     return delay * (0.5 + random.random() * 0.5)  # noqa: S311
 
 
@@ -259,6 +262,9 @@ class SyncHttpClient:
         http_client: Optional custom ``httpx.Client``.
         rng: Uniform ``[0, 1)`` source for the per-instance refresh-margin jitter
             and token-retry backoff (injectable for deterministic tests).
+        keys_cache: An existing signing-key cache to share instead of starting a
+            fresh one — how a short-lived client borrows a long-lived client's
+            view of its peers' keys, which is what lets it notice a rotation.
     """
 
     def __init__(
@@ -270,6 +276,7 @@ class SyncHttpClient:
         max_retries: int = DEFAULT_MAX_RETRIES,
         http_client: httpx.Client | None = None,
         rng: Callable[[], float] = random.random,
+        keys_cache: KeyCache | None = None,
     ) -> None:
         self._config_dir = config_dir
         self._api_url = api_url or resolve_api_url()
@@ -282,7 +289,7 @@ class SyncHttpClient:
         self._cached_token: str | None = None
         self._rng = rng
         self._refresh_margin = _jittered_margin(rng)
-        self._keys_cache = KeyCache(KEY_CACHE_TTL, KEY_CACHE_MAX_ENTRIES)
+        self._keys_cache = keys_cache or KeyCache(KEY_CACHE_TTL, KEY_CACHE_MAX_ENTRIES)
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -324,7 +331,7 @@ class SyncHttpClient:
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         headers: dict[str, str] = {"User-Agent": _USER_AGENT}
         if self._agent_id:
-            headers["X-Rine-Agent"] = self._agent_id
+            headers[AGENT_HEADER] = self._agent_id
         if extra:
             headers.update(extra)
         return headers
@@ -406,9 +413,12 @@ class SyncHttpClient:
                     continue
                 raise APIConnectionError(f"Connection failed: {method} {path}") from exc
 
-            # Auto-refresh on 401 (once)
+            # Auto-refresh on 401 (once). DEBUG, not WARNING: at a 900 s token
+            # TTL this is the designed self-healing path firing on schedule, and
+            # a warning that fires hourly forever teaches operators to ignore
+            # the ones that mean something.
             if resp.status_code == 401 and authenticated and not auth_retried:
-                logger.warning("401 received, refreshing token")
+                logger.debug("401 received, refreshing token")
                 auth_retried = True
                 self._invalidate_token()
                 headers["Authorization"] = f"Bearer {self._get_token(force=True)}"
@@ -693,7 +703,7 @@ class AsyncHttpClient:
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         headers: dict[str, str] = {"User-Agent": _USER_AGENT}
         if self._agent_id:
-            headers["X-Rine-Agent"] = self._agent_id
+            headers[AGENT_HEADER] = self._agent_id
         if extra:
             headers.update(extra)
         return headers
@@ -776,9 +786,12 @@ class AsyncHttpClient:
                     continue
                 raise APIConnectionError(f"Connection failed: {method} {path}") from exc
 
-            # Auto-refresh on 401 (once)
+            # Auto-refresh on 401 (once). DEBUG, not WARNING: at a 900 s token
+            # TTL this is the designed self-healing path firing on schedule, and
+            # a warning that fires hourly forever teaches operators to ignore
+            # the ones that mean something.
             if resp.status_code == 401 and authenticated and not auth_retried:
-                logger.warning("401 received, refreshing token")
+                logger.debug("401 received, refreshing token")
                 auth_retried = True
                 self._invalidate_token()
                 headers["Authorization"] = f"Bearer {await self._get_token(force=True)}"

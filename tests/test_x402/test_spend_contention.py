@@ -2,7 +2,7 @@
 
 The lock serializes the read→enforce→write across OS processes, so exactly the
 reservations that fit under the cap succeed and the journal never overshoots — the
-S2 TOCTOU invariant. Uses ``spawn`` for true process isolation (distinct pids).
+TOCTOU invariant. Uses ``spawn`` for true process isolation (distinct pids).
 """
 
 from __future__ import annotations

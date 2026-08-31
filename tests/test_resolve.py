@@ -5,12 +5,10 @@ from __future__ import annotations
 import pytest
 
 from rine._resolve import (
-    is_bare_agent_name,
     is_uuid,
-    match_group_by_local_name,
+    is_wire_agent_id,
     normalize_handle,
     resolve_agent,
-    resolve_bare_name,
 )
 from rine.errors import ConfigError, NotFoundError
 
@@ -27,87 +25,134 @@ class TestIsUuid:
         assert not is_uuid("agent@org.rine.network")
         assert not is_uuid("")
 
+    def test_a_uuid_with_a_trailing_newline_is_not_a_uuid(self):
+        """🔴 Python's ``$`` matches before a trailing newline; JavaScript's does not.
 
-class TestIsBareAgentName:
-    def test_bare_name(self):
-        assert is_bare_agent_name("my-agent")
+        A line read off a file or piped in carries the ``\\n``, and an id is
+        interpolated into ``GET /groups/{id}`` — httpx refuses the
+        newline with ``InvalidURL``, which is not a ``RineError`` and so leaves
+        the SDK's error hierarchy entirely, while ``rine-core``'s ``UUID_RE``
+        classifies the same string as a handle and composes the roster refusal.
+        The two classifiers have to agree; this is the input that told them
+        apart.
+        """
+        assert not is_uuid("12345678-1234-1234-1234-123456789abc\n")
+        assert not is_uuid("\n12345678-1234-1234-1234-123456789abc")
+        assert not is_uuid("12345678-1234-1234-1234-123456789abc\r\n")
 
-    def test_handle_is_not_bare(self):
-        assert not is_bare_agent_name("agent@org.rine.network")
 
-    def test_uuid_is_not_bare(self):
-        assert not is_bare_agent_name("12345678-1234-1234-1234-123456789abc")
+class TestIsWireAgentId:
+    """The wire's own question: is this spelling already an agent **id**?
+
+    Deliberately looser than :func:`is_uuid` and deliberately false for a
+    handle — the header parses all four UUID spellings itself, while a handle
+    names an agent the caller must own and is looked up like a name.
+    """
+
+    def test_the_canonical_spelling_is_an_id(self):
+        assert is_wire_agent_id("12345678-1234-1234-1234-123456789abc")
+
+    def test_the_spellings_uuid_parses_but_is_uuid_refuses_are_ids_too(self):
+        assert is_wire_agent_id("123456781234123412341234567890ab")
+        assert is_wire_agent_id("urn:uuid:12345678-1234-1234-1234-123456789abc")
+        assert is_wire_agent_id("{12345678-1234-1234-1234-123456789abc}")
+
+    def test_a_handle_is_not_an_id(self):
+        assert not is_wire_agent_id("agent@org.rine.network")
+
+    def test_a_bare_name_is_not_an_id(self):
+        assert not is_wire_agent_id("my-agent")
 
 
-class TestResolveBareName:
+class TestBareNameMatching:
+    """The bare-name rung, through the resolver that ships it.
+
+    Was ``TestResolveBareName``, against a wrapper no call path executed. The
+    matching is the same code either way (``_match_bare_name``); what changes is
+    that a rewrite of the shipped path can no longer leave this green.
+    """
+
     def test_case_insensitive_match(self):
-        agents = [{"id": "uuid-1", "name": "My-Agent", "handle": "my-agent@org.rine.network"}]
-        assert resolve_bare_name(agents, "my-agent") == "uuid-1"
-        assert resolve_bare_name(agents, "MY-AGENT") == "uuid-1"
+        agents = [
+            {"id": "uuid-1", "name": "My-Agent", "handle": "my-agent@org.rine.network"},
+            {"id": "uuid-2", "name": "other", "handle": "other@org.rine.network"},
+        ]
+        assert resolve_agent(agents, explicit="my-agent").agent_id == "uuid-1"
+        assert resolve_agent(agents, explicit="MY-AGENT").agent_id == "uuid-1"
 
     def test_no_match_raises(self):
-        agents = [{"id": "uuid-1", "name": "other", "handle": "other@org.rine.network"}]
+        agents = [
+            {"id": "uuid-1", "name": "other", "handle": "other@org.rine.network"},
+            {"id": "uuid-2", "name": "third", "handle": "third@org.rine.network"},
+        ]
         with pytest.raises(NotFoundError, match="No agent named"):
-            resolve_bare_name(agents, "missing")
+            resolve_agent(agents, explicit="missing")
 
 
 class TestResolveAgent:
     def test_single_agent_auto_selected(self):
         agents = [{"id": "uuid-1", "name": "bot", "handle": "bot@org.rine.network"}]
-        assert resolve_agent(agents) == "uuid-1"
+        assert resolve_agent(agents).agent_id == "uuid-1"
 
     def test_explicit_uuid(self):
         agents = [{"id": "uuid-1", "name": "bot"}]
         result = resolve_agent(agents, explicit="12345678-1234-1234-1234-123456789abc")
-        assert result == "12345678-1234-1234-1234-123456789abc"
+        assert result.agent_id == "12345678-1234-1234-1234-123456789abc"
 
     def test_explicit_name(self):
         agents = [
             {"id": "uuid-1", "name": "bot1"},
             {"id": "uuid-2", "name": "bot2"},
         ]
-        assert resolve_agent(agents, explicit="bot2") == "uuid-2"
+        assert resolve_agent(agents, explicit="bot2").agent_id == "uuid-2"
 
     def test_multiple_agents_no_explicit_raises(self):
         agents = [{"id": "uuid-1", "name": "a"}, {"id": "uuid-2", "name": "b"}]
-        with pytest.raises(ConfigError, match="Multiple agents"):
+        with pytest.raises(ConfigError, match="more than one agent"):
             resolve_agent(agents)
 
     def test_no_agents_raises(self):
-        with pytest.raises(ConfigError, match="No agents"):
+        with pytest.raises(ConfigError, match="No active agents in this org"):
             resolve_agent([])
+
+    def test_no_agents_still_says_how_to_make_one(self):
+        # The converged refusal is one sentence for every stack; the
+        # actionable half of the old text is kept rather than lost to it.
+        with pytest.raises(ConfigError, match="client.create_agent"):
+            resolve_agent([])
+
+    def test_explicit_handle(self):
+        agents = [
+            {"id": "uuid-1", "name": "bot1", "handle": "bot1@acme.rine.network"},
+            {"id": "uuid-2", "name": "bot2", "handle": "bot2@acme.rine.network"},
+        ]
+        assert resolve_agent(agents, explicit="bot2@acme.rine.network").agent_id == "uuid-2"
+
+    def test_explicit_short_form_handle(self):
+        agents = [{"id": "uuid-1", "name": "bot", "handle": "bot@acme.rine.network"}]
+        assert resolve_agent(agents, explicit="bot@acme").agent_id == "uuid-1"
+
+    def test_explicit_handle_case_insensitive(self):
+        agents = [{"id": "uuid-1", "name": "bot", "handle": "bot@acme.rine.network"}]
+        assert resolve_agent(agents, explicit="BOT@ACME.RINE.NETWORK").agent_id == "uuid-1"
+
+    def test_explicit_unknown_handle_raises(self):
+        # Two agents, deliberately: with one there is nothing to choose between,
+        # so an unresolvable handle falls back to the sole agent instead of
+        # refusing — the fallback pinned in ``test_actor_contract.py``.
+        agents = [
+            {"id": "uuid-1", "name": "bot", "handle": "bot@acme.rine.network"},
+            {"id": "uuid-2", "name": "bot2", "handle": "bot2@acme.rine.network"},
+        ]
+        with pytest.raises(NotFoundError, match="No agent with handle"):
+            resolve_agent(agents, explicit="ghost@acme.rine.network")
 
     def test_as_flag_used_when_no_explicit(self):
         agents = [
             {"id": "uuid-1", "name": "bot1"},
             {"id": "uuid-2", "name": "bot2"},
         ]
-        assert resolve_agent(agents, as_flag="bot1") == "uuid-1"
-
-
-class TestMatchGroupByLocalName:
-    _GROUPS = [
-        {"id": "g-1", "handle": "#ops@myorg.rine.network"},
-        {"id": "g-2", "handle": "#research@myorg.rine.network"},
-    ]
-
-    def test_bare_name_matches_local_part(self):
-        assert match_group_by_local_name(self._GROUPS, "ops") == "g-1"
-
-    def test_leading_hash_is_ignored(self):
-        assert match_group_by_local_name(self._GROUPS, "#research") == "g-2"
-
-    def test_no_match_raises_not_found(self):
-        with pytest.raises(NotFoundError, match="Group not found: missing"):
-            match_group_by_local_name(self._GROUPS, "missing")
-
-    def test_ambiguous_name_raises_config_error(self):
-        groups = [
-            {"id": "g-1", "handle": "#ops@org-a.rine.network"},
-            {"id": "g-2", "handle": "#ops@org-b.rine.network"},
-        ]
-        with pytest.raises(ConfigError, match="ambiguous"):
-            match_group_by_local_name(groups, "ops")
+        assert resolve_agent(agents, as_flag="bot1").agent_id == "uuid-1"
 
 
 class TestNormalizeHandle:

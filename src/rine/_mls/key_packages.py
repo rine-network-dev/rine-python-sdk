@@ -14,9 +14,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from rine._actor import AGENT_HEADER
 from rine._logging import logger
 from rine._mls.api import claim_key_packages, upload_key_packages
 from rine._mls.binding import KEY_PACKAGE_TARGET, open_mls_client
+from rine._mls.failures import mls_boundary
 from rine.errors import ConflictError, RineApiError
 
 # Largest ``count`` the server's claim endpoint accepts in one request.
@@ -118,6 +120,7 @@ def replenish_mls_key_packages(client: Any, config_dir: str, agent_id: str) -> N
         logger.debug("MLS KeyPackage replenishment deferred", exc_info=True)
 
 
+@mls_boundary
 def drain_and_republish_mls_key_packages(
     client: Any, config_dir: str, agent_id: str
 ) -> MlsCutoverResult:
@@ -167,7 +170,7 @@ def _claim_out_pool(client: Any, agent_id: str) -> int:
     it merely outnumbered. Bounded by :data:`DRAIN_MAX_PAGES` so a peer uploading
     concurrently can never turn it into an unbounded loop.
     """
-    headers = {"X-Rine-Agent": agent_id}
+    headers = {AGENT_HEADER: agent_id}
     drained = 0
     for _ in range(DRAIN_MAX_PAGES):
         try:

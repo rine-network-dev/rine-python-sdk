@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 
@@ -19,6 +20,27 @@ def recipient_view(keys) -> RecipientKeys:
     advertised, which is what decides the envelope version.
     """
     return recipient_keys_from_response(public_keys_body(keys))
+
+
+def signing_fingerprint(keys) -> str:
+    """Fingerprint a keypair's signing key from its raw bytes.
+
+    Derived straight from the 32 key bytes rather than through the SDK helper,
+    so a test asserting a reported fingerprint checks the value and not just
+    that the implementation agrees with itself.
+    """
+    return hashlib.sha256(keys.signing.public_key).hexdigest()
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_acting_agent(monkeypatch):
+    """Keep the developer's own ``RINE_AGENT`` out of every test in this package.
+
+    The client constructor reads it (rung 3 of the ladder), so a machine that
+    exports one would silently give every client an actor the test never asked
+    for. A test that wants the env rung sets it itself, after this has run.
+    """
+    monkeypatch.delenv("RINE_AGENT", raising=False)
 
 
 @pytest.fixture
@@ -136,9 +158,7 @@ def group_message_fixture(tmp_config_dir, agent_id, other_agent_id, saved_agent_
     sealed, _ = encrypt_group_message(tmp_config_dir, other_agent_id, _GROUP_ID, state, payload)
 
     recipient = recipient_view(load_agent_keys(tmp_config_dir, agent_id))
-    distribution = encrypt_message(
-        tmp_config_dir, other_agent_id, recipient, distribution_payload
-    )
+    distribution = encrypt_message(tmp_config_dir, other_agent_id, recipient, distribution_payload)
 
     def _row(message_id: str, msg_type: str, result, **extra) -> dict:
         return {

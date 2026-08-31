@@ -1,4 +1,4 @@
-"""Daily-spend journal (schema v2) + atomic reserve-under-lock (the S2 TOCTOU fix).
+"""Daily-spend journal (schema v2) + atomic reserve-under-lock (the TOCTOU fix).
 
 Split out of ``policy.py`` to keep each module small. The journal at
 ``keys/{agent_id}/wallet-spend.json`` is v2 — ``{"day": "YYYY-MM-DD",
@@ -90,7 +90,7 @@ def reserve_spend(
     force: bool = False,
     now_seconds: float | None = None,
 ) -> int:
-    """Enforce policy and debit the daily journal atomically, under a lock (S2 fix).
+    """Enforce policy and debit the daily journal atomically, under a lock.
 
     This is the LAST local act before a caller transmits; the debit is permanent
     (fail-closed, no refund path). Under the cross-process lock the journal is

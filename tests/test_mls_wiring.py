@@ -27,6 +27,7 @@ from rine._mls import (
 )
 from rine._mls.binding import EPOCH_RETENTION_ENV
 from rine.errors import ConfigError, RineApiError
+from rine.format import group_is_mls
 
 API = "https://rine.network"
 GROUP_ID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
@@ -84,7 +85,7 @@ def _uploaded_packages(route: respx.Route, call: int = 0) -> list[bytes]:
 
 
 def _mock_claim(agent_id: str, pages: list[list[bytes]] | None = None) -> respx.Route:
-    """Mock the destructive claim endpoint the DEC-7 drain empties the pool with.
+    """Mock the destructive claim endpoint the drain empties the pool with.
 
     Each entry in ``pages`` is one claim response; once they run out the endpoint
     answers 409 "No key packages available" — the drain's done signal. With no
@@ -121,7 +122,7 @@ class TestKeyPackagePool:
     def test_published_key_packages_are_mls_message_framed(
         self, sync_client, tmp_config_dir, agent_id
     ):
-        """DEC-7: only the framed form is minted — a bare KeyPackage is unreadable.
+        """Only the framed form is minted — a bare KeyPackage is unreadable.
 
         An ``MLSMessage`` opens with ``version(2) || wire_format(2)``; the bare
         RFC 9420 ``KeyPackage`` the previous core published opened with
@@ -227,7 +228,7 @@ class TestKeyPackagePool:
 
     @respx.mock
     def test_drain_replaces_every_key_package(self, sync_client, tmp_config_dir, agent_id):
-        """DEC-7 cutover: the old pool goes, a fresh one is published in one step."""
+        """The cutover: the old pool goes, a fresh one is published in one step."""
         _mock_token()
         route = _mock_upload(agent_id)
         _mock_claim(agent_id)
@@ -244,10 +245,10 @@ class TestKeyPackagePool:
 
     @respx.mock
     def test_drain_claims_the_stale_server_pool_out(self, sync_client, tmp_config_dir, agent_id):
-        """F-INT-1: the stale packages are claimed OUT of the server, not merely
+        """The stale packages are claimed OUT of the server, not merely
         outnumbered locally. Otherwise a peer claims one, finds it unreadable, and
         the founder's group.create() fails — walking the pool one 409 at a time,
-        exactly the shape DEC-7 forbids."""
+        which is exactly the shape the cutover forbids."""
         _mock_token()
         _mock_upload(agent_id)
         stale = [b"stale-old-framing-%d" % i for i in range(3)]
@@ -280,6 +281,11 @@ class TestEpochRetention:
             epoch_retention_limit()
 
 
+#: The latch the server writes when an init commit lands. A create response is
+#: minted before the init runs, so only the re-read can carry it.
+MLS_LATCH = "mls-latch-abc"
+
+
 def _mock_group_create(agent_id: str, *, enrollment: str = "closed") -> dict[str, respx.Route]:
     _mock_token()
     _mock_agents(agent_id)
@@ -287,6 +293,16 @@ def _mock_group_create(agent_id: str, *, enrollment: str = "closed") -> dict[str
         "create": respx.post(f"{API}/groups").mock(
             return_value=httpx.Response(
                 201, json={**_GROUP_PAYLOAD, "enrollment_policy": enrollment}
+            )
+        ),
+        "read": respx.get(f"{API}/groups/{GROUP_ID}").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    **_GROUP_PAYLOAD,
+                    "enrollment_policy": enrollment,
+                    "mls_group_id": MLS_LATCH,
+                },
             )
         ),
         "init": respx.post(f"{API}/groups/{GROUP_ID}/mls/init").mock(
@@ -310,9 +326,12 @@ class TestGroupCreate:
     def test_create_makes_a_post_quantum_mls_group(self, sync_client, tmp_config_dir, agent_id):
         routes = _mock_group_create(agent_id)
 
-        group = sync_client.groups.create("test-group")
+        group = sync_client.groups.create("test-group", visibility="private")
 
-        assert json.loads(routes["create"].calls[0].request.content)["mls_enabled"] is True
+        # The default asks for nothing: MLS is the server's own default for a
+        # closed group, and what proves the group is a post-quantum MLS one is
+        # the founding below, not a flag echoing a default back at the server.
+        assert "mls_enabled" not in json.loads(routes["create"].calls[0].request.content)
         assert routes["init"].call_count == 1
         commit = json.loads(routes["commit"].calls[0].request.content)
         assert commit["cipher_suite"] == DEFAULT_CIPHER_SUITE
@@ -328,7 +347,7 @@ class TestGroupCreate:
     ):
         _mock_group_create(agent_id)
 
-        sync_client.groups.create("test-group")
+        sync_client.groups.create("test-group", visibility="private")
 
         group_dir = os.path.join(
             mls_store_dir(tmp_config_dir, agent_id),
@@ -349,17 +368,45 @@ class TestGroupCreate:
     ):
         routes = _mock_group_create(agent_id)
 
-        sync_client.groups.create("test-group")
+        sync_client.groups.create("test-group", visibility="private")
 
         assert routes["upload"].call_count == 1
+
+    @respx.mock
+    def test_create_when_the_init_lands_returns_a_group_that_renders_as_mls(
+        self, sync_client, tmp_config_dir, agent_id
+    ):
+        """The create response predates the latch; only the re-read carries it."""
+        routes = _mock_group_create(agent_id)
+
+        group = sync_client.groups.create("test-group", visibility="private")
+
+        assert routes["read"].call_count == 1
+        assert group.mls_group_id == MLS_LATCH
+        assert group_is_mls(group) is True
+
+    @respx.mock
+    async def test_async_create_when_the_init_lands_returns_a_group_that_renders_as_mls(
+        self, async_client, tmp_config_dir, agent_id
+    ):
+        routes = _mock_group_create(agent_id)
+
+        group = await async_client.groups.create("test-group", visibility="private")
+
+        assert routes["read"].call_count == 1
+        assert group_is_mls(group) is True
+        await async_client.close()
 
     @respx.mock
     def test_open_enrollment_group_stays_on_sender_keys(self, sync_client, agent_id):
         routes = _mock_group_create(agent_id, enrollment="open")
 
-        sync_client.groups.create("test-group", enrollment="open")
+        group = sync_client.groups.create("test-group", visibility="private", enrollment="open")
 
         assert routes["init"].call_count == 0
+        # Nothing was founded, so there is nothing to re-read either.
+        assert routes["read"].call_count == 0
+        assert group_is_mls(group) is False
 
     @respx.mock
     def test_create_when_mls_init_fails_still_returns_the_group(
@@ -370,12 +417,14 @@ class TestGroupCreate:
         _mock_agents(agent_id)
         _mock_upload(agent_id)
         respx.post(f"{API}/groups").mock(return_value=httpx.Response(201, json=_GROUP_PAYLOAD))
+        # No re-read mock: a failed init returns early (see `create_group`), so
+        # the GET this test used to stub for the re-read is never reached.
         respx.post(f"{API}/groups/{GROUP_ID}/mls/init").mock(
             return_value=httpx.Response(403, json={"detail": "Only the designated admin"})
         )
 
         with caplog.at_level("WARNING"):
-            group = sync_client.groups.create("test-group")
+            group = sync_client.groups.create("test-group", visibility="private")
 
         assert str(group.id) == GROUP_ID
         assert any("MLS init failed" in r.message for r in caplog.records)
@@ -386,7 +435,7 @@ class TestGroupCreate:
     ):
         routes = _mock_group_create(agent_id)
 
-        await async_client.groups.create("test-group")
+        await async_client.groups.create("test-group", visibility="private")
 
         commit = json.loads(routes["commit"].calls[0].request.content)
         assert commit["cipher_suite"] == DEFAULT_CIPHER_SUITE
@@ -422,7 +471,7 @@ class TestAgentCreation:
 
 
 class TestCutover:
-    """DEC-7: an agent upgrading from the previous MLS core republishes its pool."""
+    """An agent upgrading from the previous MLS core republishes its pool."""
 
     @respx.mock
     def test_client_republish_replaces_the_pool(self, sync_client, tmp_config_dir, agent_id):

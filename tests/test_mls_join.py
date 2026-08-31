@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 
 import httpx
 import pytest
@@ -28,7 +29,14 @@ from rine._mls import (
     publish_mls_key_packages,
 )
 from rine._mls import external_join as external_join_module
-from rine._mls.welcome_spool import WelcomeSpool, welcome_spool_dir
+from rine._mls.api import MlsWelcomeDelivery
+from rine._mls.welcome_guard import MlsWelcomeRefusedError
+from rine._mls.welcome_spool import (
+    SPOOL_MAX_ENTRIES,
+    WelcomeSpool,
+    is_spoolable_id,
+    welcome_spool_dir,
+)
 from rine.errors import CryptoError, RineApiError
 from rine.types import JoinedResult, PendingJoinResult
 
@@ -207,8 +215,6 @@ class TestWelcomeInstall:
         _mock_welcomes(agent_id, (WELCOME_ID, GROUP_ID, welcome))
         process_mls_welcomes(sync_client._http, tmp_config_dir, agent_id)
 
-        from rine._mls.api import MlsWelcomeDelivery
-
         spool = WelcomeSpool(tmp_config_dir, agent_id)
         spool.store(MlsWelcomeDelivery(id=WELCOME_ID, group_id=GROUP_ID, welcome=welcome))
         outcome = process_mls_welcomes(sync_client._http, tmp_config_dir, agent_id)
@@ -237,19 +243,26 @@ class TestWelcomeInstall:
 
     @respx.mock
     def test_a_welcome_delivered_under_the_wrong_group_is_refused(
-        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path, caplog
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
     ):
-        """State keyed by the wrong group is unrecoverable; failing loudly is not."""
+        """State keyed by the wrong group is unrecoverable; raising is not.
+
+        It raises rather than logging because both stacks must be loud and
+        must agree: a refusal that is loud on one and a warning on the
+        other is a defect a user only ever meets on the quiet one.
+        """
         other_group = "cccccccc-dddd-eeee-ffff-000000000000"
         group = _found_group(sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path)
         _mock_welcomes(agent_id, (WELCOME_ID, other_group, group.last_commit().welcomes[0]))
 
-        with caplog.at_level("WARNING"):
-            outcome = process_mls_welcomes(sync_client._http, tmp_config_dir, agent_id)
+        with pytest.raises(MlsWelcomeRefusedError) as excinfo:
+            process_mls_welcomes(sync_client._http, tmp_config_dir, agent_id)
 
-        assert outcome.group_ids == ()
-        assert outcome.discarded == 1
+        assert excinfo.value.reason == "group_id_mismatch"
         assert _local_group(tmp_config_dir, agent_id, other_group) is None
+        # Dropped from the spool too: one left there would raise on every later
+        # pass and block every legitimate Welcome behind it.
+        assert os.listdir(welcome_spool_dir(tmp_config_dir, agent_id)) == []
 
     @respx.mock
     def test_installing_a_welcome_tops_the_key_package_pool_back_up(
@@ -297,6 +310,136 @@ def _external_join(sync_client, tmp_config_dir, agent_id) -> int:
 @pytest.fixture(autouse=True)
 def _no_retry_sleep(monkeypatch):
     monkeypatch.setattr(external_join_module, "PENDING_RETRY_DELAY_S", 0)
+
+
+class TestTheNameAWelcomeIsFiledUnder:
+    """The delivery id becomes the file NAME, and the server chooses it.
+
+    MEASURED before the check existed: an id of
+    ``../../../../elsewhere/poison`` wrote outside the spool dir entirely, and
+    on this stack it did not even raise — ``_write_atomic`` calls ``_ensure_dir``,
+    so it creates the traversed directories on the way. The TypeScript twin
+    overwrote ``<configDir>/credentials.json``, which is both the OAuth store
+    and the file the config dir is located by.
+    """
+
+    def test_an_id_that_is_not_a_plain_file_name_is_refused(self):
+        assert is_spoolable_id(WELCOME_ID)
+        # The fixtures both stacks ship use ids like this, and an honest server
+        # is free to reformat its own column, so the rule is "can be a file
+        # name", not "is a UUID".
+        assert is_spoolable_id("welcome-0")
+
+        assert not is_spoolable_id("../../../credentials")
+        assert not is_spoolable_id("a/b")
+        assert not is_spoolable_id("a\\b")
+        assert not is_spoolable_id("..")
+        assert not is_spoolable_id(".hidden")
+        assert not is_spoolable_id("")
+        assert not is_spoolable_id("a" * 129)
+
+    def test_storing_an_escaping_id_writes_nothing(self, tmp_config_dir, agent_id):
+        outside = os.path.join(tmp_config_dir, "poison.json")
+        spool = WelcomeSpool(tmp_config_dir, agent_id)
+
+        with pytest.raises(ValueError, match="plain file name"):
+            spool.store(
+                MlsWelcomeDelivery(id="../../../poison", group_id=GROUP_ID, welcome=b"\x01")
+            )
+
+        assert not os.path.exists(outside)
+
+    @respx.mock
+    def test_a_welcome_named_a_path_is_dropped_and_the_batch_survives(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path, caplog
+    ):
+        # The loss half of the same defect: the TypeScript twin threw out of the
+        # fetch loop, so every Welcome behind the poisoned one was never written
+        # — and the server had already marked them all consumed.
+        group = _found_group(sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path)
+        _mock_welcomes(
+            agent_id,
+            ("../../../poison", GROUP_ID, b"\x00\x01not a welcome"),
+            (WELCOME_ID, GROUP_ID, group.last_commit().welcomes[0]),
+        )
+
+        with caplog.at_level("WARNING"):
+            outcome = process_mls_welcomes(sync_client._http, tmp_config_dir, agent_id)
+
+        assert outcome.group_ids == (GROUP_ID,)
+        assert outcome.discarded == 1
+        assert not os.path.exists(os.path.join(tmp_config_dir, "poison.json"))
+        assert "plain file name" in caplog.text
+
+
+class TestWhatTheSpoolKeeps:
+    """Retention is right; unbounded retention is a tax the server chooses.
+
+    A ``roster_uncorroborated`` refusal for a genuinely substituted Welcome can
+    never clear, so a retained entry can be permanent — and each one costs a
+    real join plus a full roster read on every later pass, on a path that runs
+    on every MLS group send and every failed-decrypt recovery.
+
+    🔴 What the bound costs, stated here rather than buried: an honest Welcome
+    whose refusal has not cleared in a week, or which is the oldest of more than
+    a commit's worth of simultaneously retained refusals, is dropped and only a
+    re-invitation replaces it — which is the remedy the refusal messages name.
+    """
+
+    @staticmethod
+    def _fill(tmp_config_dir, agent_id, ids: list[str], age_seconds: float = 0.0) -> None:
+        """Spool one RETAINED REFUSAL per id, oldest first.
+
+        The mark is what puts an entry in the population the count bound holds.
+        A spooled Welcome no pass has tried yet is deliberately not in it —
+        ``test_mls_welcome_spool.py`` covers that half.
+        """
+        spool = WelcomeSpool(tmp_config_dir, agent_id)
+        now = time.time()
+        for offset, spool_id in enumerate(ids):
+            spool.store(MlsWelcomeDelivery(id=spool_id, group_id=GROUP_ID, welcome=b"\x01"))
+            path = os.path.join(welcome_spool_dir(tmp_config_dir, agent_id), f"{spool_id}.json")
+            spool.mark_refused(path)
+            when = now - age_seconds - (len(ids) - offset)
+            os.utime(path, (when, when))
+
+    def test_more_than_the_cap_drops_the_oldest(self, tmp_config_dir, agent_id):
+        names = [f"w{index:03d}" for index in range(SPOOL_MAX_ENTRIES + 4)]
+        self._fill(tmp_config_dir, agent_id, names)
+
+        assert WelcomeSpool(tmp_config_dir, agent_id).prune() == 4
+
+        # The newest survive: their refusal is the one most likely still to clear.
+        kept = [d.id for _p, d in WelcomeSpool(tmp_config_dir, agent_id).pending()]
+        assert kept == names[4:]
+
+    def test_a_retained_welcome_older_than_the_bound_is_dropped(self, tmp_config_dir, agent_id):
+        self._fill(tmp_config_dir, agent_id, ["old-0", "old-1"], age_seconds=8 * 24 * 60 * 60)
+        self._fill(tmp_config_dir, agent_id, ["new-0"])
+
+        assert WelcomeSpool(tmp_config_dir, agent_id).prune() == 2
+        assert len(WelcomeSpool(tmp_config_dir, agent_id).pending()) == 1
+
+    def test_nothing_past_the_bound_keeps_everything(self, tmp_config_dir, agent_id):
+        self._fill(tmp_config_dir, agent_id, [f"w{index}" for index in range(5)])
+
+        assert WelcomeSpool(tmp_config_dir, agent_id).prune() == 0
+        assert len(WelcomeSpool(tmp_config_dir, agent_id).pending()) == 5
+
+    def test_the_queue_is_ordered_by_write_time_not_by_the_servers_names(
+        self, tmp_config_dir, agent_id
+    ):
+        spool = WelcomeSpool(tmp_config_dir, agent_id)
+        spool.store(MlsWelcomeDelivery(id="zzz", group_id=GROUP_ID, welcome=b"\x01"))
+        spool.store(MlsWelcomeDelivery(id="aaa", group_id=GROUP_ID, welcome=b"\x01"))
+        older = time.time() - 60
+        os.utime(
+            os.path.join(welcome_spool_dir(tmp_config_dir, agent_id), "zzz.json"), (older, older)
+        )
+
+        # The name is the server-chosen delivery id, so a name-ordered queue lets
+        # the server decide which Welcome is processed first.
+        assert [d.id for _p, d in spool.pending()] == ["zzz", "aaa"]
 
 
 class TestExternalJoin:
