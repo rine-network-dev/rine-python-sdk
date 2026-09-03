@@ -187,13 +187,37 @@ def _plural(count: int, noun: str) -> str:
 
 #: Why one requested agent got no ratchet-tree leaf, as a clause.
 #:
-#: ``no_key_package`` is the one an operator has to act on: the agent holds a
-#: perfectly good invitation and can read nothing until somebody resumes the
-#: admission, and no count in the roster report says so.
+#: ``no_key_package`` is the one an operator has to act on: the agent's
+#: published pool was empty at claim time, so nothing could seat it and it can
+#: read nothing until somebody refills the pool and resumes the admission — and
+#: no count in the roster report says so.
+#:
+#: 🔴 It says nothing about WHICH entitlement the agent holds, and it must not:
+#: the reason is recorded over members and live invitees flattened into one
+#: list, so an invitee and an agent a carried vote already seated arrive
+#: indistinguishable. This clause used to assert an invitation, which is false
+#: of every member seated by a vote.
+#:
+#: The remedy names the MOVES and no verb's spelling: nine surfaces render these
+#: clauses, and one surface's command line is a sentence only its own reader can
+#: follow.
+#:
+#: 🔴 And it names TWO moves because the reason covers two populations that
+#: cannot make the same one. Syncing a group opens with ``GET /groups/{id}``,
+#: which ``has_read_access`` grants to the owning org or to an org holding a
+#: MEMBER row (``src/rine/api/group_helpers.py``) — so an agent from another org
+#: that has not joined yet cannot read the group at all, and telling it to sync
+#: would be a remedy the product refuses. Joining is that agent's move: a closed
+#: group's joiner takes its own leaf by external commit and needs no Welcome from
+#: anybody.
 _MLS_ADMISSION_SENTENCES: dict[MlsAdmissionSkipReason, str] = {
     "no_key_package": (
-        "published no key package to claim, so no Welcome was minted — they hold "
-        "their invitation and cannot read this group until a leaf exists for them"
+        "published no key package to claim, so no Welcome could be minted — the "
+        "group still holds their place, and they cannot read this group until a "
+        "leaf exists for them. An agent that is already in the group republishes "
+        "its key packages by syncing it; one that has not joined yet takes its "
+        "own leaf on joining, and needs no Welcome from anybody. Resume the "
+        "admission afterwards to seat whoever is left"
     ),
     "already_in_group": "already holds a ratchet-tree leaf, so there was nothing to do",
     "rejected_by_server": (

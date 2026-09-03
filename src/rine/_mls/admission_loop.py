@@ -17,17 +17,19 @@ Three properties it owes its callers, each of which is a defect it closes:
 * **It claims per batch.** A KeyPackage claim is destructive, so a founding
   refused at its fifth commit used to burn one for every member of the group,
   and a burned pool does not heal on its own.
-* **It never fails whole.** A recipient the server refuses is dropped, the batch
-  is retried **once**, and the outcome is reported per member.
+* **It never fails whole.** A recipient the server refuses is dropped and a lost
+  epoch race is caught up on, each batch is retried **once** per refusal, and the
+  outcome is reported per member. The recovery arms live in
+  :mod:`rine._mls.admission_retry`.
 """
 
 from __future__ import annotations
 
 from rine._logging import logger
-from rine._mls.admission import MlsAdmissionOutcome, MlsAdmissionResult
-from rine._mls.admission_state import Admission, commit_batch, discard_uncommitted
+from rine._mls.admission import MlsAdmissionResult
+from rine._mls.admission_retry import commit_once
+from rine._mls.admission_state import Admission
 from rine._mls.founding import claim_founding_key_packages, mls_founding_batch_sizes
-from rine._mls.wire import rejected_welcome_recipients
 
 
 def run_admission(admission: Admission, candidates: list[str], seated: int) -> MlsAdmissionResult:
@@ -61,7 +63,7 @@ def _split(candidates: list[str], seated: int) -> list[list[str]]:
 
 
 def _admit_batch(admission: Admission, batch: list[str]) -> None:
-    """Claim, commit and record one batch, retrying once past a bad recipient."""
+    """Claim, commit and record one batch."""
     claimed = (
         claim_founding_key_packages(admission.client, batch, admission.extra_headers)
         if batch
@@ -82,70 +84,10 @@ def _admit_batch(admission: Admission, batch: list[str]) -> None:
         return
 
     key_packages = [claimed[a.lower()] for a in joiners]
-    try:
-        commit_batch(admission, joiners, key_packages)
-    except Exception as err:
-        rejected = rejected_welcome_recipients(err)
-        if rejected is None:
-            # Not a recipient refusal — a network failure, a lost epoch CAS, a
-            # 500. Dropping members cannot address it, so it belongs to the
-            # caller.
-            raise
-        _retry_without(admission, joiners, key_packages, rejected)
-        return
-
-    admission.outcomes.extend(MlsAdmissionOutcome(agent_id=a, status="added") for a in joiners)
-
-
-def _retry_without(
-    admission: Admission,
-    joiners: list[str],
-    key_packages: list[bytes],
-    rejected: tuple[str, ...],
-) -> None:
-    """Drop the recipients the server named and commit the batch once more.
-
-    One retry, never a loop: the ``rejected`` array names every offender, so a
-    batch that fails a second time is failing for a reason dropping members
-    cannot fix — and the KeyPackages this batch claimed are spent either way.
-
-    A batch that cannot be salvaged is **recorded and left behind, never
-    raised**. The admission carries on to the next batch, because the batches
-    after this one are a different set of agents whose admission this one's
-    failure says nothing about — and because ``mls_group_id`` is latched by the
-    first commit that landed, so abandoning the loop here would strand every
-    remaining member with no way forward but a resume nobody knows to run. An
-    admission never fails whole.
-    """
-    discard_uncommitted(admission)
-
-    def is_rejected(agent_id: str) -> bool:
-        # A refusal naming nobody this client can read is, as far as it can
-        # tell, about the whole batch: retrying it unchanged would fail
-        # identically, so every recipient is dropped and none is retried.
-        return not rejected or agent_id.lower() in rejected
-
-    kept = [(a, kp) for a, kp in zip(joiners, key_packages, strict=True) if not is_rejected(a)]
-    for agent_id in joiners:
-        if is_rejected(agent_id):
-            admission.skip(agent_id, "rejected_by_server")
-    if not kept:
-        return
-    try:
-        commit_batch(admission, [a for a, _ in kept], [kp for _, kp in kept])
-    except Exception:
-        # The retry is spent. Whatever refused this batch a second time is not
-        # something a third attempt would tell us more about.
-        logger.warning(
-            "MLS batch refused twice — recording %d recipient(s) as rejected and "
-            "continuing with the remaining batches",
-            len(kept),
-        )
-        discard_uncommitted(admission)
-        for agent_id, _ in kept:
-            admission.skip(agent_id, "rejected_by_server")
-        return
-    admission.outcomes.extend(MlsAdmissionOutcome(agent_id=a, status="added") for a, _ in kept)
+    # Founding is the one batch with nothing to catch up to: no group means this
+    # commit creates it, so there is no local state to sync and a conflict says
+    # somebody else founded the group, which no retry mends.
+    commit_once(admission, joiners, key_packages, catch_up=admission.group is not None)
 
 
 __all__ = ["run_admission"]

@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from rine._logging import logger
 from rine.errors import GroupIdentityMismatchError
 
 if TYPE_CHECKING:
@@ -278,6 +279,33 @@ async def walk_async(steps: Generator[LookupRequest, Any, _T], reads: AsyncRefer
         answer = await _asked_for(request, reads)
 
 
+def note_group_id_recipient(reference: str, handle: str) -> None:
+    """Say that a UUID recipient was read as a group, not as an agent.
+
+    A group's own id addresses the group, and a UUID is the one spelling
+    that reaches both namespaces — so a caller who believed it held an agent id
+    would otherwise have a message sealed to every member org of a group with
+    nothing said about it. No silent acceptance: the substitution is announced
+    wherever it is made.
+
+    Quotes the caller's own spelling and the handle it resolved to, and nothing
+    else. A third handle in this sentence, or an ``@org`` slot the caller never
+    typed, is how the template-org rule gets broken.
+
+    It lives here, beside the walk, for the reason the module docstring gives:
+    the two clients hold no copy of a rung, a fallback, a refusal — and none of
+    this sentence either. It is deliberately NOT hoisted into ``rine-core``'s
+    shared prose; each surface says it in its own idiom, and this one's idiom is
+    the ``rine`` logger, because a library that writes to stderr behind its
+    caller's back is a library that cannot be embedded.
+    """
+    logger.warning(
+        "%r is a group id, so this was addressed to the group %r, not to an agent.",
+        reference,
+        handle,
+    )
+
+
 __all__ = [
     "AgentIdFor",
     "AsyncReferenceReads",
@@ -289,6 +317,7 @@ __all__ = [
     "SeatedByHandle",
     "answered_group_id",
     "group_read_refused",
+    "note_group_id_recipient",
     "refuse_a_substituted_group",
     "walk",
     "walk_async",

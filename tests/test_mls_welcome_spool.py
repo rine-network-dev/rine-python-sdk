@@ -212,7 +212,7 @@ class TestThePassCallsTheBound:
 
         monkeypatch.setattr(welcomes_module, "fetch_welcomes", _fetch)
         monkeypatch.setattr(welcomes_module, "welcome_refusal", lambda *_a, **_k: None)
-        monkeypatch.setattr(welcomes_module, "replenish_mls_key_packages", lambda *_a, **_k: None)
+        monkeypatch.setattr(welcomes_module, "mls_heartbeat", lambda *_a, **_k: None)
         monkeypatch.setattr(
             welcomes_module,
             "open_mls_client",
@@ -241,11 +241,7 @@ class TestThePassCallsTheBound:
         WelcomeSpool(tmp_config_dir, agent_id).store(delivery)
         monkeypatch.setattr(welcomes_module, "fetch_welcomes", lambda *_a, **_k: [])
         monkeypatch.setattr(welcomes_module, "open_mls_client", lambda *_a, **_k: _StubClient())
-        monkeypatch.setattr(
-            welcomes_module,
-            "replenish_mls_key_packages",
-            lambda *_a, **_k: None,
-        )
+        monkeypatch.setattr(welcomes_module, "mls_heartbeat", lambda *_a, **_k: None)
         monkeypatch.setattr(
             welcomes_module,
             "welcome_refusal",

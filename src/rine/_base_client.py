@@ -29,10 +29,13 @@ from rine._resolve import is_wire_agent_id
 from rine.errors import (
     ConfigError,
     CryptoError,
+    MlsError,
+    NoMlsGroupStateError,
     NoSenderKeyStateError,
     SenderMismatchError,
     SignatureVerificationError,
 )
+from rine.mls_read_words import mls_read_refusal, sdk_sync_remedy
 from rine.types import CursorPage, GroupSummary
 
 if TYPE_CHECKING:
@@ -332,7 +335,7 @@ class BaseRineClient:
         if no_recovery is not None and isinstance(error, NoSenderKeyStateError):
             msg.decrypt_error = no_recovery.not_recovered(msg, error.sender_key_id)
         else:
-            msg.decrypt_error = str(error)
+            msg.decrypt_error = _refusal_text(msg, error)
             if isinstance(error, NoSenderKeyStateError):
                 msg.decrypt_error_code = error.code
         if isinstance(error, SenderMismatchError):
@@ -350,3 +353,61 @@ class BaseRineClient:
                 "No credentials found. Run: rine onboard\n"
                 "Or set RINE_CLIENT_ID and RINE_CLIENT_SECRET environment variables."
             )
+
+
+#: The MLS core's code for a message no key this agent holds will open.
+#:
+#: Matched as a value, never as a message. It is the ONE code translated here,
+#: and the narrowness is the point: a store failure, a panic and this agent's
+#: own message aged out of the self-read cache all carry different codes and are
+#: all things :func:`~rine._resources.groups.GroupsResource.sync` cannot mend,
+#: so they keep the words they arrived with rather than being handed a remedy
+#: that would not work. An eviction is an :class:`~rine.errors.MlsError` too and
+#: is excluded by the same test — it carries ``group_membership_removed``,
+#: because rine already restates that one as a membership fact.
+_MLS_PROTOCOL_CODE = "RINE_MLS_PROTOCOL"
+
+
+def _refusal_text(msg: DecryptedMessage, error: Exception) -> str:
+    """The sentence for a row that would not open, in rine's words where it has any.
+
+    What this replaced was ``str(error)`` for every cause alike, which on an MLS
+    group row printed mls-rs's own *"the provided length of the key 0 is shorter
+    than the minimum length 32"* — the KDF refusing to derive from an epoch
+    secret this agent never held, stated in a vocabulary that belongs to a Rust
+    crate and names neither the group nor a move. The CLI leaked the same string
+    from its own renderer; both now say the same thing.
+    """
+    if msg.group_id and _is_unopenable_group_read(error):
+        group_id = str(msg.group_id)
+        return mls_read_refusal(group_id, sdk_sync_remedy(group_id))
+    return str(error)
+
+
+def _is_unopenable_group_read(error: Exception) -> bool:
+    """The two failures this sentence answers, and no others.
+
+    🔴 Both arms, because the two are one failure to the agent this phase was
+    opened for. A vote seated it on the roster with no Welcome, so it holds no
+    leaf: the epoch secret it never had surfaces as the core's protocol refusal,
+    and the state it never established surfaces as
+    :class:`~rine.errors.NoMlsGroupStateError` — same agent, same move, and
+    before this only the first got told what the move was. The TypeScript twin
+    is ``isRecoverableMlsRead`` (``rine-core/src/crypto/mls.ts``), which unions
+    the same two.
+
+    The coded arm stays a single value rather than "any code that is not a local
+    failure". Inside :mod:`rine._mls` the twin predicate
+    :func:`~rine._mls.failures.is_recoverable_mls_failure` branches on the core's
+    exception CLASSES, and it cannot be used here: ``mls_boundary`` has already
+    replaced them with :class:`~rine.errors.MlsError`, deliberately, so nothing
+    outside that package holds a type from the compiled wheel. Restating the
+    core's local-failure codes here would be a second copy of its vocabulary in
+    the one place that exists to not have one — and a store failure handed this
+    remedy would send an operator to sync a group whose disk is unwritable.
+    """
+    if isinstance(error, NoMlsGroupStateError):
+        return True
+    return isinstance(error, MlsError) and error.code == _MLS_PROTOCOL_CODE
+
+

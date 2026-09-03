@@ -5,7 +5,14 @@ All errors include three components: what failed, why, and what to try.
 
 from __future__ import annotations
 
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
+
+# Safe as a module-level import in the module every other one imports: ``format``
+# is a leaf, with no runtime imports of its own at all.
+from rine.format import _join_lines, key_package_top_up_line
+
+if TYPE_CHECKING:
+    from rine._group_recovery import KeyPackageTopUp
 
 
 class RineError(Exception):
@@ -466,21 +473,34 @@ class MlsResyncUnavailableError(CryptoError):
     an agent its tree already holds, so the fallback would replace an actionable
     refusal with a protocol error about a leaf the operator never asked about.
 
+    🔴 It carries the recovery's key-package top-up, and that is not decoration.
+    This refusal IS the answer an agent gets when a carried vote seated it with
+    no Welcome — the exact population whose published pool has run out — so the
+    one thing that unblocks the re-admission it asks for is the pool the top-up
+    just refilled. Reporting the top-up only on a returned result would report it
+    everywhere except the case it was built for.
+
     Args:
         group_id: The group that cannot be resynced.
+        key_packages: What the top-up that ran ahead of this refusal did, when
+            one ran.
     """
 
     code = MLS_RESYNC_UNAVAILABLE_CODE
 
-    def __init__(self, group_id: str) -> None:
+    def __init__(self, group_id: str, key_packages: KeyPackageTopUp | None = None) -> None:
         """Build the refusal for one group."""
         self.group_id = group_id
+        self.key_packages = key_packages
         super().__init__(
-            f"Cannot resync MLS group {group_id}: this agent's local group state will not "
-            f"load, and a resync needs it — the leaf a resync replaces is named by the stale "
-            f"state itself and by nothing the server knows. Ask an admin to remove this agent "
-            f"from the group and invite it again; re-admission mints a new leaf and a fresh "
-            f"Welcome."
+            _join_lines(
+                f"Cannot resync MLS group {group_id}: this agent's local group state will not "
+                f"load, and a resync needs it — the leaf a resync replaces is named by the "
+                f"stale state itself and by nothing the server knows. Ask an admin to remove "
+                f"this agent from the group and invite it again; re-admission mints a new leaf "
+                f"and a fresh Welcome.",
+                key_package_top_up_line(key_packages),
+            )
         )
 
 

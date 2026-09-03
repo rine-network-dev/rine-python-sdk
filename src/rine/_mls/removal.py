@@ -27,9 +27,11 @@ from typing import Any
 
 from rine._actor import AGENT_HEADER
 from rine._logging import logger
-from rine._mls.api import MlsCommit, mls_commit, read_group
+from rine._mls.api import MlsCommit, read_group
+from rine._mls.commit import post_mls_commit
 from rine._mls.failures import group_failures, is_epoch_conflict
 from rine._mls.group_access import note_mls_state_changed, open_mls_group
+from rine._mls.heartbeat import MlsActor
 from rine._mls.sync import sync_mls_group
 from rine._mls.tree import fetch_agent_identities, leaf_index
 
@@ -177,8 +179,8 @@ def _post_removal(
     group = open_mls_group(config_dir, agent_id, group_id, cipher_suite=suite)
     leaf = None if identity is None else leaf_index(group, identity)
     bundle = group.add_members([]) if leaf is None else group.remove_member(leaf)
-    epoch = mls_commit(
-        client,
+    epoch = post_mls_commit(
+        MlsActor(client=client, config_dir=config_dir, agent_id=agent_id),
         group_id,
         MlsCommit(
             commit=bundle.commit,

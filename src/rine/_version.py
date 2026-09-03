@@ -9,4 +9,4 @@ holds them together; it is the only thing that does, and it is inside the
 already uploaded irreversibly. Bump both, in the same edit.
 """
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"

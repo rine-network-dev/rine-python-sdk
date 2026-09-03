@@ -24,17 +24,27 @@ not load has no resync at all. The TypeScript twin is
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from rine._actor import AGENT_HEADER
 from rine._logging import logger
-from rine._mls.api import MlsCommit, fetch_group_info, mls_commit
+from rine._mls.api import MlsCommit, fetch_group_info
 from rine._mls.binding import GroupInactiveError, open_mls_client
+from rine._mls.commit import post_mls_commit
 from rine._mls.failures import group_failures, is_epoch_conflict, is_unprocessable_commit
 from rine._mls.group_access import load_mls_group, note_mls_state_changed
+from rine._mls.heartbeat import MlsActor
 from rine._mls.sync import sync_mls_group
 from rine._mls.wire import api_error_code
 from rine.errors import CryptoError, MlsResyncUnavailableError
+
+if TYPE_CHECKING:
+    # Annotation-only, and this module is imported by ``_resources.group_sync``
+    # alongside ``_group_recovery`` itself: a runtime import here would pull the
+    # recovery vocabulary in through the MLS ladder for a field nothing resolves
+    # at run time. Safe because the dataclass below never has its hints read
+    # back — no ``get_type_hints`` call exists anywhere in this package.
+    from rine._group_recovery import KeyPackageTopUp
 
 #: The server's ``error`` key when a replay cannot carry this agent to the group:
 #: it holds no deliverable commit for the gap. The ladder's escalation signal —
@@ -123,6 +133,15 @@ class MlsRecoveryResult:
     """True when recovery ended with this agent out of the ratchet tree: a Remove
     commit it replayed evicted it. The backlog it already holds secrets for still
     opens; nothing committed after the Remove ever will."""
+
+    key_packages: KeyPackageTopUp | None = None
+    """What the key-package top-up that rode along with this recovery did.
+
+    ``None`` when the recovery was not driven through
+    :func:`rine._resources.group_sync.sync_group_state` — this module's own
+    ladder publishes nothing. A surface projecting this into JSON omits the key
+    rather than emitting a null, the ``mls_never_founded_note`` rule. The
+    TypeScript twin is ``keyPackages`` (``rine-core/src/mls-ops-resync.ts``)."""
 
 
 def recover_mls_group(
@@ -306,8 +325,8 @@ def _resync_once(
     bundle = group.last_commit()
     if bundle is None:  # pragma: no cover - a resync always commits
         raise CryptoError(f"MLS resync for group {group_id} produced no commit")
-    epoch = mls_commit(
-        client,
+    epoch = post_mls_commit(
+        MlsActor(client=client, config_dir=config_dir, agent_id=agent_id),
         group_id,
         MlsCommit(
             commit=bundle.commit,

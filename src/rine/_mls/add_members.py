@@ -21,7 +21,7 @@ from rine._mls.admission_state import Admission
 from rine._mls.api import read_group
 from rine._mls.failures import group_failures
 from rine._mls.group_access import holds_mls_state, open_mls_group
-from rine._mls.key_packages import replenish_mls_key_packages
+from rine._mls.heartbeat import MlsActor, mls_heartbeat
 from rine._mls.tree import fetch_agent_identities, leaf_index, read_group_tree
 from rine._mls.welcomes import process_mls_welcomes
 
@@ -94,9 +94,10 @@ def add_mls_group_members(
             recipients it named cannot fix.
     """
     headers = dict(extra_headers or {AGENT_HEADER: agent_id})
-    # Every MLS operation doubles as the heartbeat that keeps this agent's own
-    # KeyPackage pool above its low-water mark, so it never becomes un-addable.
-    replenish_mls_key_packages(client, config_dir, agent_id)
+    # Forced rather than gated: this admission is about to spend key packages.
+    # Each member's own pool is theirs to top up — a client can only publish key
+    # packages for an agent whose signing key it holds.
+    mls_heartbeat(MlsActor(client=client, config_dir=config_dir, agent_id=agent_id), "forced")
 
     with group_failures(group_id):
         # An admitter that has never opened its own Welcome holds no state at

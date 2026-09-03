@@ -17,6 +17,7 @@ from rine._mls.api import fetch_group_info
 from rine._mls.external_join import ExternalJoin, external_join_mls_group
 from rine._mls.failures import is_unprocessable_commit
 from rine._mls.group_access import open_mls_group
+from rine._mls.heartbeat import MlsActor, mls_heartbeat
 from rine._mls.sync_api import MlsHandshake, fetch_handshakes, mls_ack, mls_nack
 
 
@@ -48,6 +49,12 @@ def sync_mls_group(
 ) -> MlsSyncResult:
     """Apply every commit posted to the group since this agent's current epoch.
 
+    Carries the acting agent's key-package heartbeat, which is what covers the
+    verbs that post no commit — the catch-up behind an ordinary read, the replay
+    rung of a recovery, and the retries behind a removal or a reclamation. It
+    beats BEFORE the group handle is opened, so only one MLS handle for this
+    store root is ever live at a time.
+
     Raises:
         NoMlsGroupStateError: When this agent holds no local state for the group.
         MlsStoreError: When the local store cannot be read or written — a failure
@@ -55,6 +62,7 @@ def sync_mls_group(
             the commit.
     """
     headers = {AGENT_HEADER: agent_id}
+    mls_heartbeat(MlsActor(client=client, config_dir=config_dir, agent_id=agent_id), "gated")
     group = open_mls_group(config_dir, agent_id, group_id, cipher_suite=cipher_suite)
     handshakes = fetch_handshakes(client, group_id, group.epoch(), headers)
 

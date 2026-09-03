@@ -152,20 +152,33 @@ def recipient_ladder(
     group reading can only turn a certain refusal into a send or into a better
     refusal. :func:`~rine._group_ref.refuse_if_a_bare_agent_name` is what makes
     that safe, and it runs FIRST, against a list the caller has usually already
-    fetched. Anything carrying the group sigil is a group as written. Everything
-    else — a UUID, a handle, and the empty string — is put to the agent
-    namespace, whose refusal for a reference that names nothing is the clearest
-    sentence either namespace has.
+    fetched. Anything carrying the group sigil is a group as written. A handle
+    and the empty string go to the agent namespace, whose refusal for a
+    reference that names nothing is the clearest sentence either namespace has.
 
-    🔴 There is no "try one, then the other" on either stack, and there must not
-    be: the server refuses a post to a group the acting agent holds no seat in,
-    so a wrong GROUP answer is caught on the wire and a wrong AGENT answer is
-    delivered to somebody.
+    🔴 An ID is the one reference that reaches BOTH namespaces, and it does so
+    on a founder decision rather than on
+    the argument the other classes rest on: a UUID has always been a legitimate
+    agent id, so widening it was not free the way widening a spelling the agent
+    namespace refused on syntax was. What makes it safe is the ORDER, which is
+    the two routes' SCOPES. ``GET /groups/{id}`` answers only for a group this
+    caller's org owns or is seated in (``has_read_access``), while
+    ``GET /agents/{id}/keys`` is unauthenticated and global — so asking the
+    agent side first would prefer a stranger's namespace over the caller's own
+    org's. The group read goes first and a miss falls through to the agent rung
+    below, which still costs nothing for a UUID.
 
-    🔴 The ``id`` class is answered by the AGENT namespace here, and neither the
-    group UUID rung nor its single-row read reaches it. A UUID in the recipient
-    slot goes to :func:`~rine._recipient.agent_recipient` below without entering
-    :func:`group_ladder`; only a reference the classifier calls ``group`` does.
+    🔴 Only the READ is shared with :func:`group_ladder`, never the ladder. That
+    one spends :class:`~rine._recipient_reads.OwnGroups` and RAISES on a miss,
+    which here would refuse every agent id in the product. The JOIN ladder's
+    UUID rung is a third question again — it passes an id through unread,
+    because a joiner holds no seat this org-scoped route would answer for — and
+    the three must not be unified.
+
+    🔴 There is no ambiguity arm and none may be added. Both id spaces are
+    minted server-side and no route accepts a caller-supplied primary key, so a
+    UUID naming an agent AND a group is not constructible; a refusal for it
+    would document a state the product cannot reach.
 
     Args:
         reference: The recipient, normalised the way ``send()`` normalises it.
@@ -181,6 +194,10 @@ def recipient_ladder(
         return group_recipient(group_target(row, said), said)
     if kind == REF_CLASS_GROUP:
         return group_recipient((yield from group_ladder(reference, said)), said)
+    if kind == REF_CLASS_ID:
+        readable = yield GroupById(reference)
+        if readable is not None:
+            return group_recipient(group_target(readable, said), said)
     agent_id = yield AgentIdFor(reference)
     return agent_recipient(agent_id, reference, said)
 

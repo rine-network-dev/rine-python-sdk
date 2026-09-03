@@ -52,12 +52,20 @@ from rine._group_ref import (
 from rine._http import SyncHttpClient
 from rine._logging import logger
 from rine._onboard import create_agent as _create_agent
-from rine._recipient import GroupTarget, RecipientTarget, group_target_by_id
+from rine._recipient import (
+    REF_CLASS_GROUP,
+    REF_CLASS_ID,
+    GroupTarget,
+    RecipientTarget,
+    classify_reference,
+    group_target_by_id,
+)
 from rine._recipient_ladder import group_ladder, recipient_ladder
 from rine._recipient_reads import (
     ReferenceReads,
     answered_group_id,
     group_read_refused,
+    note_group_id_recipient,
     refuse_a_substituted_group,
     walk,
 )
@@ -547,6 +555,22 @@ class SyncRineClient(BaseRineClient):
         """
         return str(self.resolve_recipient(name, agent).handle)
 
+    def _group_handle_for_id_recipient(self, reference: str, agent: str | None) -> str:
+        """The group handle a UUID ``send()`` recipient names — or the UUID, unchanged.
+
+        The synchronous twin of :meth:`rine.RineClient._group_handle_for_id_recipient`,
+        which carries the whole argument: why the group probe goes first, why the
+        ``kind`` test rather than the presence of an answer decides the rewrite,
+        and why the dispatch above asks the shared classification table rather
+        than :func:`~rine._resolve.is_uuid`.
+        """
+        target = self.resolve_recipient(reference, agent)
+        if target.kind != "group":
+            return reference
+        handle = str(target.handle)
+        note_group_id_recipient(reference, handle)
+        return handle
+
     # --- Messaging ---
 
     def send(
@@ -571,10 +595,15 @@ class SyncRineClient(BaseRineClient):
         :meth:`_group_handle_for_sigil_recipient`, so the spelling every other
         group verb accepts is accepted here too.
 
+        A **UUID** is the one spelling that can name either namespace. It is
+        offered to the group first and sent to the group when this org can read
+        one of that id (:meth:`_group_handle_for_id_recipient`); anything else
+        is the agent id it has always been.
+
         Args:
-            to: Recipient handle, UUID, group handle (``#logistics@acme.rine.network``),
-                ``#name`` without the org, or the bare name of a group this org
-                is in.
+            to: Recipient handle, agent UUID, group UUID, group handle
+                (``#logistics@acme.rine.network``), ``#name`` without the org,
+                or the bare name of a group this org is in.
             payload: JSON-serializable message payload.
             message_type: Message type.
             agent: Agent to send as.
@@ -601,6 +630,8 @@ class SyncRineClient(BaseRineClient):
             to = self._group_handle_for_bare_recipient(to, agent)
         elif is_sigil_group_reference(to):
             to = self._group_handle_for_sigil_recipient(to, agent)
+        elif classify_reference(to) == REF_CLASS_ID:
+            to = self._group_handle_for_id_recipient(to, agent)
 
         is_group = to.startswith("#")
         if is_group:
@@ -1082,6 +1113,22 @@ class SyncRineClient(BaseRineClient):
         )
         return MessageRead.model_validate(data)
 
+    def _a_group_the_sync_endpoint_refuses(self, to: str, agent: str | None) -> bool:
+        """Whether a ``send_and_wait`` recipient names a group — this verb's rule.
+
+        The synchronous twin of
+        :meth:`rine.RineClient._a_group_the_sync_endpoint_refuses`, which
+        carries the whole argument: the two classes that name a group on this
+        verb, why the UUID probe is eager rather than a reaction to the 1:1
+        path's ``404``, and why a bare word is deliberately not one of them.
+        """
+        kind = classify_reference(to)
+        if kind == REF_CLASS_GROUP:
+            return True
+        if kind != REF_CLASS_ID:
+            return False
+        return self._readable_group_by_id(to, agent) is not None
+
     def send_and_wait(
         self,
         to: str,
@@ -1097,10 +1144,14 @@ class SyncRineClient(BaseRineClient):
         creates the message AND long-polls for a reply in one atomic call.
         Returns ``SendAndWaitResult`` with ``reply=None`` on timeout.
 
-        Note: group handles are not supported by the sync endpoint.
+        Note: the sync endpoint is 1:1 only, so a group is refused before
+        anything is sealed — named by handle or named by its own id
+        (:meth:`_a_group_the_sync_endpoint_refuses`). Use :meth:`send` for a
+        group.
 
         Args:
-            to: Recipient handle or UUID (not a group handle).
+            to: Recipient handle or agent UUID. A group is not a legal
+                recipient here, by handle or by id.
             payload: Message payload.
             message_type: Message type.
             timeout: Max wait time in seconds (1-300).
@@ -1108,8 +1159,11 @@ class SyncRineClient(BaseRineClient):
 
         Returns:
             SendAndWaitResult with sent message and reply (or None on timeout).
+
+        Raises:
+            UnsupportedTargetError: The recipient names a group.
         """
-        if to.startswith("#"):
+        if self._a_group_the_sync_endpoint_refuses(to, agent):
             raise UnsupportedTargetError(
                 "send_and_wait() does not support group handles — "
                 "the /messages/sync endpoint is 1:1 only. "

@@ -25,7 +25,7 @@ import pytest
 import respx
 
 from rine._crypto.sender_keys_helpers import mark_sender_keys_retired
-from rine._group_recovery import SenderKeyRecoveryResult
+from rine._group_recovery import KeyPackageTopUp, SenderKeyRecoveryResult
 from rine._mls.resync import MlsRecoveryResult
 from rine.format import (
     MLS_NEVER_FOUNDED_NOTE,
@@ -102,7 +102,17 @@ def _scan_page(agent_id: str, row_id: str, total: int):
 
 
 def _fake_ladder(monkeypatch, result: MlsRecoveryResult = REPLAYED) -> list[tuple]:
-    """Stand in for the MLS ladder, recording what it was asked to recover."""
+    """Stand in for the MLS ladder, recording what it was asked to recover.
+
+    Also stands in for the key-package top-up that rides ahead of the ladder,
+    reporting a healthy pool so it adds nothing to the answer. Not optional: the
+    top-up publishes at the transport, so an MLS arm that stubbed only the ladder
+    would read a mocked-transport failure back as part of its result and every
+    assertion here would be about that. What the top-up itself does — that it
+    really runs, really reaches the wire, and really rides on the refusal — is
+    ``tests/contract/test_group_sync_topup_contract.py``, against the real one,
+    which is where the gate that ci.sh runs lives.
+    """
     calls: list[tuple] = []
 
     def _recover(client, config_dir, agent_id, group_id, *, cipher_suite=None):
@@ -110,6 +120,10 @@ def _fake_ladder(monkeypatch, result: MlsRecoveryResult = REPLAYED) -> list[tupl
         return result
 
     monkeypatch.setattr("rine._resources.group_sync.recover_mls_group", _recover)
+    monkeypatch.setattr(
+        "rine._resources.group_sync.top_up_key_packages",
+        lambda _actor: KeyPackageTopUp(outcome="healthy"),
+    )
     return calls
 
 
@@ -303,7 +317,9 @@ class TestSyncGroupMls:
 
         result = sync_client.groups.sync(GROUP_ID)
 
-        assert result is REPLAYED
+        # Equal, not identical: the arm re-mints the ladder's result to hang the
+        # top-up on it, and a healthy pool hangs nothing.
+        assert result == REPLAYED
         assert result.regime == "mls"
         assert calls == [(sync_client._config_dir, agent_id, GROUP_ID, 61015)]
 
@@ -607,7 +623,7 @@ class TestAsyncGroupSync:
 
         result = await async_client.groups.sync(GROUP_ID)
 
-        assert result is REPLAYED
+        assert result == REPLAYED
         assert calls == [(async_client._config_dir, agent_id, GROUP_ID, 61015)]
         await async_client.close()
 

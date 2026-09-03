@@ -19,9 +19,9 @@ from rine._crypto.keys import (
     signing_public_key_to_jwk,
 )
 from rine._crypto.message import encrypt_message
-from tests.conftest import recipient_view
 from rine._utils import to_base64url
 from rine.types import DecryptedMessage, ThreadEntry
+from tests.conftest import recipient_view
 
 API = "https://rine.network"
 AGENT_ID = "00000000-1111-2222-3333-444444444444"  # matches conftest fixtures
@@ -49,6 +49,21 @@ def _mock_agents() -> None:
                 ]
             },
         )
+    )
+
+
+def _mock_no_group_of_that_id(uuid: str) -> None:
+    """Answer the group probe a UUID recipient costs, the way the real route answers it.
+
+    ``send()`` offers a UUID to this org's groups before the agent namespace
+    By ratified decision: ``GET /groups/{id}`` is org-scoped
+    where ``GET /agents/{id}/keys`` is global, so asking the agent side first
+    would prefer a stranger's namespace over the caller's own org's. A peer's
+    AGENT id names no group, the route 404s, and the send falls through to the
+    1:1 path these tests are about.
+    """
+    respx.get(f"{API}/groups/{uuid}").mock(
+        return_value=httpx.Response(404, json={"detail": "Group not found"})
     )
 
 
@@ -174,6 +189,7 @@ class TestSelfSealOnSend:
         """A 1:1 send POSTs self_encrypted_payload (async)."""
         _mock_token()
         _mock_agents()
+        _mock_no_group_of_that_id(PEER_ID)
         peer_keys = generate_agent_keys()
         respx.get(f"{API}/agents/{PEER_ID}/keys").mock(
             return_value=httpx.Response(
@@ -217,6 +233,7 @@ class TestSelfSealOnSend:
         """A 1:1 send POSTs self_encrypted_payload (sync)."""
         _mock_token()
         _mock_agents()
+        _mock_no_group_of_that_id(PEER_ID)
         peer_keys = generate_agent_keys()
         respx.get(f"{API}/agents/{PEER_ID}/keys").mock(
             return_value=httpx.Response(

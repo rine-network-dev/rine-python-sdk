@@ -53,12 +53,20 @@ from rine._group_ref import (
 from rine._http import AsyncHttpClient
 from rine._logging import logger
 from rine._onboard import create_agent as _create_agent
-from rine._recipient import GroupTarget, RecipientTarget, group_target_by_id
+from rine._recipient import (
+    REF_CLASS_GROUP,
+    REF_CLASS_ID,
+    GroupTarget,
+    RecipientTarget,
+    classify_reference,
+    group_target_by_id,
+)
 from rine._recipient_ladder import group_ladder, recipient_ladder
 from rine._recipient_reads import (
     AsyncReferenceReads,
     answered_group_id,
     group_read_refused,
+    note_group_id_recipient,
     refuse_a_substituted_group,
     walk_async,
 )
@@ -590,6 +598,43 @@ class RineClient(BaseRineClient):
         """
         return str((await self.resolve_recipient(name, agent)).handle)
 
+    async def _group_handle_for_id_recipient(self, reference: str, agent: str | None) -> str:
+        """The group handle a UUID ``send()`` recipient names — or the UUID, unchanged.
+
+        By ratified decision, a group's own id addresses the group. The rung
+        and the whole argument for it are the id arm of
+        :func:`rine._recipient_ladder.recipient_ladder`; this is that answer's
+        handle, exactly as its two siblings above are theirs.
+
+        🔴 **The one arm that can decline to rewrite**, and why the ``kind``
+        test is load-bearing: a UUID is the single spelling that reaches BOTH
+        namespaces, and it has been a legitimate agent id for as long as the
+        product has existed. So the ladder's group probe runs first — ``GET
+        /groups/{id}`` is org-scoped where ``GET /agents/{id}/keys`` is global,
+        so asking the agent side first would prefer a stranger's namespace over
+        the caller's own org's — and a 404 or 403 falls through to the agent
+        rung, which returns the id it was given without a request. An agent id
+        therefore reaches :meth:`_encrypt_dm` exactly as it always has, and the
+        widening costs one org-scoped read. A read that fails any other way is
+        not an answer about the reference and propagates
+        (:func:`rine._recipient_reads.group_read_refused`).
+
+        ⚠️ Do not narrow this to ``is_uuid``: the dispatch above is the one
+        classification table both stacks share
+        (:func:`rine._recipient.classify_reference`), and Python already holds a
+        looser reading of a UUID that is deliberately not wired into it.
+
+        The handle is taken the way the siblings take it — a group answer is
+        never quietly discarded back onto the 1:1 path, where a group id would
+        become the ``Agent not found`` this rung exists to eliminate.
+        """
+        target = await self.resolve_recipient(reference, agent)
+        if target.kind != "group":
+            return reference
+        handle = str(target.handle)
+        note_group_id_recipient(reference, handle)
+        return handle
+
     # --- Messaging ---
 
     async def send(
@@ -617,10 +662,15 @@ class RineClient(BaseRineClient):
         :meth:`_group_handle_for_sigil_recipient`, so the spelling every other
         group verb accepts is accepted here too.
 
+        A **UUID** is the one spelling that can name either namespace. It is
+        offered to the group first and sent to the group when this org can read
+        one of that id (:meth:`_group_handle_for_id_recipient`); anything else
+        is the agent id it has always been.
+
         Args:
-            to: Recipient handle, UUID, group handle (``#logistics@acme.rine.network``),
-                ``#name`` without the org, or the bare name of a group this org
-                is in.
+            to: Recipient handle, agent UUID, group UUID, group handle
+                (``#logistics@acme.rine.network``), ``#name`` without the org,
+                or the bare name of a group this org is in.
             payload: JSON-serializable message payload.
             message_type: Message type (default: ``rine.v1.task_request``).
             agent: Agent to send as (for multi-agent orgs).
@@ -647,6 +697,8 @@ class RineClient(BaseRineClient):
             to = await self._group_handle_for_bare_recipient(to, agent)
         elif is_sigil_group_reference(to):
             to = await self._group_handle_for_sigil_recipient(to, agent)
+        elif classify_reference(to) == REF_CLASS_ID:
+            to = await self._group_handle_for_id_recipient(to, agent)
 
         is_group = to.startswith("#")
 
@@ -1144,6 +1196,53 @@ class RineClient(BaseRineClient):
         )
         return MessageRead.model_validate(data)
 
+    async def _a_group_the_sync_endpoint_refuses(self, to: str, agent: str | None) -> bool:
+        """Whether a ``send_and_wait`` recipient names a group — this verb's rule.
+
+        ``POST /messages/sync`` is 1:1 only, so this verb never resolves a
+        recipient INTO a group the way :meth:`send` does; it only has to
+        RECOGNISE one and refuse before anything is sealed. Two classes name a
+        group:
+
+        * anything carrying the group sigil, as written — the shared table's
+          reading (:func:`rine._recipient.classify_reference`), which is why
+          ``#ops`` with no org half is refused here exactly as
+          ``#ops@acme.rine.network`` is;
+        * a **UUID this org may read a group of**, which costs the one
+          org-scoped :meth:`_readable_group_by_id` the same id already costs on
+          :meth:`send`.
+
+        🔴 **The UUID probe is EAGER, and the lazy variant is rejected rather
+        than unbuilt.** Probing only after the 1:1 path had answered
+        ``404: Agent not found`` would save one GET on a verb that then
+        long-polls for up to 300 seconds, and would buy two different request
+        orders for one question across two stacks — the drift the recipient
+        contract gates exist for. The TypeScript twin is
+        ``MessagesResource.syncSendTarget`` (``rine-ts-sdk``), and
+        ``groupIsNotASyncRecipient`` (``rine-mcp``) is the same answer on the
+        surface that reached it first.
+
+        🔴 **A bare word is deliberately NOT a group here**, unlike on
+        :meth:`send`. That door reads an unsigiled word as a group NAME, and
+        routing this verb through it would turn a certain agent-namespace
+        refusal into a group send ``/messages/sync`` then rejects. What this
+        recognises is the two classes that name a group as written or on the
+        wire, and nothing else.
+
+        Args:
+            to: The recipient, as the caller wrote it.
+            agent: The agent the probe is attributed to.
+
+        Returns:
+            Whether the recipient names a group, so the caller must refuse.
+        """
+        kind = classify_reference(to)
+        if kind == REF_CLASS_GROUP:
+            return True
+        if kind != REF_CLASS_ID:
+            return False
+        return await self._readable_group_by_id(to, agent) is not None
+
     async def send_and_wait(
         self,
         to: str,
@@ -1159,10 +1258,14 @@ class RineClient(BaseRineClient):
         creates the message AND long-polls for a reply in one atomic call.
         Returns ``SendAndWaitResult`` with ``reply=None`` on timeout.
 
-        Note: group handles are not supported by the sync endpoint.
+        Note: the sync endpoint is 1:1 only, so a group is refused before
+        anything is sealed — named by handle or named by its own id
+        (:meth:`_a_group_the_sync_endpoint_refuses`). Use :meth:`send` for a
+        group.
 
         Args:
-            to: Recipient handle or UUID (not a group handle).
+            to: Recipient handle or agent UUID. A group is not a legal
+                recipient here, by handle or by id.
             payload: Message payload.
             message_type: Message type.
             timeout: Max wait time in seconds (1-300).
@@ -1170,8 +1273,11 @@ class RineClient(BaseRineClient):
 
         Returns:
             SendAndWaitResult with sent message and reply (or None on timeout).
+
+        Raises:
+            UnsupportedTargetError: The recipient names a group.
         """
-        if to.startswith("#"):
+        if await self._a_group_the_sync_endpoint_refuses(to, agent):
             raise UnsupportedTargetError(
                 "send_and_wait() does not support group handles — "
                 "the /messages/sync endpoint is 1:1 only. "

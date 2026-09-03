@@ -20,6 +20,7 @@ from rine._mls.admission import MlsAdmissionResult
 from rine.format import (
     _ENCRYPTION_WORDS,
     MLS_NEVER_FOUNDED_NOTE,
+    _join_lines,
     GroupEncryption,
     describe_group_encryption,
     group_accepts_mls_send_only,
@@ -415,3 +416,42 @@ class TestGroupEncryptionWord:
                 assert unfounded_group_note("none") in said
             else:
                 assert _ENCRYPTION_WORDS[word]
+
+
+class TestJoinLines:
+    """The seam four sites used to hand-roll, and the case none of them asserted.
+
+    The recorded failure mode of a hand-rolled copy is getting the empty case
+    backwards, which emits a LEADING BLANK LINE into an operator's answer — and
+    ``driver_framework_ts_admin.mjs`` and ``container_admin.py`` match these
+    answers' heads with ``^``-anchored regexes, so a blank first line is read as
+    the surface refusing: a successful recovery graded as a broken one. Nothing
+    asserted it before this class. The TypeScript twin is the ``joinLines``
+    block in ``rine-core/test/mls-recovery-format.test.ts``.
+    """
+
+    def test_join_lines_when_there_is_no_tail_then_the_head_comes_back_alone(self):
+        assert _join_lines("head", "") == "head"
+        assert _join_lines("head", None) == "head"
+
+    def test_join_lines_when_there_is_no_head_then_no_leading_newline(self):
+        assert _join_lines("", "tail") == "tail"
+
+    def test_join_lines_when_both_halves_are_empty_then_the_answer_is_empty(self):
+        assert _join_lines("", "") == ""
+        assert _join_lines("", None) == ""
+
+    def test_join_lines_when_both_halves_are_present_then_exactly_one_newline(self):
+        assert _join_lines("head", "tail") == "head\ntail"
+
+    def test_join_lines_when_any_half_is_absent_then_no_blank_first_or_last_line(self):
+        for first in ("", "head"):
+            for second in ("", None, "tail"):
+                said = _join_lines(first, second)
+                assert not said.startswith("\n")
+                assert not said.endswith("\n")
+
+    def test_join_lines_when_a_half_carries_its_own_spacing_then_it_is_untouched(self):
+        # It joins; it never normalises. Every tail it appends is a sentence two
+        # matrix drivers match, so rewriting one is the thing it may not do.
+        assert _join_lines("head.", " tail ") == "head.\n tail "

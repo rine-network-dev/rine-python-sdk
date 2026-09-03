@@ -21,13 +21,15 @@ from rine._mls.admission import (
     MlsAdmissionResult,
     MlsAdmissionSkipReason,
 )
-from rine._mls.api import MlsCommit, MlsWelcome, mls_commit
+from rine._mls.api import MlsCommit, MlsWelcome
 from rine._mls.binding import MlsGroup, UnreadableKeyPackageError, open_mls_client
+from rine._mls.commit import post_mls_commit
 from rine._mls.group_access import (
     mls_group_id_bytes,
     note_mls_state_changed,
     open_mls_group,
 )
+from rine._mls.heartbeat import MlsActor
 from rine.errors import CryptoError
 
 _UNREADABLE_KEY_PACKAGE = (
@@ -108,8 +110,12 @@ def commit_batch(admission: Admission, joiners: list[str], key_packages: list[by
     except UnreadableKeyPackageError as exc:
         raise CryptoError(_UNREADABLE_KEY_PACKAGE.format(named=", ".join(joiners))) from exc
 
-    admission.epoch = mls_commit(
-        admission.client,
+    admission.epoch = post_mls_commit(
+        MlsActor(
+            client=admission.client,
+            config_dir=admission.config_dir,
+            agent_id=admission.agent_id,
+        ),
         admission.group_id,
         MlsCommit(
             commit=bundle.commit,

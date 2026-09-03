@@ -31,7 +31,7 @@ from rine._mls.binding import (
     open_mls_client,
 )
 from rine._mls.group_access import load_mls_group, note_mls_state_changed
-from rine._mls.key_packages import replenish_mls_key_packages
+from rine._mls.heartbeat import MlsActor, mls_heartbeat
 from rine._mls.welcome_guard import (
     MlsWelcomeRefusedError,
     refusal_is_retryable,
@@ -181,12 +181,14 @@ def process_mls_welcomes(
             joined.append(group_id)
         spool.discard(path)
 
-    # Every processed Welcome consumed one of this agent's published KeyPackages.
-    # This is the only path on which an agent's own pool shrinks, so it is where
-    # topping it back up matters most: without it the agent silently becomes
-    # un-addable once its onboarding batch runs out. Before the refusal, so a
-    # substituted Welcome cannot cost this agent its pool as well.
-    replenish_mls_key_packages(client, config_dir, agent_id)
+    # Every processed Welcome consumed one of this agent's published KeyPackages,
+    # and this is the only path on which an agent's own pool shrinks — so the beat
+    # here is forced, never gated: waiting out a floor would leave the agent short
+    # in exactly the window a peer is most likely to add it. Unconditional within
+    # the pass, because a pass whose Welcomes were all refused is a pass where the
+    # pool matters more, not less. Before the refusal, so a substituted Welcome
+    # cannot cost this agent its pool as well.
+    mls_heartbeat(MlsActor(client=client, config_dir=config_dir, agent_id=agent_id), "forced")
     refused = _pick_refusal(refusals, for_group)
     for entry in refusals:
         # Everything this pass refused and did not raise, said once — on the pass

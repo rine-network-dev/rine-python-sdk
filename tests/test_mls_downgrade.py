@@ -369,7 +369,7 @@ def _join_by_welcome(monkeypatch, config_dir: str, agent_id: str, tmp_path) -> N
         monkeypatch,
         "rine._mls.welcomes",
         fetch_welcomes=lambda *_a: [delivery],
-        replenish_mls_key_packages=lambda *_a: None,
+        mls_heartbeat=lambda *_a: None,
     )
     assert process_mls_welcomes(None, config_dir, agent_id).group_ids == (GROUP_ID,)
 
@@ -402,12 +402,16 @@ class TestMemoAcrossAStateChange:
         _patch(
             monkeypatch,
             "rine._mls.group_init",
-            replenish_mls_key_packages=lambda *_a: None,
+            mls_heartbeat=lambda *_a: None,
             mls_init=lambda *_a: [MlsMemberStatus(agent_id=READER_V, has_key_package=True)],
         )
         # Founding creates the native state inside the shared admission loop, so
         # that is where the commit is published from and where it is stubbed.
-        _patch(monkeypatch, "rine._mls.admission_state", mls_commit=lambda *_a: 1)
+        # ``post_mls_commit`` and not ``mls_commit``: the wire call now sits
+        # behind the seam that also beats the key-package heartbeat, and stubbing
+        # the inner one would leave the heartbeat publishing at a server that is
+        # not there.
+        _patch(monkeypatch, "rine._mls.admission_state", post_mls_commit=lambda *_a, **_k: 1)
         init_mls_group(None, tmp_config_dir, READER_V, GROUP_ID, {})
 
         with pytest.raises(MlsDowngradeError):
@@ -424,7 +428,7 @@ class TestMemoAcrossAStateChange:
             monkeypatch,
             "rine._mls.external_join",
             fetch_group_info=lambda *_a: MlsGroupInfo(blob=group.group_info(), epoch=1),
-            mls_commit=lambda *_a: 2,
+            post_mls_commit=lambda *_a, **_k: 2,
         )
         external_join_mls_group(
             ExternalJoin(

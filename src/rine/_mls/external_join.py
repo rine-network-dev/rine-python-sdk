@@ -19,9 +19,11 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from rine._mls.api import MlsCommit, fetch_group_info, mls_commit
+from rine._mls.api import MlsCommit, fetch_group_info
 from rine._mls.binding import open_mls_client
+from rine._mls.commit import post_mls_commit
 from rine._mls.group_access import note_mls_state_changed
+from rine._mls.heartbeat import MlsActor
 from rine._mls.wire import api_error_code
 from rine.errors import CryptoError
 
@@ -116,8 +118,8 @@ def _attempt(join: ExternalJoin) -> int:
     if bundle is None:  # pragma: no cover - an external join always commits
         raise CryptoError(f"External MLS self-join for group {join.group_id} produced no commit")
 
-    epoch = mls_commit(
-        join.client,
+    epoch = post_mls_commit(
+        MlsActor(client=join.client, config_dir=join.config_dir, agent_id=join.agent_id),
         join.group_id,
         MlsCommit(
             commit=bundle.commit,

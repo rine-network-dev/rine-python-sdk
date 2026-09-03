@@ -226,6 +226,21 @@ def _mock_invitee_keys(tmp_config_dir: str) -> None:
     )
 
 
+def _mock_no_group_of_that_id(uuid: str) -> None:
+    """Answer the group probe a UUID recipient costs, the way the real route answers it.
+
+    ``send()`` offers a UUID to this org's groups before the agent namespace
+    By ratified decision: ``GET /groups/{id}`` is org-scoped
+    where ``GET /agents/{id}/keys`` is global, so asking the agent side first
+    would prefer a stranger's namespace over the caller's own org's. An
+    invitee's AGENT id names no group, the route 404s, and the send falls
+    through to the 1:1 path — which is the whole of what these tests assert.
+    """
+    respx.get(f"https://rine.network/groups/{uuid}").mock(
+        return_value=httpx.Response(404, json={"detail": "Group not found"})
+    )
+
+
 class TestSyncGroupsCreate:
     @respx.mock
     def test_create_returns_group_read(self, sync_client, landed_mls_init):
@@ -1525,6 +1540,7 @@ class TestSyncGroupsInviteNotification:
         _mock_group_read()
         _mock_agents()
         _mock_invitee_keys(tmp_config_dir)
+        _mock_no_group_of_that_id(OTHER_AGENT_ID)
         respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
             return_value=httpx.Response(201, json=_OPEN_INVITE_PAYLOAD)
         )
@@ -1567,6 +1583,7 @@ class TestAsyncGroupsInviteNotification:
         _mock_group_read()
         _mock_agents()
         _mock_invitee_keys(tmp_config_dir)
+        _mock_no_group_of_that_id(OTHER_AGENT_ID)
         respx.post(f"https://rine.network/groups/{GROUP_ID}/invite").mock(
             return_value=httpx.Response(201, json=_OPEN_INVITE_PAYLOAD)
         )

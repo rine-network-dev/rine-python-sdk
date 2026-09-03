@@ -424,9 +424,7 @@ class TestTheSeatedRecordIsWholeWhereverTheLadderRead:
             )
             return
         assert taken, f"{rung}: expected a read"
-        assert answered.row == OPS, (
-            f"{rung}: paid for a listing and answered with no row"
-        )
+        assert answered.row == OPS, f"{rung}: paid for a listing and answered with no row"
         assert answered.handle == OPS["handle"], (
             f"{rung}: answered with no handle, which is the column POST /messages "
             "addresses by exact equality"
@@ -501,7 +499,38 @@ class TestResolveRecipient:
         )
         assert taken == ["GET /.well-known/webfinger"]
 
-    async def test_a_uuid_recipient_is_an_agent_and_costs_nothing(self, async_client, sync_client):
+    async def test_a_uuid_that_names_a_group_is_that_group_on_both_clients(
+        self, async_client, sync_client
+    ):
+        # 🔴 A group's own id used to be adopted verbatim as an AGENT id on
+        # both stacks and fail at the outbound key fetch with "Agent not found",
+        # a sentence about the namespace the caller did not name. The row's own
+        # handle comes back, which is the column ``POST /messages`` addresses.
+        answered, taken = await _twin(
+            async_client, sync_client, "resolve_recipient", GROUP_UUID, groups=[OPS]
+        )
+
+        assert answered == RecipientTarget(
+            kind="group",
+            id=GROUP_UUID,
+            handle="#ops@acme.rine.network",
+            spelling=GROUP_UUID,
+            row=OPS,
+        )
+        # One indexed row and no roster. The recipient slot shares the id READ
+        # with the member ladder and never the ladder itself — that one buys
+        # ``GET /groups`` on a miss and raises, which here would refuse every
+        # agent id in the product.
+        assert taken == [f"GET /groups/{GROUP_UUID}"]
+
+    async def test_a_uuid_no_group_answers_to_is_an_agent_after_one_indexed_miss(
+        self, async_client, sync_client
+    ):
+        # The other half of the same arm, and why the group is asked FIRST:
+        # ``GET /groups/{id}`` is org-scoped and ``GET /agents/{id}/keys`` is
+        # unauthenticated and global, so agent-first would prefer a stranger's
+        # namespace over the caller's own org's. The agent rung is untouched —
+        # it still answers with the id and spends no request of its own.
         answered, taken = await _twin(
             async_client, sync_client, "resolve_recipient", KOFI_ID, agents=[KOFI]
         )
@@ -509,7 +538,56 @@ class TestResolveRecipient:
         assert answered.kind == "agent"
         assert answered.id == KOFI_ID
         assert answered.handle is None
-        assert taken == []
+        # 🔴 The whole cost of the widening, pinned as a list rather than a
+        # count, and identical on both clients.
+        assert taken == [f"GET /groups/{KOFI_ID}"]
+
+    async def test_a_uuid_the_group_route_403s_falls_through_to_the_agent_rung(
+        self, async_client, sync_client
+    ):
+        # 403 and 404 are one answer by disclosure rule, so a group belonging to
+        # another org reaches the agent rung exactly as an unknown id does
+        # rather than refusing a spelling that may well name an agent.
+        answered, taken = await _twin(
+            async_client,
+            sync_client,
+            "resolve_recipient",
+            KOFI_ID,
+            agents=[KOFI],
+            refuse_by_id={KOFI_ID: 403},
+        )
+
+        assert answered.kind == "agent"
+        assert answered.id == KOFI_ID
+        assert taken == [f"GET /groups/{KOFI_ID}"]
+
+    async def test_a_uuid_the_group_route_faulted_on_is_not_read_as_an_agent(
+        self, async_client, sync_client
+    ):
+        # 🔴 The asymmetry decides this: a wrong GROUP answer is refused by the
+        # server's seat gate, a wrong AGENT answer is delivered to somebody. So
+        # a 500 has to surface as itself — swallowing it into the agent rung
+        # would seal this payload for whoever holds that id. Driven by hand
+        # rather than through ``_twin``, because the whole claim is that this
+        # escapes as ITSELF and ``_twin`` captures only the two refusal types.
+        fault = {KOFI_ID: 500}
+
+        with mocked_server([], [KOFI], fault) as taken:
+            with pytest.raises(InternalServerError):
+                await async_client.resolve_recipient(KOFI_ID)
+            async_calls = list(taken)
+        await async_client.close()
+
+        with mocked_server([], [KOFI], fault) as taken:
+            with pytest.raises(InternalServerError):
+                sync_client.resolve_recipient(KOFI_ID)
+            sync_calls = list(taken)
+
+        assert async_calls == sync_calls
+        # The set, not the list: a 500 is retryable and how many times the
+        # transport asks is not the ladder's business. What is pinned is that no
+        # agent read was reached at all.
+        assert set(async_calls) == {f"GET /groups/{KOFI_ID}"}
 
     async def test_a_handle_webfinger_cannot_place_comes_back_unvalidated(
         self, async_client, sync_client

@@ -1155,6 +1155,97 @@ class TestReadDegrades:
         assert msg.decrypt_error is not None
 
     @respx.mock
+    def test_a_row_committed_before_this_agents_leaf_says_so_in_rines_words(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """The measured leak, and the reason a reader could do nothing with it.
+
+        The peer sends one epoch before this agent has a leaf, so no key it will
+        ever hold opens that row — correct MLS behaviour, reported by the core as
+        mls-rs's own KDF refusal: *the provided length of the key 0 is shorter
+        than the minimum length 32*. That names no group, no cause a reader
+        recognises and no move, and ``decrypt_error`` carried it verbatim to
+        every SDK caller and every framework tool built on one.
+        """
+        peer = Peer(tmp_path, other_agent_id)
+        _mock_token()
+        key_package = _mint_key_package(sync_client, tmp_config_dir, agent_id)
+        peer.found()
+        before_the_leaf = peer.send({"not": "openable"})
+        bundle = peer.add(key_package)
+        _mock_welcomes(agent_id, bundle.welcomes[0])
+        process_mls_welcomes(sync_client._http, tmp_config_dir, agent_id)
+        _mock_keys(peer)
+        _mock_agents(agent_id)
+        _mock_group()
+        _mock_no_handshakes()
+        _mock_message_routes(agent_id, _mls_row(before_the_leaf, other_agent_id))
+
+        msg = sync_client.read(MESSAGE_ID)
+
+        assert msg.plaintext is None
+        assert "shorter than the minimum length" not in msg.decrypt_error
+        assert f"holds no MLS key for group {GROUP_ID}" in msg.decrypt_error
+        assert f'groups.sync("{GROUP_ID}")' in msg.decrypt_error
+
+    @respx.mock
+    def test_a_row_for_a_group_this_agent_holds_no_state_for_says_the_same_thing(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """The other half of the same agent's failure, and it used to say something else.
+
+        A carried vote seats an agent on the roster with no Welcome, so it holds
+        no leaf and no local state at all. Reading a group row then fails before
+        any key is tried, as :class:`~rine.errors.NoMlsGroupStateError`, and the
+        SDK printed the class's own sentence — which names neither
+        ``groups.sync()`` nor the key packages an admission has to claim, and so
+        told the one agent this phase was opened for nothing it could act on.
+        The CLI has covered both arms (``isRecoverableMlsRead``); this
+        is the SDK saying the same thing to the same agent.
+
+        The group's MLS state is unfounded here, which is what leaves the
+        recovery with nothing to install and nothing to join.
+        """
+        _mock_token()
+        peer = Peer(tmp_path, other_agent_id)
+        peer.found()
+        ciphertext = peer.send({"not": "openable"})
+        _mock_keys(peer)
+        _mock_agents(agent_id)
+        respx.get(f"{API}/groups/{GROUP_ID}").mock(
+            return_value=httpx.Response(200, json={**_GROUP_JSON, "mls_group_id": None})
+        )
+        _mock_welcomes(agent_id)
+        _mock_no_handshakes()
+        _mock_message_routes(agent_id, _mls_row(ciphertext, other_agent_id))
+
+        msg = sync_client.read(MESSAGE_ID)
+
+        assert msg.plaintext is None
+        assert "This agent is not in the group's MLS state yet" not in msg.decrypt_error
+        assert f"holds no MLS key for group {GROUP_ID}" in msg.decrypt_error
+        assert f'groups.sync("{GROUP_ID}")' in msg.decrypt_error
+
+    @respx.mock
+    def test_a_group_that_never_published_a_group_info_keeps_its_own_refusal(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+    ):
+        """The translation is narrow on purpose, and this is the neighbour it must not eat.
+
+        A group with no published GroupInfo is a different fact from a leaf that
+        does not reach far enough back — it names something a *member* must do,
+        not this agent — and rine already had a sentence for it. Widening the
+        branch to "any MLS failure" would replace an accurate sentence with a
+        vaguer one, which is the failure this whole finding is about.
+        """
+        _unreachable_group(sync_client, tmp_path, agent_id, other_agent_id)
+
+        msg = sync_client.read(MESSAGE_ID)
+
+        assert f"Cannot self-join MLS group {GROUP_ID}" in msg.decrypt_error
+        assert "holds no MLS key for group" not in msg.decrypt_error
+
+    @respx.mock
     def test_a_core_failure_the_sdk_does_not_name_reaches_the_caller_as_a_rine_error(
         self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
     ):

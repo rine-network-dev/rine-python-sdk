@@ -29,6 +29,50 @@ if TYPE_CHECKING:
     from rine._mls.resync import MlsRecoveryResult
 
 
+#: What a recovery's key-package top-up did — the closed set, so a renderer
+#: cannot fall through to a default arm and a new outcome cannot ship unsaid.
+#:
+#: ``healthy`` is *nothing was published and nothing needed to be*, and it has
+#: two producers: the group that has no ratchet tree at all — an open group runs
+#: sender keys, mints no Welcome and claims no key package — and the agent whose
+#: additive rescue has already run in this process. Both say nothing to the
+#: operator, because in both there is nothing to report. The open-group arm is
+#: reported by leaving the field unset rather than by this literal, which is
+#: named here anyway because :func:`rine.format.describe_mls_recovery` also
+#: renders results that crossed from the TypeScript stack, which spells it out —
+#: a renderer that could not name it would fall through on a payload the product
+#: really produces.
+#:
+#: The TypeScript twin is ``KeyPackageTopUpOutcome``
+#: (``rine-core/src/mls-keypackage-topup.ts``).
+KeyPackageTopUpOutcome = Literal["healthy", "topped-up", "cap-reached", "failed"]
+
+
+@dataclass(frozen=True)
+class KeyPackageTopUp:
+    """What a recovery's key-package top-up did, and what it cost.
+
+    It lives here rather than in :mod:`rine._mls` for the reason
+    :data:`GroupRecoveryResult` does: :mod:`rine.format` renders it, every
+    framework wrapper imports :mod:`rine.format`, and importing anything under
+    :mod:`rine._mls` raises where the ``rine-mls`` wheel is not installable.
+
+    The TypeScript twin is ``KeyPackageTopUp``
+    (``rine-core/src/mls-keypackage-topup.ts``).
+    """
+
+    outcome: KeyPackageTopUpOutcome
+    """Which arm this was. Every consumer branches on this and on nothing else."""
+
+    published: int = 0
+    """Key packages the server stored for this agent. Zero on every other arm."""
+
+    detail: str | None = None
+    """The refusal, in the server's or the core's own words. Set on ``failed``
+    and on no other arm — a detail on a success is a detail with nothing to
+    explain."""
+
+
 @dataclass(frozen=True)
 class SenderKeyScan:
     """One pass over the distribution inbox: what it installed, what it skipped.
@@ -137,6 +181,16 @@ class SenderKeyRecoveryResult:
     not conclude a missing key from it. The TypeScript twin is ``unscanned``
     (``rine-core/src/group-recovery.ts``)."""
 
+    key_packages: KeyPackageTopUp | None = None
+    """What the key-package top-up that rode along with this recovery did.
+
+    ``None`` when there was nothing to do — a sender-key group mints no Welcome
+    and claims no key package — and ``None`` again when the recovery was not
+    driven through :func:`rine._resources.group_sync.sync_group_state`. A
+    surface projecting this into JSON omits the key rather than emitting a null,
+    the ``mls_never_founded_note`` rule. The TypeScript twin is ``keyPackages``
+    (``rine-core/src/group-recovery.ts``)."""
+
     mls_never_founded_note: str | None = None
     """Set when the group was created to run MLS and its ratchet tree was never
     founded: what this recovery could not reach, in the words every surface
@@ -168,4 +222,10 @@ if TYPE_CHECKING:
     GroupRecoveryResult: TypeAlias = MlsRecoveryResult | SenderKeyRecoveryResult
 
 
-__all__ = ["SenderKeyRecoveryResult", "SenderKeyScan", "unscanned_beyond_page"]
+__all__ = [
+    "KeyPackageTopUp",
+    "KeyPackageTopUpOutcome",
+    "SenderKeyRecoveryResult",
+    "SenderKeyScan",
+    "unscanned_beyond_page",
+]

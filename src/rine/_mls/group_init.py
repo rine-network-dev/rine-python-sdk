@@ -23,7 +23,7 @@ from rine._mls.admission import MlsAdmissionResult
 from rine._mls.admission_loop import run_admission
 from rine._mls.admission_state import Admission
 from rine._mls.api import mls_init
-from rine._mls.key_packages import replenish_mls_key_packages
+from rine._mls.heartbeat import MlsActor, mls_heartbeat
 from rine.types import MlsInitFailure
 
 if TYPE_CHECKING:
@@ -58,9 +58,9 @@ def init_mls_group(
         CryptoError: If a member's published KeyPackage cannot be read.
         RineApiError: If the server refuses the init or a commit.
     """
-    # Every MLS operation doubles as the heartbeat that keeps this agent's own
-    # KeyPackage pool above its low-water mark, so it never becomes un-addable.
-    replenish_mls_key_packages(client, config_dir, agent_id)
+    # Forced rather than gated: founding is about to spend key packages, and the
+    # founder's own pool is the one no other member can top up.
+    mls_heartbeat(MlsActor(client=client, config_dir=config_dir, agent_id=agent_id), "forced")
 
     roster = mls_init(client, group_id, extra_headers)
     admission = Admission(

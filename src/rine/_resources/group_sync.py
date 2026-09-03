@@ -20,10 +20,14 @@ The TypeScript twin is ``recoverGroup`` (``rine-core/src/group-recovery.ts``).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from rine._group_recovery import SenderKeyRecoveryResult
+from rine._mls.heartbeat import MlsActor
 from rine._mls.resync import recover_mls_group
+from rine._mls.topup import top_up_key_packages
+from rine.errors import MlsResyncUnavailableError
 from rine.format import (
     MLS_INIT_IN_FLIGHT_SYNC,
     group_is_mls,
@@ -34,7 +38,8 @@ from rine.format import (
 from rine.types import GroupRead
 
 if TYPE_CHECKING:
-    from rine._group_recovery import GroupRecoveryResult
+    from rine._group_recovery import GroupRecoveryResult, KeyPackageTopUp
+    from rine._mls.resync import MlsRecoveryResult
     from rine.format import UnfoundedGroupRepair
 
 
@@ -93,6 +98,74 @@ def _never_founded_note(group: GroupRead, repair: UnfoundedGroupRepair) -> str |
     return mls_never_founded_sync(repair)
 
 
+def _recover_mls_with_top_up(
+    http: Any,
+    config_dir: str,
+    acting: str,
+    group_id: str,
+    *,
+    cipher_suite: int | None,
+) -> MlsRecoveryResult:
+    """Publish this agent's key packages, then catch its MLS state up.
+
+    🔴 **The top-up runs first, and that ordering is the whole point.** An agent
+    whose published key packages have run out is un-addable: no member can mint
+    it a Welcome, so a carried vote seats it on the roster with no leaf in the
+    tree, and :func:`~rine._mls.resync.recover_mls_group` answers that agent by
+    RAISING — its local state will not load, because it never had any. A top-up
+    that only decorated a returned result would therefore run for every group
+    except the one it exists to fix, so this one rides on the refusal too.
+
+    Re-minted rather than mutated, and re-raised ``from`` the original: the
+    refusal composes its own sentence in its constructor, so one that learned
+    about the top-up afterwards would carry a field its own message never
+    mentions.
+
+    The whole helper is what the async client hands to a single
+    :func:`~rine._mls.bridge.with_sync_http`: the top-up and the ladder both need
+    a synchronous client, and hoisting the top-up out would buy a second bridge
+    for it.
+
+    Args:
+        http: Sync HTTP client.
+        config_dir: Config directory path.
+        acting: The recovering agent's UUID.
+        group_id: The rine group UUID.
+        cipher_suite: The group's own suite, when it is not the current default.
+
+    Returns:
+        What the ladder did, carrying what the top-up did.
+
+    Raises:
+        MlsResyncUnavailableError: This agent's local state will not load at all,
+            now naming the top-up that just ran.
+    """
+    top_up = top_up_key_packages(MlsActor(client=http, config_dir=config_dir, agent_id=acting))
+    try:
+        recovered = recover_mls_group(
+            http, config_dir, acting, group_id, cipher_suite=cipher_suite
+        )
+    except MlsResyncUnavailableError as err:
+        raise MlsResyncUnavailableError(group_id, key_packages=top_up) from err
+    return replace(recovered, key_packages=_top_up_field(top_up))
+
+
+def _top_up_field(top_up: KeyPackageTopUp) -> KeyPackageTopUp | None:
+    """The top-up as a result field, or ``None`` when there is nothing to report.
+
+    The ``mls_never_founded_note`` rule: a surface projecting the result into
+    JSON emits no key at all rather than a value saying nothing happened. The
+    TypeScript twin is ``topUpField`` (``rine-core/src/group-recovery.ts``).
+
+    Args:
+        top_up: What the top-up did.
+
+    Returns:
+        The top-up, unless its outcome is ``healthy``.
+    """
+    return None if top_up.outcome == "healthy" else top_up
+
+
 def _read_group(client: Any, group_id: str, extra: dict[str, str] | None) -> GroupRead:
     return GroupRead.model_validate(client._http.get(f"/groups/{group_id}", extra_headers=extra))
 
@@ -110,7 +183,7 @@ def sync_group_state(
     regime = _regime(group)
     acting = client._resolve_agent_id(agent)
     if regime == "mls":
-        return recover_mls_group(
+        return _recover_mls_with_top_up(
             client._http,
             client._config_dir,
             acting,
@@ -163,7 +236,7 @@ async def sync_group_state_async(
     if regime == "mls":
         return await with_sync_http(
             client,
-            lambda http: recover_mls_group(
+            lambda http: _recover_mls_with_top_up(
                 http,
                 client._config_dir,
                 acting,

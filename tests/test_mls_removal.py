@@ -51,11 +51,15 @@ def commits(monkeypatch) -> list[MlsCommit]:
     """Accept every commit, recording it, and answer with its own epoch."""
     posted: list[MlsCommit] = []
 
-    def _commit(_client: Any, _group_id: str, commit: MlsCommit, _headers: dict[str, str]) -> int:
+    def _commit(_actor: Any, _group_id: str, commit: MlsCommit, _headers: dict[str, str]) -> int:
         posted.append(commit)
         return commit.epoch
 
-    monkeypatch.setattr("rine._mls.removal.mls_commit", _commit)
+    # The seam that publishes a commit AND beats the acting agent's key-package
+    # heartbeat behind it. Stubbed here rather than the inner ``mls_commit``:
+    # this fixture stands in for the whole server, so leaving the heartbeat live
+    # would have it publish key packages at one that is not there.
+    monkeypatch.setattr("rine._mls.removal.post_mls_commit", _commit)
     monkeypatch.setattr("rine._mls.removal.read_group", lambda *_a: _group_read())
     return posted
 

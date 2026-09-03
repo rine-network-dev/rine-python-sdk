@@ -41,11 +41,19 @@ from rine._mls.binding import (
     epoch_retention_limit,
     open_mls_client,
 )
+from rine._mls.commit import post_mls_commit
 from rine._mls.external_join import ExternalJoin, external_join_mls_group
 from rine._mls.failures import is_recoverable_mls_failure, is_unprocessable_commit
 from rine._mls.founding import claim_founding_key_packages, mls_founding_batch_sizes
 from rine._mls.group_access import load_mls_group, mls_group_id_bytes, open_mls_group
 from rine._mls.group_init import init_mls_group
+from rine._mls.heartbeat import (
+    MLS_HEARTBEAT_MIN_INTERVAL_S,
+    MlsActor,
+    MlsHeartbeatPace,
+    mls_heartbeat,
+    reset_mls_heartbeat_gate,
+)
 from rine._mls.join import (
     install_mls_state,
     install_mls_state_by_id,
@@ -57,6 +65,7 @@ from rine._mls.key_packages import (
     MlsKeyPackageStatus,
     drain_and_republish_mls_key_packages,
     ensure_mls_key_packages,
+    is_inventory_full,
     publish_mls_key_packages,
     replenish_mls_key_packages,
 )
@@ -72,6 +81,7 @@ from rine._mls.resync import (
 )
 from rine._mls.sync import MlsSyncResult, sync_mls_group
 from rine._mls.sync_api import MlsHandshake, fetch_handshakes, mls_ack, mls_nack
+from rine._mls.topup import reset_key_package_rescue_gate, top_up_key_packages
 from rine._mls.tree import GroupTree, read_group_tree
 from rine._mls.welcome_guard import MlsWelcomeRefusedError
 from rine._mls.welcomes import MlsWelcomeOutcome, process_mls_welcomes
@@ -79,6 +89,7 @@ from rine._mls.wire import api_error_code, mls_from_base64, mls_to_base64
 
 __all__ = [
     "APP_MESSAGE_TAG",
+    "MLS_HEARTBEAT_MIN_INTERVAL_S",
     "MLS_RESYNC_REQUIRED",
     "CLASSICAL_CIPHER_SUITE",
     "DEFAULT_CIPHER_SUITE",
@@ -88,6 +99,7 @@ __all__ = [
     "KEY_PACKAGE_TARGET",
     "ExternalJoin",
     "GroupTree",
+    "MlsActor",
     "MlsAdmissionOutcome",
     "MlsAdmissionResult",
     "MlsAdmissionSkipReason",
@@ -95,6 +107,7 @@ __all__ = [
     "MlsCoreError",
     "MlsCutoverResult",
     "MlsGroupInfo",
+    "MlsHeartbeatPace",
     "MlsHandshake",
     "MlsKeyPackageStatus",
     "MlsMemberStatus",
@@ -128,6 +141,7 @@ __all__ = [
     "init_mls_group",
     "install_mls_state",
     "install_mls_state_by_id",
+    "is_inventory_full",
     "is_recoverable_mls_failure",
     "is_unprocessable_commit",
     "join_mls_state",
@@ -138,22 +152,27 @@ __all__ = [
     "mls_founding_batch_sizes",
     "mls_from_base64",
     "mls_group_id_bytes",
+    "mls_heartbeat",
     "mls_init",
     "mls_nack",
     "mls_to_base64",
     "open_mls_client",
     "open_mls_group",
+    "post_mls_commit",
     "orphan_leaves",
     "process_mls_welcomes",
     "publish_mls_key_packages",
     "read_group",
     "read_group_tree",
     "reclaim_orphan_leaves",
+    "reset_key_package_rescue_gate",
+    "reset_mls_heartbeat_gate",
     "recover_mls_group",
     "remove_mls_group_member",
     "retire_local_group_state",
     "replenish_mls_key_packages",
     "sync_mls_group",
+    "top_up_key_packages",
     "upload_key_packages",
     "wipe_mls_state",
 ]

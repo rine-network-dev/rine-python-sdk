@@ -294,7 +294,7 @@ class TestAdmitterState:
             raise RuntimeError("stop-after-ensure")
 
         monkeypatch.setattr(add_members_module, "process_mls_welcomes", _welcomes)
-        monkeypatch.setattr(add_members_module, "replenish_mls_key_packages", lambda *a, **k: None)
+        monkeypatch.setattr(add_members_module, "mls_heartbeat", lambda *a, **k: None)
         monkeypatch.setattr(add_members_module, "read_group", _stop)
         return installs
 

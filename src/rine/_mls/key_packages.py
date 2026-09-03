@@ -101,7 +101,7 @@ def ensure_mls_key_packages(client: Any, config_dir: str, agent_id: str) -> MlsK
         # The server refuses an upload that would exceed its inventory cap. Being
         # at the cap means the agent already holds far more than enough, so this
         # is a no-op success rather than an error.
-        if _is_inventory_full(err):
+        if is_inventory_full(err):
             return MlsKeyPackageStatus(available=available, published=0, cap_reached=True)
         raise
     return MlsKeyPackageStatus(available=available, published=stored, cap_reached=False)
@@ -113,6 +113,12 @@ def replenish_mls_key_packages(client: Any, config_dir: str, agent_id: str) -> N
     Replenishment is maintenance, never the caller's purpose: a failed top-up must
     not fail the group operation it rode along with, and every later MLS operation
     retries it, so the pool self-heals with no user-facing surface.
+
+    The heartbeat does not go through here — it awaits
+    :func:`ensure_mls_key_packages` itself, because it has to know whether the
+    beat actually did the maintenance its floor then claims was done. This is
+    the wrapper for the callers that genuinely do not care: onboarding, which
+    mints the FIRST pool with no group and nothing to be short for.
     """
     try:
         ensure_mls_key_packages(client, config_dir, agent_id)
@@ -149,8 +155,15 @@ def drain_and_republish_mls_key_packages(
     The window that remains: between the last claim and the upload landing this
     agent has no claimable KeyPackage, so a peer adding it in that instant gets a
     clean, retriable "No key packages available" refusal rather than a broken
-    join. If the upload itself fails the window stays open, and the next MLS
-    operation this agent performs closes it by retrying the cutover.
+    join. If the upload itself fails the window stays open.
+
+    🔴 On the TypeScript stack the next MLS operation closes that window on its
+    own: ``ensureMlsKeyPackages`` asks ``needsMlsKeyPackageCutover`` first, so
+    every heartbeat retries a cutover that did not finish. This stack has no such
+    detector — the legacy store and its marker are a TypeScript-side layout — so
+    the cutover runs only where an operator asks for it, through
+    :meth:`rine.RineClient.republish_mls_key_packages`. An earlier version of
+    this docstring claimed the TypeScript behaviour for both.
 
     Returns:
         The count drained from the server and the count freshly stored.
@@ -185,5 +198,10 @@ def _claim_out_pool(client: Any, agent_id: str) -> int:
     return drained
 
 
-def _is_inventory_full(err: RineApiError) -> bool:
-    return "inventory full" in str(err.detail).lower()
+def is_inventory_full(err: object) -> bool:
+    """The server refusing an upload that would push this agent past its cap.
+
+    A no-op success wherever it is caught: an agent at the cap already holds far
+    more key packages than any peer can claim.
+    """
+    return isinstance(err, RineApiError) and "inventory full" in str(err.detail).lower()

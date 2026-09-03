@@ -44,8 +44,57 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from rine._group_recovery import GroupRecoveryResult, SenderKeyRecoveryResult
+    from rine._group_recovery import (
+        GroupRecoveryResult,
+        KeyPackageTopUp,
+        SenderKeyRecoveryResult,
+    )
+    from rine._mls.resync import MlsRecoveryResult
     from rine.types import GroupRead
+
+
+def _join_lines(first: str, second: str | None) -> str:
+    """Two blocks of operator prose, joined by exactly one newline.
+
+    The TypeScript twin is ``joinLines`` (``rine-core/src/mls-recovery-format.ts``),
+    which is exported only because ``index.ts`` re-exports its module with
+    ``export *``; this half stays underscore-private because
+    :mod:`rine.errors` is the only other caller and it is in this package.
+
+    🔴 **The empty case is the whole reason it exists.** Four sites hand-rolled
+    ``f"{head}\\n{tail}" if tail else head``, and the recorded failure mode of a
+    fifth copy is getting it backwards: an absent half then emits a **leading
+    blank line** into an operator's answer, and the ``^``-anchored head regexes
+    in ``scripts/mls-matrix/driver_framework_ts_admin.mjs`` and
+    ``scripts/mls-matrix/container_admin.py`` read that as the surface refusing
+    — a successful recovery graded as a broken surface. Absent means absent: the
+    other half comes back unchanged, with no separator on either end.
+
+    It joins and normalises nothing else. That is what separates it from the
+    sentence seam in :func:`rine._group_ref.compose_group_refusal`, which
+    terminates an unterminated part: every tail this appends is a pinned
+    sentence two matrix drivers match, so touching its content is the one thing
+    it may not do.
+
+    Only the CONDITIONAL seams route through here. A join whose halves are both
+    constants — :func:`_describe_mls_rung`'s eviction line — stays an f-string,
+    because passing an argument that cannot be empty to a function whose subject
+    is emptiness reads as a claim that it can be.
+
+    Args:
+        first: The head. Returned alone when there is no tail.
+        second: The tail, when there is one. ``None`` and ``""`` are the same
+            answer: nothing to append.
+
+    Returns:
+        The two halves with one ``\\n`` between them, or whichever half is not
+        empty, or ``""`` when neither is.
+    """
+    if not second:
+        return first
+    if not first:
+        return second
+    return f"{first}\n{second}"
 
 
 #: What a surface should say a group is encrypted with.
@@ -544,6 +593,59 @@ def mls_never_founded_sync(repair: UnfoundedGroupRepair = "none") -> str:
     return _note_with_repair(_UNFOUNDED_REPAIR_CLAUSES, repair)
 
 
+_KEY_PACKAGE_CAP_REACHED = (
+    "This agent's published key packages are already at the server's per-agent cap, so "
+    "none were added — any member adding it to a group has plenty to claim."
+)
+
+_KEY_PACKAGE_FAILED = (
+    "Could not publish key packages for this agent: {detail}. Until that succeeds no "
+    "member can mint it a Welcome, so a group it is voted into would seat it on the "
+    "roster with no leaf in the ratchet tree and it would read nothing there. Run this "
+    "sync again."
+)
+
+_KEY_PACKAGE_PUBLISHED = (
+    "Published {published} key package(s) for this agent along the way. Peers claim one "
+    "each time they add it to a group, and an agent whose published pool has run out is "
+    "one no member can mint a Welcome for — seated by a carried vote, listed on the "
+    "roster, reading nothing."
+)
+
+
+def key_package_top_up_line(top_up: KeyPackageTopUp | None) -> str:
+    """What the key-package top-up that rode along with a recovery did.
+
+    Empty, with no trailing newline, when there is nothing to say — the
+    :func:`_unscanned_clause` shape, so the caller composes one way and not two.
+    A group that runs sender keys mints no Welcome and claims no key package, so
+    ``healthy`` is genuinely silent rather than a reassurance nobody asked for.
+
+    Every other arm is said out loud, the successful one included, because this
+    is a recovery the operator ran on purpose and the pool is the thing most
+    likely to have been broken. An agent whose published pool is empty cannot be
+    told apart from a healthy one anywhere else in the product: a carried vote
+    seats it on the roster, the roster lists it as a full member, and it reads
+    nothing.
+
+    The TypeScript twin is ``keyPackageTopUpLine``
+    (``rine-core/src/mls-recovery-format.ts``).
+
+    Args:
+        top_up: What the top-up did, or ``None`` when none ran.
+
+    Returns:
+        The sentence, or ``""`` when there is nothing to say.
+    """
+    if top_up is None or top_up.outcome == "healthy":
+        return ""
+    if top_up.outcome == "cap-reached":
+        return _KEY_PACKAGE_CAP_REACHED
+    if top_up.outcome == "failed":
+        return _KEY_PACKAGE_FAILED.format(detail=top_up.detail or "the reason was not reported")
+    return _KEY_PACKAGE_PUBLISHED.format(published=top_up.published)
+
+
 _RECOVERY_EVICTED = (
     "This agent was removed from the group by a commit it just replayed: messages that "
     "already arrived still open, and nothing committed after the Remove ever will."
@@ -650,8 +752,7 @@ def _describe_sender_key_recovery(group_ref: str, result: SenderKeyRecoveryResul
     """
 
     def with_note(head: str) -> str:
-        note = result.mls_never_founded_note
-        return f"{head}\n{note}" if note else head
+        return _join_lines(head, result.mls_never_founded_note)
 
     # Both arms where the scan ran end the same way: what it could not reach, if
     # anything, and then the next action. Composed once so the two cannot drift.
@@ -721,8 +822,19 @@ def describe_mls_recovery(group_ref: str, result: GroupRecoveryResult) -> str:
     print the same sentences: two stacks describing one event differently is the
     defect this pair exists to stop.
     """
-    if result.regime == "sender-key":
-        return _describe_sender_key_recovery(group_ref, result)
+    body = (
+        _describe_sender_key_recovery(group_ref, result)
+        if result.regime == "sender-key"
+        else _describe_mls_rung(group_ref, result)
+    )
+    # 🔴 APPENDED, never prepended. Two matrix drivers match this answer's head
+    # with ``^``-anchored regexes and read a miss as the surface refusing — a
+    # successful recovery graded as a broken surface.
+    return _join_lines(body, key_package_top_up_line(result.key_packages))
+
+
+def _describe_mls_rung(group_ref: str, result: MlsRecoveryResult) -> str:
+    """The MLS half of :func:`describe_mls_recovery`, by rung."""
     distance = (
         "by an unknown distance (the group has published no confirmed epoch)"
         if result.behind is None
@@ -757,6 +869,7 @@ __all__ = [
     "group_is_mls",
     "group_mls_init_in_flight",
     "group_mls_never_founded",
+    "key_package_top_up_line",
     "mls_never_founded_sync",
     "unfounded_group_note",
 ]

@@ -62,9 +62,11 @@ from typing import TYPE_CHECKING, Any
 
 from rine._actor import AGENT_HEADER
 from rine._mls.admission import MlsReclamation, MlsReclamationDecline
-from rine._mls.api import MlsCommit, mls_commit, read_group
+from rine._mls.api import MlsCommit, read_group
+from rine._mls.commit import post_mls_commit
 from rine._mls.failures import is_epoch_conflict
 from rine._mls.group_access import open_mls_group
+from rine._mls.heartbeat import MlsActor
 from rine._mls.sync import sync_mls_group
 from rine._mls.tree import fetch_agent_identities, leaf_index, read_group_tree
 
@@ -184,8 +186,8 @@ def _commit_orphan_removal(
     if leaf is None:
         return None
     bundle = group.remove_member(leaf)
-    epoch = mls_commit(
-        client,
+    epoch = post_mls_commit(
+        MlsActor(client=client, config_dir=config_dir, agent_id=agent_id),
         group_id,
         MlsCommit(
             commit=bundle.commit,
