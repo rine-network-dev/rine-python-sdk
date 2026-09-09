@@ -337,7 +337,7 @@ except RateLimitError as e:
     print(e.retry_after)  # seconds to wait
 ```
 
-Error hierarchy: `RineError` > `RineApiError` > `AuthenticationError`, `AuthorizationError`, `NotFoundError`, `ConflictError`, `RateLimitError`, `ValidationError`, `InternalServerError`, `ServiceUnavailableError`. Direct `RineError` subclasses: `APITimeoutError`, `APIConnectionError`, `ConfigError`, `GroupIdentityMismatchError`, `SpiffeVerificationError`, `UnsupportedTargetError` (`send_and_wait` on a group — by handle or by the group's own id), and `CryptoError`. Under `CryptoError`: `SignatureVerificationError` (and `SenderMismatchError`), `NoMlsGroupStateError`, `MlsDowngradeError`, `MlsResyncUnavailableError`, `MlsWelcomeRefusedError`, and `MlsError` (and `GroupEvictedError`, raised when this agent has been removed from the group it is reading).
+Error hierarchy: `RineError` > `RineApiError` > `AuthenticationError`, `AuthorizationError`, `NotFoundError`, `ConflictError`, `RateLimitError`, `ValidationError`, `InternalServerError`, `ServiceUnavailableError`. Direct `RineError` subclasses: `APITimeoutError`, `APIConnectionError`, `ConfigError`, `GroupIdentityMismatchError`, `SpiffeVerificationError`, `UnsupportedTargetError` (`send_and_wait` on a group — by handle or by the group's own id), `NotAGroupMemberError` and `ReplyAttributionError` (both refused client-side, before anything is encrypted or posted), and `CryptoError`. Under `CryptoError`: `NoSenderKeyStateError`, `SignatureVerificationError` (and `SenderMismatchError`), `NoMlsGroupStateError`, `MlsDowngradeError`, `MlsResyncUnavailableError`, `MlsWelcomeRefusedError`, and `MlsError` (and `GroupEvictedError`, raised when this agent has been removed from the group it is reading).
 
 ## Documentation
 

@@ -20,6 +20,7 @@ import pytest
 
 from rine._crypto.keys import generate_agent_keys, save_agent_keys
 from rine._crypto.sender_keys import generate_sender_key
+from rine._crypto.sender_keys_helpers import save_sender_key_state
 from rine._group_send import encrypt_for_group_sync
 from rine._mls.binding import open_mls_client
 from rine._mls.group_access import mls_group_id_bytes, note_mls_state_changed
@@ -65,9 +66,16 @@ class _SenderKeySpy:
     def __init__(self) -> None:
         self.calls = 0
 
-    def __call__(self, _client: Any, _config_dir: str, agent_id: str, group: dict[str, Any]):
+    def __call__(self, _client: Any, config_dir: str, agent_id: str, group: dict[str, Any]):
         self.calls += 1
-        return generate_sender_key(str(group["id"]), agent_id)
+        state = generate_sender_key(str(group["id"]), agent_id)
+        # The real function's every return path has already written the state it
+        # hands back, and the send's tail depends on that: it advances this agent's
+        # row IN PLACE and refuses a state that is on no disk at all rather than
+        # discarding the advance. A stand-in that skips the write is not the
+        # function it replaces.
+        save_sender_key_state(config_dir, agent_id, str(group["id"]), [state])
+        return state
 
 
 @pytest.fixture

@@ -100,6 +100,7 @@ from rine.errors import (
     ServiceUnavailableError,
     SignatureVerificationError,
     SpiffeVerificationError,
+    UnpersistedSenderKeyStateError,
     UnsupportedTargetError,
     ValidationError,
     WelcomeRefusalReason,
@@ -467,6 +468,10 @@ __all__ = [
     "ServiceUnavailableError",
     "SignatureVerificationError",
     "SpiffeVerificationError",
+    # A group send handed a sender key that was never written to disk: the
+    # message seals, and its ratchet advance and self-read key would be
+    # discarded silently. Refused so a composing caller learns it at the seam.
+    "UnpersistedSenderKeyStateError",
     "UnsupportedTargetError",
     "ValidationError",
     "format_error",

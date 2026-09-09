@@ -111,6 +111,10 @@ def _sender_key_row(config_dir: str, payload: object = PAYLOAD) -> tuple[str, ob
             )
         ],
     )
+    # The sender's own copy, which ``encrypt_group_message`` advances in place. A
+    # stand-in sender needs it as much as a real one does: the tail refuses a
+    # state that is on no disk at all rather than discarding the advance.
+    save_sender_key_state(config_dir, SENDER_B, GROUP_ID, [state])
     sealed, _ = encrypt_group_message(config_dir, SENDER_B, GROUP_ID, state, payload)
     return sealed.encrypted_payload, sender_keys
 

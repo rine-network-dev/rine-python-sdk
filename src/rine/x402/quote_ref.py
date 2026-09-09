@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from rine._constants import MessageType
 from rine._crypto._sender_verify import is_authenticity_failure
+from rine._resolve import parses_as_uuid
 from rine.sender_key_words import SenderKeyRefusal
 from rine.types import DecryptedMessage
 from rine.x402.errors import X402Error, X402ErrorCode
@@ -63,6 +64,28 @@ async def load_referenced_quote(
             f"Payment carries no {X402_QUOTE_REF_KEY} — cannot bind it to a "
             "payee-issued quote (fail closed; use explicit expected terms for an "
             "out-of-band quote)",
+        )
+    # 🔴 Before ANY network call, including the agent resolution below: ``ref`` is
+    # the payer's own plaintext and it is about to be interpolated into a URL path.
+    # Every other guard in this function runs on the RESPONSE, so an unchecked ref
+    # decides WHICH endpoint the payee's own credentials are spent on — and the
+    # server has GETs that mutate (``/agents/{id}/mls/welcomes`` consumes what it
+    # returns), so a traversal here is not a read, it is a write the payee is
+    # tricked into signing for. Refusing before the first request is the whole
+    # point: a refusal after it has already been issued is not a refusal.
+    #
+    # ``parses_as_uuid`` and not the strict ``is_uuid``: the server types this path
+    # parameter ``uuid.UUID`` (``GET /messages/{message_id}``), which has always
+    # taken the dashless, ``urn:uuid:`` and braced spellings too. A pre-flight is
+    # only ever allowed to refuse what the wire would have refused anyway, so
+    # refusing one of those here would be a capability removal wearing a validation
+    # fix. What it buys is the alphabet: every spelling it admits is hex digits,
+    # dashes, braces and the two prefixes, so none can carry a ``/``, a ``?`` or a
+    # ``#`` — the ref can no longer name an endpoint other than this one.
+    if not parses_as_uuid(ref):
+        raise X402Error(
+            X402ErrorCode.NO_QUOTE,
+            f"Referenced quote {ref} is not a message id — refusing to settle",
         )
     payee_agent_id = await client._resolve_agent_id(agent)
     extra = await client._agent_header(agent)

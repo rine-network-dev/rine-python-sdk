@@ -140,6 +140,7 @@ def group_message_fixture(tmp_config_dir, agent_id, other_agent_id, saved_agent_
     )
     from rine._crypto.message import encrypt_group_message, encrypt_message
     from rine._crypto.sender_keys import generate_sender_key
+    from rine._crypto.sender_keys_helpers import save_sender_key_state
     from rine._utils import to_base64url
 
     sender_keys = generate_agent_keys()
@@ -155,6 +156,10 @@ def group_message_fixture(tmp_config_dir, agent_id, other_agent_id, saved_agent_
     }
 
     payload = {"text": "hello group"}
+    # The sender's own copy, which ``encrypt_group_message`` advances in place. A
+    # stand-in sender needs it as much as a real one does: the tail refuses a state
+    # that is on no disk at all rather than discarding the advance.
+    save_sender_key_state(tmp_config_dir, other_agent_id, _GROUP_ID, [state])
     sealed, _ = encrypt_group_message(tmp_config_dir, other_agent_id, _GROUP_ID, state, payload)
 
     recipient = recipient_view(load_agent_keys(tmp_config_dir, agent_id))

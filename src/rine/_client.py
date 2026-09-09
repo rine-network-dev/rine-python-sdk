@@ -29,7 +29,6 @@ from rine._crypto.message import (
     decrypt_message_async,
     encrypt_message,
 )
-from rine._crypto.sender_keys import SenderKeyState
 from rine._crypto.sender_keys_helpers import (
     lift_retirement_if_member,
     load_sender_key_states,
@@ -1067,8 +1066,13 @@ class RineClient(BaseRineClient):
         :meth:`_fetch_pending_sk_distributions` is one line over it, so the two
         cannot come to disagree about what a pass does.
         """
+        from rine._crypto.keys import agent_id_from_kid
         from rine._crypto.message import decrypt_message_async
-        from rine._utils import from_base64url
+        from rine._crypto.sk_distribution import (
+            already_held,
+            distribution_group_id,
+            sender_key_state_from_distribution,
+        )
 
         data = await self._http.get(
             f"/agents/{agent_id}/messages",
@@ -1099,7 +1103,10 @@ class RineClient(BaseRineClient):
                 if not result.verified:
                     continue
                 payload = json.loads(result.plaintext)
-                group_id = payload["group_id"]
+                # Canonicalised, not taken verbatim: this id becomes a FILENAME and
+                # every other reader of that file passes the server's lower-case
+                # spelling. See ``rine._crypto.sk_distribution``.
+                group_id = distribution_group_id(payload)
                 # A group this agent retired never takes key material again.
                 # The DMs that carried these keys are still in the inbox after a
                 # leave, so without this the wipe would hold only until the next
@@ -1110,16 +1117,47 @@ class RineClient(BaseRineClient):
                 # otherwise refuse every distribution forever.
                 if sender_keys_retired(self._config_dir, agent_id, group_id):
                     continue
+                # 🔴 A read-modify-write of this group's whole state array that
+                # takes NO lock — the one
+                # :mod:`rine._crypto.sender_keys_store` does not serialise. It is
+                # sound against other COROUTINES because the load, the membership
+                # check and the save below have no ``await`` between them, so no
+                # task can run in that gap. It is NOT sound against the worker
+                # thread the async group send runs its own whole-array write on
+                # (residual 1 of that module): Python threads preempt between
+                # bytecodes, and the load below is file I/O, which releases the
+                # GIL outright. Putting an await between them additionally reopens
+                # the coroutine half of exactly the lost update that module exists
+                # to close, and nothing here would catch it. The lock's own
+                # holders survive this writer the other way round because they
+                # MERGE by ``sender_key_id`` rather than asserting the array they
+                # loaded before their network call.
                 states = load_sender_key_states(self._config_dir, agent_id, group_id)
-                if any(s.sender_key_id == payload["sender_key_id"] for s in states):
-                    continue
-                new_state = SenderKeyState(
-                    sender_key_id=payload["sender_key_id"],
-                    group_id=group_id,
-                    sender_agent_id=payload["sender_agent_id"],
-                    chain_key=from_base64url(payload["chain_key"]),
-                    message_index=payload.get("message_index", 0),
+                # 🔴 The VERIFIED signer, never ``payload["sender_agent_id"]``. The
+                # payload is the sender's own plaintext, so taking the row's identity
+                # from it lets any agent that can DM this one — every current and
+                # former member of the group, who all know its id — plant a row
+                # claiming to be THIS agent's own key. The signature check above binds
+                # the envelope to ``from_agent_id``; it says nothing about a field
+                # inside the payload, and the two were never compared. Such a row is
+                # picked up as this agent's own sending key (an ingested row has no
+                # ``created_at``, so ``needs_rotation`` cannot retire it), fanned out
+                # to the whole group as this agent's own, and sealed under — handing
+                # the planter every group post this agent then writes. Deriving the id
+                # from the kid is what the TypeScript twin has always done
+                # (``crypto/ingest.ts``, ``agentIdFromKid(result.senderKid)``); this
+                # stack diverged from it and that divergence WAS the hole. A malformed
+                # kid throws into the ``except`` below, so it fails closed — as does
+                # every field refusal ``sk_distribution`` raises.
+                new_state = sender_key_state_from_distribution(
+                    payload, group_id, agent_id_from_kid(result.sender_kid)
                 )
+                # Per SENDER, not per key id: a global check made the first
+                # distribution to claim an id the owner of that slot, so a shadow
+                # could displace a peer's genuine key. See
+                # :func:`rine._crypto.sk_distribution.already_held`.
+                if already_held(states, new_state):
+                    continue
                 states.append(new_state)
                 save_sender_key_state(self._config_dir, agent_id, group_id, states)
                 ingested += 1

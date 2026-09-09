@@ -183,6 +183,58 @@ class NoSenderKeyStateError(CryptoError):
         self.sender_key_id = sender_key_id
 
 
+class UnpersistedSenderKeyStateError(CryptoError):
+    """A group send was handed a sender key that is on no disk this agent owns.
+
+    :func:`rine._crypto.message.encrypt_group_message` writes the state it
+    advanced back IN PLACE and writes nothing at all when the row is gone,
+    because gone means RETIRED: a rotation dropped it, or a ``group leave``
+    removed the file. Both of those are silent on purpose. This is the third
+    case, and it is none of the agent's history — the file names no key of this
+    agent's at all and the group is not retired, so nothing ever persisted the
+    state the caller passed in.
+
+    That is a caller defect, not a race, and it is silent in the worst way:
+    the message is sealed and transmittable, while the ratchet advance and the
+    self-read cache it produced go nowhere. The sender cannot re-read its own
+    post, and the next send under a freshly minted key starts from message index
+    zero again. Every in-tree caller takes its state from
+    :func:`rine._sender_key_ops.get_or_create_sender_key_sync`, which persists
+    before returning; a caller that mints a state with
+    :func:`rine._crypto.sender_keys.generate_sender_key` and encrypts with it
+    must save it first.
+
+    🔴 One narrow race reaches this refusal honestly: a leave lifts its own
+    retirement marker on re-admission
+    (:func:`rine._crypto.sender_keys_helpers.lift_retirement_if_member`), so a
+    send whose fan-out spans leave → rejoin → another send's lift can arrive
+    here with neither the file nor the marker. It is refused rather than
+    guessed at: the alternative is the silent discard above, and the send is
+    retried honestly against the state the rejoin wrote.
+
+    Args:
+        sender_key_id: The key the caller sealed under.
+        group_id: The group it was sealed for.
+    """
+
+    def __init__(self, sender_key_id: str, group_id: str) -> None:
+        """Refuse a send whose sender key was never written to disk."""
+        super().__init__(
+            f"rine sealed a group message for {group_id} under sender key "
+            f"{sender_key_id}, but this agent holds no sender-key state file "
+            "naming that key or any other key of its own for that group, and "
+            "the group is not retired — so nothing persisted the state this "
+            "send was given. The ratchet advance and the self-read key for "
+            "this message would have been discarded, leaving the sender unable "
+            "to read back its own post. Obtain the sender key through "
+            "get_or_create_sender_key_sync, which saves it before returning, "
+            "or save a freshly generated one with save_sender_key_state before "
+            "encrypting with it."
+        )
+        self.sender_key_id = sender_key_id
+        self.group_id = group_id
+
+
 class SignatureVerificationError(CryptoError):
     """The sender's signature failed verification (``verification_status == "invalid"``).
 

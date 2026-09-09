@@ -28,7 +28,6 @@ from rine._crypto.message import (
     decrypt_message_sync,
     encrypt_message,
 )
-from rine._crypto.sender_keys import SenderKeyState
 from rine._crypto.sender_keys_helpers import (
     lift_retirement_if_member,
     load_sender_key_states,
@@ -990,8 +989,13 @@ class SyncRineClient(BaseRineClient):
         :meth:`_fetch_pending_sk_distributions` is one line over it, so the two
         cannot come to disagree about what a pass does.
         """
+        from rine._crypto.keys import agent_id_from_kid
         from rine._crypto.message import decrypt_message_sync
-        from rine._utils import from_base64url
+        from rine._crypto.sk_distribution import (
+            already_held,
+            distribution_group_id,
+            sender_key_state_from_distribution,
+        )
 
         data = self._http.get(
             f"/agents/{agent_id}/messages",
@@ -1022,7 +1026,10 @@ class SyncRineClient(BaseRineClient):
                 if not result.verified:
                     continue
                 payload = json.loads(result.plaintext)
-                group_id = payload["group_id"]
+                # Canonicalised, not taken verbatim: this id becomes a FILENAME and
+                # every other reader of that file passes the server's lower-case
+                # spelling. See ``rine._crypto.sk_distribution``.
+                group_id = distribution_group_id(payload)
                 # A group this agent retired never takes key material again.
                 # The DMs that carried these keys are still in the inbox after a
                 # leave, so without this the wipe would hold only until the next
@@ -1033,16 +1040,31 @@ class SyncRineClient(BaseRineClient):
                 # otherwise refuse every distribution forever.
                 if sender_keys_retired(self._config_dir, agent_id, group_id):
                     continue
+                # 🔴 The sync twin of the unlocked whole-array writer documented in
+                # ``rine._client.RineClient._scan_pending_sk_distributions``, and it
+                # has a WEAKER argument than that one, not the same: there are no
+                # coroutines here to exclude, and nothing in this stack takes a lock
+                # a thread can see, so what keeps it whole is only that no other
+                # writer in this process holds a load across this load and save.
+                # :mod:`rine._crypto.sender_keys_store` does not serialise it (its
+                # region is per event loop) and cannot; a host that drives a sync
+                # client on one thread and an async one on another races here.
                 states = load_sender_key_states(self._config_dir, agent_id, group_id)
-                if any(s.sender_key_id == payload["sender_key_id"] for s in states):
-                    continue
-                new_state = SenderKeyState(
-                    sender_key_id=payload["sender_key_id"],
-                    group_id=group_id,
-                    sender_agent_id=payload["sender_agent_id"],
-                    chain_key=from_base64url(payload["chain_key"]),
-                    message_index=payload.get("message_index", 0),
+                # 🔴 The VERIFIED signer, never ``payload["sender_agent_id"]`` — the
+                # async twin's reasoning, and the same hole. The comment at the top of
+                # this loop already says the DM is verified "never against the agent
+                # id inside its own payload"; the row's identity then came from that
+                # very field. See
+                # ``rine._client.RineClient._scan_pending_sk_distributions``.
+                new_state = sender_key_state_from_distribution(
+                    payload, group_id, agent_id_from_kid(result.sender_kid)
                 )
+                # Per SENDER, not per key id: a global check made the first
+                # distribution to claim an id the owner of that slot, so a shadow
+                # could displace a peer's genuine key. See
+                # :func:`rine._crypto.sk_distribution.already_held`.
+                if already_held(states, new_state):
+                    continue
                 states.append(new_state)
                 save_sender_key_state(self._config_dir, agent_id, group_id, states)
                 ingested += 1

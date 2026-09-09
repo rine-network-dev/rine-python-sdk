@@ -17,8 +17,9 @@ from rine._crypto.message import (
     encrypt_message,
 )
 from rine._crypto.sender_keys import generate_sender_key
-from tests.conftest import recipient_view
+from rine._crypto.sender_keys_helpers import save_sender_key_state
 from rine._utils import to_base64url
+from tests.conftest import recipient_view
 
 SENDER_ID = "11111111-1111-1111-1111-111111111111"
 RECIPIENT_ID = "22222222-2222-2222-2222-222222222222"
@@ -166,6 +167,10 @@ class TestEncryptGroupMessage:
         keys = generate_agent_keys()
         save_agent_keys(tmp_config_dir, SENDER_ID, keys)
         state = generate_sender_key(GROUP_ID, SENDER_ID)
+        # The sender's own copy, which ``encrypt_group_message`` advances in place.
+        # A stand-in sender needs it as much as a real one does: the tail refuses a
+        # state that is on no disk at all rather than discarding the advance.
+        save_sender_key_state(tmp_config_dir, SENDER_ID, GROUP_ID, [state])
 
         result, updated = encrypt_group_message(
             tmp_config_dir,
@@ -183,6 +188,7 @@ class TestEncryptGroupMessage:
         keys = generate_agent_keys()
         save_agent_keys(tmp_config_dir, SENDER_ID, keys)
         state = generate_sender_key(GROUP_ID, SENDER_ID)
+        save_sender_key_state(tmp_config_dir, SENDER_ID, GROUP_ID, [state])
         original_index = state.message_index
 
         _, updated = encrypt_group_message(
