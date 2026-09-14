@@ -859,6 +859,7 @@ class RineClient(BaseRineClient):
         message_id: str,
         *,
         agent: str | None = None,
+        peek: bool = False,
     ) -> DecryptedMessage:
         """Fetch and decrypt a single message.
 
@@ -867,6 +868,13 @@ class RineClient(BaseRineClient):
         this agent cannot open or verify comes back with ``decrypt_error`` set
         and ``plaintext = None``, exactly as it would from :meth:`inbox`. Check
         ``decrypt_error`` before touching ``plaintext``.
+
+        Reading a message marks it delivered for the acting agent **whether or
+        not it decrypts** — the server holds no key and stamps the mark before
+        this client has tried — and there is no un-mark route, so the row leaves
+        :meth:`inbox` with ``status="new"``, :meth:`poll` and SSE catch-up and
+        stays fetchable only by id. Pass ``peek=True`` to read without
+        consuming it.
 
         Reading a **group** message a second time is answered from a local copy,
         not from the group's cryptography, which spends a message's key on first
@@ -880,12 +888,17 @@ class RineClient(BaseRineClient):
         Args:
             message_id: Message UUID.
             agent: Agent to read as.
+            peek: Read without consuming the message — it stays new, and stays
+                offered by ``inbox(status="new")``, :meth:`poll` and SSE
+                catch-up. What an unattended loop wants for a message it may not
+                be able to open yet: the acting agent is still named and still
+                refused if it names nobody, so only the mark is suppressed.
 
         Returns:
             Decrypted message, or the message carrying ``decrypt_error``.
         """
         agent_id = await self._resolve_agent_id(agent)
-        extra = await self._agent_header(agent)
+        extra = self._with_peek(await self._agent_header(agent), peek=peek)
         data = await self._http.get(f"/messages/{message_id}", extra_headers=extra)
         msg = DecryptedMessage.model_validate(data)
         try:
@@ -1068,6 +1081,7 @@ class RineClient(BaseRineClient):
         """
         from rine._crypto.keys import agent_id_from_kid
         from rine._crypto.message import decrypt_message_async
+        from rine._crypto.sender_keys_store import with_sender_key_states
         from rine._crypto.sk_distribution import (
             already_held,
             distribution_group_id,
@@ -1117,49 +1131,55 @@ class RineClient(BaseRineClient):
                 # otherwise refuse every distribution forever.
                 if sender_keys_retired(self._config_dir, agent_id, group_id):
                     continue
-                # 🔴 A read-modify-write of this group's whole state array that
-                # takes NO lock — the one
-                # :mod:`rine._crypto.sender_keys_store` does not serialise. It is
-                # sound against other COROUTINES because the load, the membership
-                # check and the save below have no ``await`` between them, so no
-                # task can run in that gap. It is NOT sound against the worker
-                # thread the async group send runs its own whole-array write on
-                # (residual 1 of that module): Python threads preempt between
-                # bytecodes, and the load below is file I/O, which releases the
-                # GIL outright. Putting an await between them additionally reopens
-                # the coroutine half of exactly the lost update that module exists
-                # to close, and nothing here would catch it. The lock's own
-                # holders survive this writer the other way round because they
-                # MERGE by ``sender_key_id`` rather than asserting the array they
-                # loaded before their network call.
-                states = load_sender_key_states(self._config_dir, agent_id, group_id)
-                # 🔴 The VERIFIED signer, never ``payload["sender_agent_id"]``. The
-                # payload is the sender's own plaintext, so taking the row's identity
-                # from it lets any agent that can DM this one — every current and
-                # former member of the group, who all know its id — plant a row
-                # claiming to be THIS agent's own key. The signature check above binds
-                # the envelope to ``from_agent_id``; it says nothing about a field
-                # inside the payload, and the two were never compared. Such a row is
-                # picked up as this agent's own sending key (an ingested row has no
-                # ``created_at``, so ``needs_rotation`` cannot retire it), fanned out
-                # to the whole group as this agent's own, and sealed under — handing
-                # the planter every group post this agent then writes. Deriving the id
-                # from the kid is what the TypeScript twin has always done
-                # (``crypto/ingest.ts``, ``agentIdFromKid(result.senderKid)``); this
-                # stack diverged from it and that divergence WAS the hole. A malformed
-                # kid throws into the ``except`` below, so it fails closed — as does
-                # every field refusal ``sk_distribution`` raises.
-                new_state = sender_key_state_from_distribution(
-                    payload, group_id, agent_id_from_kid(result.sender_kid)
-                )
-                # Per SENDER, not per key id: a global check made the first
-                # distribution to claim an id the owner of that slot, so a shadow
-                # could displace a peer's genuine key. See
-                # :func:`rine._crypto.sk_distribution.already_held`.
-                if already_held(states, new_state):
-                    continue
-                states.append(new_state)
-                save_sender_key_state(self._config_dir, agent_id, group_id, states)
+                # 🔴 The load and the save below are ONE read-modify-write of this
+                # group's whole state array, and the save ASSERTS that array — it
+                # is not a merge — so the region is what makes it whole. Having no
+                # ``await`` between them excludes other COROUTINES and nothing
+                # else: the writer this actually races is the worker thread the
+                # async group send runs on, Python threads preempt between
+                # bytecodes, and the load is file I/O, which releases the GIL
+                # outright. Nor would surviving be a property of the other
+                # holders — the encrypt tail
+                # (:func:`rine._crypto.message.encrypt_group_message`) and the
+                # rotation (:func:`rine._sender_key_ops.get_or_create_sender_key_sync`)
+                # assert whole arrays of their own, so an unlocked append here
+                # erased the fresh key a rotation had just fanned out to the whole
+                # group. The region is taken HERE, per group, rather than around
+                # the loop: one pass may carry distributions for several groups,
+                # and a caller must not hold one group's lock while it opens
+                # another group's DM. It is entered from outside every other
+                # region — ``_self_heal_group_decrypt`` calls this only after the
+                # failed decrypt's exception has escaped its own region — so it
+                # cannot wait on itself.
+                async with with_sender_key_states(self._config_dir, agent_id, group_id):
+                    states = load_sender_key_states(self._config_dir, agent_id, group_id)
+                    # 🔴 The VERIFIED signer, never ``payload["sender_agent_id"]``. The
+                    # payload is the sender's own plaintext, so taking the row's identity
+                    # from it lets any agent that can DM this one — every current and
+                    # former member of the group, who all know its id — plant a row
+                    # claiming to be THIS agent's own key. The signature check above binds
+                    # the envelope to ``from_agent_id``; it says nothing about a field
+                    # inside the payload, and the two were never compared. Such a row is
+                    # picked up as this agent's own sending key (an ingested row has no
+                    # ``created_at``, so ``needs_rotation`` cannot retire it), fanned out
+                    # to the whole group as this agent's own, and sealed under — handing
+                    # the planter every group post this agent then writes. Deriving the id
+                    # from the kid is what the TypeScript twin has always done
+                    # (``crypto/ingest.ts``, ``agentIdFromKid(result.senderKid)``); this
+                    # stack diverged from it and that divergence WAS the hole. A malformed
+                    # kid throws into the ``except`` below, so it fails closed — as does
+                    # every field refusal ``sk_distribution`` raises.
+                    new_state = sender_key_state_from_distribution(
+                        payload, group_id, agent_id_from_kid(result.sender_kid)
+                    )
+                    # Per SENDER, not per key id: a global check made the first
+                    # distribution to claim an id the owner of that slot, so a shadow
+                    # could displace a peer's genuine key. See
+                    # :func:`rine._crypto.sk_distribution.already_held`.
+                    if already_held(states, new_state):
+                        continue
+                    states.append(new_state)
+                    save_sender_key_state(self._config_dir, agent_id, group_id, states)
                 ingested += 1
             except Exception:
                 logger.debug("SK ingestion failed", exc_info=True)
@@ -1301,6 +1321,13 @@ class RineClient(BaseRineClient):
         (:meth:`_a_group_the_sync_endpoint_refuses`). Use :meth:`send` for a
         group.
 
+        A reply that arrives but will not open is reported, never raised: the
+        send has already landed and the answer is already on the wire, so the row
+        comes back with ``decrypt_error`` set and ``plaintext = None``, exactly as
+        it would from :meth:`read`. Check ``reply.decrypt_error`` before touching
+        ``reply.plaintext``, and read ``reply=None`` as the timeout it is — a
+        different outcome from a reply this agent could not read.
+
         Args:
             to: Recipient handle or agent UUID. A group is not a legal
                 recipient here, by handle or by id.
@@ -1310,7 +1337,9 @@ class RineClient(BaseRineClient):
             agent: Agent to send as.
 
         Returns:
-            SendAndWaitResult with sent message and reply (or None on timeout).
+            SendAndWaitResult with the sent message and one of three answers in
+            ``reply``: the decrypted reply, ``None`` if the wait timed out, or the
+            reply row carrying ``decrypt_error`` because it would not open.
 
         Raises:
             UnsupportedTargetError: The recipient names a group.
@@ -1339,7 +1368,17 @@ class RineClient(BaseRineClient):
         raw_reply = data.get("reply")
         if raw_reply is not None:
             reply_msg = DecryptedMessage.model_validate(raw_reply)
-            reply_msg = await self._decrypt_message(agent_id, reply_msg)
+            # The same degrade every other receive surface runs: the send has
+            # already happened and the reply is already on the wire, so raising
+            # here would take the whole call down over one unreadable answer and
+            # hand the caller no row to inspect. There is no group self-heal arm
+            # because ``/messages/sync`` is 1:1 only — a group is refused above,
+            # before anything is sealed — so the arm ``read()`` has for a cold
+            # sender key could only ever forward to this same degrade.
+            try:
+                reply_msg = await self._decrypt_message(agent_id, reply_msg)
+            except Exception as e:  # noqa: BLE001 — degrade, never raise (inbox's contract)
+                reply_msg = self._apply_decrypt_failure(reply_msg, e)
             return SendAndWaitResult(sent=sent, reply=reply_msg)
         return SendAndWaitResult(sent=sent, reply=None)
 

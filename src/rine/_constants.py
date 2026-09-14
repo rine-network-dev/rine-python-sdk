@@ -96,6 +96,21 @@ NotGiven = _NotGiven
 # --- Wire format constants ---
 
 
+#: The request header that reads a message without consuming it.
+#:
+#: The twin of ``rine.api.message_words.PEEK_HEADER``. Two constants bound by a
+#: test rather than one import, for the reason ``rine._actor`` states: the
+#: backend and this SDK both own the top-level ``rine`` import package, so no
+#: interpreter holds both. Boolean-valued on the wire — see the server constant
+#: for the accepted spellings; this stack sends ``"1"``.
+#:
+#: Deliberately not re-exported from ``rine/__init__``. ``AGENT_HEADER`` is
+#: public because a caller building raw requests needs it; the peek surface is
+#: ``read(peek=True)``, and publishing the header would invite a second,
+#: hand-rolled copy of the one decision both clients must share.
+PEEK_HEADER = "X-Rine-Peek"
+
+
 class EncryptionVersion:
     """Encryption version identifiers used in the wire protocol."""
 

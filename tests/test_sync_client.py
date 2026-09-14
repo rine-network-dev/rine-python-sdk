@@ -463,15 +463,18 @@ class TestSendAndWaitTimeout:
             )
         )
 
-        try:
-            sync_client.send_and_wait(
-                "other@acme.rine.network",
-                {"task": "hi"},
-                timeout=2.5,
-            )
-        except Exception:
-            # May fail on decrypt — we only care about the HTTP call params
-            pass
+        # No ``try``: the reply row here is deliberately unopenable, and
+        # ``send_and_wait`` reports that on the row rather than raising (see
+        # ``test_send_and_wait_degrades``). A swallowed exception here is what
+        # let the unguarded decrypt ship — it made the call's own contract
+        # unassertable while this test still read green.
+        result = sync_client.send_and_wait(
+            "other@acme.rine.network",
+            {"task": "hi"},
+            timeout=2.5,
+        )
+        assert result.reply is not None
+        assert result.reply.decrypt_error is not None
 
         assert sync_route.called
         request = sync_route.calls[0].request

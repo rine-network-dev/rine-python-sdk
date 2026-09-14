@@ -14,13 +14,17 @@ which is what a CLI invocation and a restarted worker both are.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import pathlib
+import re
 import stat
 
 import pytest
 
 from rine._crypto.group_read_cache import (
+    GROUP_READ_MAX_BYTES,
     GROUP_READ_MAX_ENTRIES,
     delete_group_read_cache,
     lookup_group_read,
@@ -34,6 +38,7 @@ from rine._crypto.message import (
 )
 from rine._crypto.sender_keys import SenderKeyState, generate_sender_key
 from rine._crypto.sender_keys_helpers import save_sender_key_state
+from rine._utils import from_base64url, to_base64url
 from rine.errors import CryptoError, SenderMismatchError
 from tests.test_sender_binding import GROUP_ID, PAYLOAD, SENDER_B, VICTIM_V, KeyServer
 
@@ -190,6 +195,115 @@ class TestBounds:
             fh.write("{not json")
 
         assert lookup_group_read(tmp_config_dir, VICTIM_V, GROUP_ID, b"abc") is None
+
+
+def _ts_number(source: str, name: str) -> int:
+    """One ``export const <name> = …;`` from the twin, as an integer.
+
+    Accepts a plain literal or a product of them, which is how both stacks spell
+    a byte bound. Anything else is a source shape this helper has no reading of,
+    and it says so rather than answering ``0``.
+    """
+    match = re.search(rf"\b{name} = ([\d ]+(?:\* *[\d ]+)*);", source)
+    assert match, f"no readable {name} literal in the twin's source"
+    product = 1
+    for factor in match.group(1).split("*"):
+        product *= int(factor.strip())
+    return product
+
+
+class TestTheCrossStackFile:
+    """One config dir driven by both stacks is ONE cache file, so its shape is a contract.
+
+    ``rine-core/src/crypto/group-read-cache.ts`` builds the same path out of the
+    same components and reads the same two entry keys, and a CLI and an SDK
+    pointed at one ``RINE_CONFIG_DIR`` are the ordinary case rather than an exotic
+    one. So the path, the digest and the entry keys are not implementation
+    details of this module: change one here alone and the other stack reads a
+    file it cannot parse, which :func:`rine._crypto.group_read_cache._load`
+    tolerates as an empty cache — and for a row whose one-time key is already
+    spent, an empty cache is the sealed-message refusal rather than a slow path.
+    """
+
+    def test_recording_when_the_group_id_is_upper_cased_then_the_file_is_lower_cased(
+        self, tmp_config_dir
+    ):
+        """``groupId.toLowerCase()`` on the other side, so one group is one file.
+
+        🔴 The id has to carry hex LETTERS. Every other group id in this suite is
+        digits only, so an upper-cased spelling of one is the same string and a
+        test built on it passes with the lower-casing deleted.
+
+        🔴 Only the FIRST segment is upper-cased, and that is not cosmetic. An
+        all-upper spelling reads to ``scripts/check-internal-ids.py`` as a
+        citation of an internal record — its ``family`` class matches up to six
+        upper-case letters, a hyphen and a digit, which any upper-cased hex
+        segment followed by a numeric one satisfies — so it turns the mandated
+        pre-mirror gate red on this file. Upper-casing one eight-character
+        segment still differs from its own ``.lower()``, which is all the
+        assertion needs.
+        """
+        mixed_case = "AABBCCDD-eeff-4011-8022-334455667788"
+        record_group_read(tmp_config_dir, VICTIM_V, mixed_case, b"abc", b"envelope")
+
+        expected = os.path.join(
+            tmp_config_dir, "keys", VICTIM_V, "group_reads", f"{mixed_case.lower()}.json"
+        )
+        assert os.listdir(os.path.join(tmp_config_dir, "keys", VICTIM_V, "group_reads")) == [
+            os.path.basename(expected)
+        ]
+        # And it answers under either spelling, which is what makes the two
+        # stacks' spellings interchangeable rather than merely similar.
+        assert lookup_group_read(tmp_config_dir, VICTIM_V, mixed_case.lower(), b"abc") == (
+            b"envelope"
+        )
+
+    def test_entry_when_recorded_then_it_is_the_shape_the_other_stack_reads(self, tmp_config_dir):
+        """``{"k": base64url sha256 of the ciphertext, "e": base64url envelope}``."""
+        record_group_read(tmp_config_dir, VICTIM_V, GROUP_ID, b"ciphertext", b"envelope")
+
+        with open(_cache_file(tmp_config_dir)) as fh:
+            entries = json.load(fh)
+
+        assert [sorted(entry) for entry in entries] == [["e", "k"]]
+        assert entries[0]["k"] == to_base64url(hashlib.sha256(b"ciphertext").digest())
+        assert from_base64url(entries[0]["e"]) == b"envelope"
+
+    def test_the_other_stack_still_builds_the_same_file(self):
+        """The assertions above are computed from Python's own literals alone.
+
+        So they pin this stack against itself and say nothing about the twin —
+        change ``rine-core``'s entry bound, its digest or its lower-casing and
+        the two stacks write one file the other cannot parse, with a green suite
+        on this side. Read the twin's own source for the four values, in the
+        shape ``test_actor_contract.py``'s ``TestThePeekHeaderConstant`` uses for
+        the actor and peek headers: the two deployables cannot import each other,
+        so a test is the only thing that can bind them.
+        """
+        twin = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "rine-core/src/crypto/group-read-cache.ts"
+        )
+        if not twin.is_file():
+            pytest.skip("rine-core source not present — SDK tested outside the monorepo")
+        source = twin.read_text()
+
+        # The two bounds. Both are written as one product on both stacks, so the
+        # factors are read rather than the expression evaluated — a plain integer
+        # is accepted too, because either spelling is the same contract.
+        assert _ts_number(source, "GROUP_READ_MAX_ENTRIES") == GROUP_READ_MAX_ENTRIES
+        assert _ts_number(source, "GROUP_READ_MAX_BYTES") == GROUP_READ_MAX_BYTES
+        # The path, the lower-casing and the digest, each as one literal: the
+        # directory name, ``groupId.toLowerCase()`` in the filename, and sha256
+        # over the framed ciphertext.
+        assert '"group_reads"' in source
+        assert "${groupId.toLowerCase()}.json" in source
+        assert "toBase64Url(sha256(ciphertext))" in source
+        # The entry keys, as the twin WRITES them — the ``CacheEntry`` interface
+        # declares the same two names, but a declaration a writer has stopped
+        # honouring is not the contract. A rename on one side is an unparseable
+        # file on the other, which both modules degrade to an empty cache.
+        assert "{ k: key, e: toBase64Url(innerEnvelope) }" in source
 
 
 class TestTheLeaveTakesIt:

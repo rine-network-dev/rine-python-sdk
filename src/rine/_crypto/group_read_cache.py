@@ -11,9 +11,35 @@ This cache is the plaintext being kept, and it is the receiving counterpart of
 the native core's ``self_read.bin``, which has always kept the plaintext of a
 member's OWN sends for the same reason. It copies that file's shape on purpose:
 keyed on a digest of the framed ciphertext, bounded by entry count and by bytes,
-one file per group, written 0600. Its TypeScript twin is
-``rine-core/src/crypto/group-read-cache.ts``; the two never share a file, so
-they need only agree on behaviour.
+one file per group, written 0600.
+
+🔴 **Its TypeScript twin — ``rine-core/src/crypto/group-read-cache.ts`` — shares
+the FILE, not merely the behaviour.** Both stacks derive
+``<config_dir>/keys/<agent_id>/group_reads/<lower-cased group id>.json``, hold the
+same ``{"k": digest, "e": envelope}`` entries, and bound them by the same
+:data:`GROUP_READ_MAX_ENTRIES` and :data:`GROUP_READ_MAX_BYTES` — so a CLI and
+this SDK pointed at one ``RINE_CONFIG_DIR``, which is the ordinary case rather
+than an exotic one, are two writers of one cache. Three things follow, and none
+of them is true of a cache the two stacks merely mirror:
+
+- The on-disk shape is a CROSS-STACK CONTRACT. Change the path, the digest, the
+  entry keys or the bounds on one stack alone and the other reads a file it
+  cannot parse, which :func:`_load` tolerates as an EMPTY cache — and for a row
+  whose one-time key is already spent, an empty cache is the sealed-message
+  refusal, not a slow path. Pinned here by
+  ``tests/test_group_read_cache.py::TestTheCrossStackFile``.
+- :func:`record_group_read` is a read-modify-write of the whole array, so two
+  clients over one config dir lose each other's entries. It is the shape of the
+  sender-key lost update but NOT the same residual, and no in-process lock
+  reaches it: the racing writer is another PROCESS. What it costs is bounded — a
+  lost entry is a row that cannot be re-read, never wrong plaintext and never a
+  wrong verdict — but it is permanent, because the key that would rebuild the
+  entry was spent at the first decrypt.
+- The two writes are not the same write. This stack goes through
+  :func:`rine._config._write_atomic` (temp file, then rename); the TypeScript one
+  writes in place. So a reader on either stack can catch that writer's
+  truncation and see an empty cache, which is the previous point's loss with no
+  concurrent writer on this side at all.
 
 🔴 **This is plaintext at rest, and it widens what a stolen config dir yields.**
 The dir already holds group state in the clear under 0600, and MLS group state

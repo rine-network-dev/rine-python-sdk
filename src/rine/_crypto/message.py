@@ -40,6 +40,7 @@ from rine._crypto.sender_keys_store import (
     merge_sender_key_states,
     states_from_sender,
     with_sender_key_states,
+    with_sender_key_states_sync,
 )
 from rine._crypto.sign import sign_payload
 from rine._utils import from_base64url, to_base64url
@@ -311,14 +312,16 @@ def encrypt_group_message(
     # Cache for sender self-read
     updated.skipped_keys[self_read_index] = to_base64url(self_read_key)
 
-    # 🔴 The THIRD read-modify-write of this group's state file that takes no
-    # lock, and the only one of the three inside an ``async`` function — ``seal_group``
-    # above is not awaited, but this whole function runs on the worker thread the
-    # async send hands it to. It is sound against other COROUTINES because the load
-    # and the save below have no ``await`` between them; it is NOT sound against
-    # that worker thread's own peers, which is residual 1 of
-    # :mod:`rine._crypto.sender_keys_store`. Putting an await between them would
-    # additionally reopen the coroutine half, with nothing here to catch it.
+    # 🔴 The THIRD read-modify-write of this group's state file, and it is HELD:
+    # the load and the save below sit in one
+    # :func:`rine._crypto.sender_keys_store.with_sender_key_states_sync` region,
+    # the thread tier, because this whole function runs on the worker thread the
+    # async send hands it to and an :class:`asyncio.Lock` cannot reach a thread.
+    # "No ``await`` between the load and the save" was never the argument that
+    # made this safe — it excludes other COROUTINES and nothing else, and the
+    # writer this site actually races is another thread. Do not put an await
+    # between them even so: this is a sync function, and making it async would
+    # reopen the coroutine half against a lock this side cannot poll for.
     #
     # 🔴 The reverse direction is a KNOWN RESIDUAL and is not closed: a decrypt of
     # this agent's own past post holds the file's lock across its network verify
@@ -369,22 +372,23 @@ def encrypt_group_message(
     # it returns — but this function is reachable from outside that path, and a
     # silent discard there is a real, transmittable message whose sender can
     # never read it back. It is refused instead.
-    all_states = load_sender_key_states(config_dir, sender_agent_id, group_id)
-    # 🔴 By the (sender, key) pair, never the key id alone: a peer may legitimately
-    # hold a row under an id this agent also uses, and a write that matched on the id
-    # would overwrite THAT peer's chain key with this agent's own state — losing the
-    # peer's key for good, on an ordinary send.
-    own = states_from_sender(all_states, sender_agent_id)
-    target = next((s for s in own if s.sender_key_id == updated.sender_key_id), None)
-    if target is not None:
-        save_sender_key_state(
-            config_dir,
-            sender_agent_id,
-            group_id,
-            [updated if s is target else s for s in all_states],
-        )
-    elif not own and not sender_keys_retired(config_dir, sender_agent_id, group_id):
-        raise UnpersistedSenderKeyStateError(updated.sender_key_id, group_id)
+    with with_sender_key_states_sync(config_dir, sender_agent_id, group_id):
+        all_states = load_sender_key_states(config_dir, sender_agent_id, group_id)
+        # 🔴 By the (sender, key) pair, never the key id alone: a peer may legitimately
+        # hold a row under an id this agent also uses, and a write that matched on the id
+        # would overwrite THAT peer's chain key with this agent's own state — losing the
+        # peer's key for good, on an ordinary send.
+        own = states_from_sender(all_states, sender_agent_id)
+        target = next((s for s in own if s.sender_key_id == updated.sender_key_id), None)
+        if target is not None:
+            save_sender_key_state(
+                config_dir,
+                sender_agent_id,
+                group_id,
+                [updated if s is target else s for s in all_states],
+            )
+        elif not own and not sender_keys_retired(config_dir, sender_agent_id, group_id):
+            raise UnpersistedSenderKeyStateError(updated.sender_key_id, group_id)
 
     return (
         EncryptResult(
@@ -446,6 +450,31 @@ def _record_read(
         from_base64url(encrypted_payload_b64),
         encode_envelope(decoded.kid, decoded.signature, decoded.payload),
     )
+
+
+def _replay_result_sync(
+    config_dir: str,
+    recipient_agent_id: str,
+    group_id: str,
+    encrypted_payload_b64: str,
+    client: SyncHttpClient,
+    from_agent_id: str,
+) -> DecryptResult | None:
+    """The cached answer for a row this agent already opened, or ``None`` (sync).
+
+    The synchronous twin of :func:`_replay_result_async`, and it exists as a
+    function for the same reason that one does: the cache is consulted twice per
+    decrypt — once before the state file's lock and once inside it — and the two
+    consultations must be the same check, including the signature verify.
+    """
+    replay = _replayed_envelope(config_dir, recipient_agent_id, group_id, encrypted_payload_b64)
+    if replay is None:
+        return None
+    verification = verify_envelope_sender_sync(
+        replay.kid, replay.payload, replay.signature, client, from_agent_id
+    )
+    refuse_if_inauthentic(verification)
+    return _group_result(replay, verification)
 
 
 async def _replay_result_async(
@@ -577,42 +606,58 @@ def decrypt_group_message_sync(
     # A row this agent has already opened is answered from its own read cache:
     # the ratchet spends the message key at the first decrypt and cannot be
     # asked twice. The envelope is verified here exactly as a first read is.
-    replay = _replayed_envelope(config_dir, recipient_agent_id, group_id, encrypted_payload_b64)
-    if replay is not None:
-        verification = verify_envelope_sender_sync(
-            replay.kid, replay.payload, replay.signature, client, from_agent_id
+    replayed = _replay_result_sync(
+        config_dir, recipient_agent_id, group_id, encrypted_payload_b64, client, from_agent_id
+    )
+    if replayed is not None:
+        return replayed
+
+    # 🔴 Everything below is ONE read-modify-write across a network verify, and it
+    # runs under this file's THREAD lock — the tier a sync caller can take, since
+    # this function is reached both from the sync client's own thread and from the
+    # worker thread the async client hands its group send to. The region, the
+    # in-region cache recheck and the merge are the async twin's below, for the
+    # reasons documented there; the only difference is which tier of the lock a
+    # sync caller is entitled to take. The read cache is consulted a SECOND time
+    # inside the region because the ratchet spends a message key exactly once, so
+    # a caller that lost the race must be shown the winner's recorded read rather
+    # than a spent-key ``CryptoError`` the render path does not recover.
+    with with_sender_key_states_sync(config_dir, recipient_agent_id, group_id):
+        replayed = _replay_result_sync(
+            config_dir, recipient_agent_id, group_id, encrypted_payload_b64, client, from_agent_id
         )
+        if replayed is not None:
+            return replayed
+
+        decoded, _sender_key_id, message_index, updated = _decrypt_group_core(
+            config_dir, recipient_agent_id, group_id, encrypted_payload_b64, from_agent_id
+        )
+
+        verification = verify_envelope_sender_sync(
+            decoded.kid, decoded.payload, decoded.signature, client, from_agent_id
+        )
+
         refuse_if_inauthentic(verification)
-        return _group_result(replay, verification)
 
-    decoded, _sender_key_id, message_index, updated = _decrypt_group_core(
-        config_dir, recipient_agent_id, group_id, encrypted_payload_b64, from_agent_id
-    )
+        # Preserve self-read keys for own sender key
+        if updated.sender_agent_id == recipient_agent_id:
+            prev = _own_row(config_dir, recipient_agent_id, group_id, updated.sender_key_id)
+            if prev and message_index in (prev.skipped_keys or {}):
+                cached = prev.skipped_keys[message_index]
+                if message_index not in updated.skipped_keys:
+                    updated.skipped_keys[message_index] = cached
 
-    verification = verify_envelope_sender_sync(
-        decoded.kid, decoded.payload, decoded.signature, client, from_agent_id
-    )
-
-    refuse_if_inauthentic(verification)
-
-    # Preserve self-read keys for own sender key
-    if updated.sender_agent_id == recipient_agent_id:
-        prev = _own_row(config_dir, recipient_agent_id, group_id, updated.sender_key_id)
-        if prev and message_index in (prev.skipped_keys or {}):
-            cached = prev.skipped_keys[message_index]
-            if message_index not in updated.skipped_keys:
-                updated.skipped_keys[message_index] = cached
-
-    # Merge rather than assert an array built from a pre-network read, exactly as
-    # the async twin below and ``crypto/message.ts`` do. The map this path used to
-    # write back was keyed by sender key id over the WHOLE file, so a second row
-    # legitimately sharing an id — see :func:`_decrypt_group_core` — was collapsed
-    # away by the load and then deleted by the save. The merge asserts the one row
-    # this decrypt knows about and says nothing about the rest of the file, which
-    # also stops an ingest that landed during the verify from being rolled back.
-    merge_sender_key_states(config_dir, recipient_agent_id, group_id, [updated])
-    _record_read(config_dir, recipient_agent_id, group_id, encrypted_payload_b64, decoded)
-    return _group_result(decoded, verification)
+        # Merge rather than assert an array built from a pre-network read, exactly
+        # as the async twin below and ``crypto/message.ts`` do. The map this path
+        # used to write back was keyed by sender key id over the WHOLE file, so a
+        # second row legitimately sharing an id — see :func:`_decrypt_group_core` —
+        # was collapsed away by the load and then deleted by the save. The merge
+        # asserts the one row this decrypt knows about and says nothing about the
+        # rest of the file, which also stops an ingest that landed during the
+        # verify from being rolled back.
+        merge_sender_key_states(config_dir, recipient_agent_id, group_id, [updated])
+        _record_read(config_dir, recipient_agent_id, group_id, encrypted_payload_b64, decoded)
+        return _group_result(decoded, verification)
 
 
 async def decrypt_group_message_async(

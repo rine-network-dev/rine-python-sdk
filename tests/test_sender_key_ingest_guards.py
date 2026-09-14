@@ -37,6 +37,8 @@ import httpx
 import pytest
 import respx
 
+from rine import _client as async_client_module
+from rine import _sync_client as sync_client_module
 from rine._constants import MessageType
 from rine._crypto._agent_keys import recipient_keys_from_response
 from rine._crypto.keys import (
@@ -54,6 +56,7 @@ from rine._crypto.sender_keys import generate_sender_key
 from rine._crypto.sender_keys_helpers import load_sender_key_states, save_sender_key_state
 from rine._http import SyncHttpClient
 from rine._utils import to_base64url
+from tests.conftest import sender_key_region_is_held_here
 
 API = "https://rine.network"
 #: Any agent that can DM the reader — it never has to be a member to send the DM.
@@ -283,6 +286,69 @@ class TestTheKeyIdSquat:
 
         assert sync_client._scan_pending_sk_distributions(agent_id).ingested == 1
         assert len(_rows(tmp_config_dir, agent_id)) == 1
+
+
+class TestTheIngestTakesItsRegion:
+    """Both clients append inside the state file's lock, not merely atomically.
+
+    The ingest is a load, an append and a save of the WHOLE array — an assert,
+    not a merge — so anything that landed between its load and its save is
+    discarded. What lands there is the worst possible thing to lose: a rotation
+    fanning a fresh key out to the group runs its own whole-array write from a
+    worker thread, and an unlocked append erases it. The peers then hold a key
+    the sender has retired and every later post reads as sealed, with nothing in
+    the file to say which write won.
+
+    Neither client could be serialised by the loop tier alone, which is why this
+    pins the region rather than the atomic save: the async client's group send
+    runs on a worker thread that no :class:`asyncio.Lock` reaches, and a host
+    driving a sync client and an async one on two threads used to race here
+    outright.
+    """
+
+    @respx.mock
+    def test_sync_ingest_when_it_writes_then_the_region_is_held(
+        self, sync_client, tmp_config_dir, agent_id, foreign_config_dir, monkeypatch
+    ):
+        """Asked from inside the write, because the bytes cannot tell the difference."""
+        published, honest = _stand_up(foreign_config_dir, tmp_config_dir, agent_id)
+        _register(agent_id, [honest.row], published)
+        held: list[bool] = []
+        real = sync_client_module.save_sender_key_state
+
+        def watched(config_dir, writer_id, gid, states):
+            held.append(sender_key_region_is_held_here(config_dir, writer_id, gid))
+            return real(config_dir, writer_id, gid, states)
+
+        monkeypatch.setattr(sync_client_module, "save_sender_key_state", watched)
+
+        assert sync_client._scan_pending_sk_distributions(agent_id).ingested == 1
+
+        assert held == [True]
+        # And the ingest is still correct with the writer wrapped, so a passing
+        # region assertion is never a passing assertion over a dead code path.
+        assert "the group secret" in _read_group_post(tmp_config_dir, agent_id, honest.post)
+
+    @respx.mock
+    async def test_async_ingest_when_it_writes_then_the_region_is_held(
+        self, async_client, tmp_config_dir, agent_id, foreign_config_dir, monkeypatch
+    ):
+        """The async client's own copy, which is the one the send races."""
+        published, honest = _stand_up(foreign_config_dir, tmp_config_dir, agent_id)
+        _register(agent_id, [honest.row], published)
+        held: list[bool] = []
+        real = async_client_module.save_sender_key_state
+
+        def watched(config_dir, writer_id, gid, states):
+            held.append(sender_key_region_is_held_here(config_dir, writer_id, gid))
+            return real(config_dir, writer_id, gid, states)
+
+        monkeypatch.setattr(async_client_module, "save_sender_key_state", watched)
+
+        assert (await async_client._scan_pending_sk_distributions(agent_id)).ingested == 1
+
+        assert held == [True]
+        assert "the group secret" in _read_group_post(tmp_config_dir, agent_id, honest.post)
 
 
 class TestTheGroupIdNamespace:

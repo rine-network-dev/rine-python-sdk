@@ -24,6 +24,7 @@ import respx
 
 from rine import AGENT_HEADER, RineClient, SyncRineClient, normalize_actor, single_actor_value
 from rine._actor import ACTING_AGENT_ENV
+from rine._constants import PEEK_HEADER
 from rine._resolve import resolve_agent
 from rine.errors import ConfigError
 
@@ -819,6 +820,46 @@ class TestTheHeaderConstant:
             str(path.relative_to(src))
             for path in src.rglob("*.py")
             if path.name != "_actor.py" and f'"{AGENT_HEADER}"' in path.read_text()
+        ]
+        assert offenders == []
+
+
+class TestThePeekHeaderConstant:
+    """``X-Rine-Peek``, held to the same single-declaration rule as the actor header.
+
+    The same two-deployables reason :class:`TestTheHeaderConstant` gives applies
+    unchanged: the backend cannot import this SDK, so the two constants are bound
+    by this test instead. The peek header is the load-bearing half of
+    ``read(peek=True)`` — a client that spells it differently from the server
+    consumes every row it believes it is deferring, silently and in the direction
+    that loses work.
+    """
+
+    def test_the_sdk_names_the_peek_header_once(self):
+        assert PEEK_HEADER == "X-Rine-Peek"
+
+    def test_the_server_still_spells_it_the_same_way(self):
+        api = pathlib.Path(__file__).resolve().parents[2] / "src/rine/api"
+        if not api.is_dir():
+            pytest.skip("server source not present — SDK tested outside the monorepo")
+
+        spellings = {
+            match.group(1): path.name
+            for path in sorted(api.glob("*.py"))
+            for match in re.finditer(r'^PEEK_HEADER = "([^"]+)"', path.read_text(), re.MULTILINE)
+        }
+        assert spellings, f"no PEEK_HEADER constant anywhere in {api}"
+        assert len(spellings) == 1, (
+            f"the server spells the peek header more than one way: {spellings}"
+        )
+        assert next(iter(spellings)) == PEEK_HEADER
+
+    def test_the_sdk_source_holds_no_second_copy_of_the_peek_header(self):
+        src = pathlib.Path(__file__).resolve().parents[1] / "src/rine"
+        offenders = [
+            str(path.relative_to(src))
+            for path in src.rglob("*.py")
+            if path.name != "_constants.py" and f'"{PEEK_HEADER}"' in path.read_text()
         ]
         assert offenders == []
 

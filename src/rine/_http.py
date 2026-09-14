@@ -12,8 +12,6 @@ import httpx
 
 from rine._actor import AGENT_HEADER
 from rine._config import (
-    cache_token,
-    get_cached_token,
     get_credential_entry,
     resolve_api_url,
 )
@@ -30,6 +28,7 @@ from rine._constants import (
 )
 from rine._crypto._key_cache import KeyCache
 from rine._logging import logger
+from rine._token_cache import TokenCache
 from rine._version import __version__
 from rine.errors import (
     APIConnectionError,
@@ -265,6 +264,8 @@ class SyncHttpClient:
         keys_cache: An existing signing-key cache to share instead of starting a
             fresh one — how a short-lived client borrows a long-lived client's
             view of its peers' keys, which is what lets it notice a rotation.
+        time_fn: Wall-clock source for token expiry (injectable for deterministic
+            tests). Must agree with the clock ``cache_token`` writes against.
     """
 
     def __init__(
@@ -277,6 +278,7 @@ class SyncHttpClient:
         http_client: httpx.Client | None = None,
         rng: Callable[[], float] = random.random,
         keys_cache: KeyCache | None = None,
+        time_fn: Callable[[], float] = time.time,
     ) -> None:
         self._config_dir = config_dir
         self._api_url = api_url or resolve_api_url()
@@ -286,9 +288,10 @@ class SyncHttpClient:
         self._owns_client = http_client is None
         self._http = http_client or httpx.Client(timeout=timeout)
         self._profile = "default"
-        self._cached_token: str | None = None
         self._rng = rng
+        self._time_fn = time_fn
         self._refresh_margin = _jittered_margin(rng)
+        self._tokens = TokenCache(config_dir, self._profile, self._refresh_margin, time_fn)
         self._keys_cache = keys_cache or KeyCache(KEY_CACHE_TTL, KEY_CACHE_MAX_ENTRIES)
 
     def close(self) -> None:
@@ -297,14 +300,21 @@ class SyncHttpClient:
             self._http.close()
 
     def _get_token(self, force: bool = False) -> str:
-        """Get a valid token, refreshing if needed."""
-        if not force and self._cached_token:
-            return self._cached_token
+        """Get a valid token, refreshing it before it expires.
+
+        The held token is only handed back while it is still fresh by this
+        client's jittered margin. Without that check a process that outlives one
+        token lifetime — a poller, a gateway, any always-on agent — holds its
+        first token forever and learns it expired from a 401, which is one
+        rejected request per token lifetime for as long as the process runs.
+        Everything about which token counts as fresh lives in
+        :class:`rine._token_cache.TokenCache`, held by both clients; what
+        is left here is the fetch, which is the only part that differs.
+        """
         if not force:
-            cached = get_cached_token(self._config_dir, self._profile, self._refresh_margin)
-            if cached:
-                self._cached_token = cached
-                return cached
+            held = self._tokens.fresh_token()
+            if held is not None:
+                return held
 
         entry = get_credential_entry(self._config_dir, self._profile)
         if not entry:
@@ -317,16 +327,12 @@ class SyncHttpClient:
             entry["client_secret"],
             rng=self._rng,
         )
-        try:
-            cache_token(self._config_dir, self._profile, token, expires_in)
-        except Exception:
-            logger.warning("Failed to cache token", exc_info=True)
-        self._cached_token = token
+        self._tokens.stamp(token, expires_in)
         return token
 
     def _invalidate_token(self) -> None:
-        """Invalidate the in-memory token cache."""
-        self._cached_token = None
+        """Invalidate the in-memory token cache, expiry included."""
+        self._tokens.clear()
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         headers: dict[str, str] = {"User-Agent": _USER_AGENT}
@@ -413,12 +419,16 @@ class SyncHttpClient:
                     continue
                 raise APIConnectionError(f"Connection failed: {method} {path}") from exc
 
-            # Auto-refresh on 401 (once). DEBUG, not WARNING: at a 900 s token
-            # TTL this is the designed self-healing path firing on schedule, and
-            # a warning that fires hourly forever teaches operators to ignore
-            # the ones that mean something.
+            # Auto-refresh on 401 (once). WARNING, and it belongs at WARNING:
+            # ``_get_token`` refreshes before the token expires, so reaching here
+            # means the server rejected a token this client believed was live —
+            # a revocation, a clock skew, a credential change. That is rare and
+            # unexpected. It was demoted to DEBUG while this path *was* the
+            # refresh mechanism and fired every token lifetime; if it ever looks
+            # like routine noise again, the expiry check has regressed and that
+            # is the thing to fix.
             if resp.status_code == 401 and authenticated and not auth_retried:
-                logger.debug("401 received, refreshing token")
+                logger.warning("401 received, refreshing token")
                 auth_retried = True
                 self._invalidate_token()
                 headers["Authorization"] = f"Bearer {self._get_token(force=True)}"
@@ -638,6 +648,8 @@ class AsyncHttpClient:
         http_client: Optional custom ``httpx.AsyncClient``.
         rng: Uniform ``[0, 1)`` source for the per-instance refresh-margin jitter
             and token-retry backoff (injectable for deterministic tests).
+        time_fn: Wall-clock source for token expiry (injectable for deterministic
+            tests). Must agree with the clock ``cache_token`` writes against.
     """
 
     def __init__(
@@ -649,6 +661,7 @@ class AsyncHttpClient:
         max_retries: int = DEFAULT_MAX_RETRIES,
         http_client: httpx.AsyncClient | None = None,
         rng: Callable[[], float] = random.random,
+        time_fn: Callable[[], float] = time.time,
     ) -> None:
         self._config_dir = config_dir
         self._api_url = api_url or resolve_api_url()
@@ -658,9 +671,10 @@ class AsyncHttpClient:
         self._owns_client = http_client is None
         self._http = http_client or httpx.AsyncClient(timeout=timeout)
         self._profile = "default"
-        self._cached_token: str | None = None
         self._rng = rng
+        self._time_fn = time_fn
         self._refresh_margin = _jittered_margin(rng)
+        self._tokens = TokenCache(config_dir, self._profile, self._refresh_margin, time_fn)
         self._keys_cache = KeyCache(KEY_CACHE_TTL, KEY_CACHE_MAX_ENTRIES)
 
     async def close(self) -> None:
@@ -669,14 +683,21 @@ class AsyncHttpClient:
             await self._http.aclose()
 
     async def _get_token(self, force: bool = False) -> str:
-        """Get a valid token, refreshing if needed."""
-        if not force and self._cached_token:
-            return self._cached_token
+        """Get a valid token, refreshing it before it expires.
+
+        The held token is only handed back while it is still fresh by this
+        client's jittered margin. Without that check a process that outlives one
+        token lifetime — a poller, a gateway, any always-on agent — holds its
+        first token forever and learns it expired from a 401, which is one
+        rejected request per token lifetime for as long as the process runs.
+        Everything about which token counts as fresh lives in
+        :class:`rine._token_cache.TokenCache`, held by both clients; what
+        is left here is the fetch, which is the only part that differs.
+        """
         if not force:
-            cached = get_cached_token(self._config_dir, self._profile, self._refresh_margin)
-            if cached:
-                self._cached_token = cached
-                return cached
+            held = self._tokens.fresh_token()
+            if held is not None:
+                return held
 
         entry = get_credential_entry(self._config_dir, self._profile)
         if not entry:
@@ -689,16 +710,12 @@ class AsyncHttpClient:
             entry["client_secret"],
             rng=self._rng,
         )
-        try:
-            cache_token(self._config_dir, self._profile, token, expires_in)
-        except Exception:
-            logger.warning("Failed to cache token", exc_info=True)
-        self._cached_token = token
+        self._tokens.stamp(token, expires_in)
         return token
 
     def _invalidate_token(self) -> None:
-        """Invalidate the in-memory token cache."""
-        self._cached_token = None
+        """Invalidate the in-memory token cache, expiry included."""
+        self._tokens.clear()
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         headers: dict[str, str] = {"User-Agent": _USER_AGENT}
@@ -786,12 +803,16 @@ class AsyncHttpClient:
                     continue
                 raise APIConnectionError(f"Connection failed: {method} {path}") from exc
 
-            # Auto-refresh on 401 (once). DEBUG, not WARNING: at a 900 s token
-            # TTL this is the designed self-healing path firing on schedule, and
-            # a warning that fires hourly forever teaches operators to ignore
-            # the ones that mean something.
+            # Auto-refresh on 401 (once). WARNING, and it belongs at WARNING:
+            # ``_get_token`` refreshes before the token expires, so reaching here
+            # means the server rejected a token this client believed was live —
+            # a revocation, a clock skew, a credential change. That is rare and
+            # unexpected. It was demoted to DEBUG while this path *was* the
+            # refresh mechanism and fired every token lifetime; if it ever looks
+            # like routine noise again, the expiry check has regressed and that
+            # is the thing to fix.
             if resp.status_code == 401 and authenticated and not auth_retried:
-                logger.debug("401 received, refreshing token")
+                logger.warning("401 received, refreshing token")
                 auth_retried = True
                 self._invalidate_token()
                 headers["Authorization"] = f"Bearer {await self._get_token(force=True)}"

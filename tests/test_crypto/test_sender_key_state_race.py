@@ -19,12 +19,14 @@ is the real thing. The TypeScript twin is
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
 import threading
+import time
 
-from rine._crypto import sender_keys_store
+from rine._crypto import message, sender_keys_store, sender_keys_thread_lock
 from rine._crypto.keys import generate_agent_keys, public_keys_body, save_agent_keys
 from rine._crypto.message import (
     decrypt_group_message_async,
@@ -39,6 +41,7 @@ from rine._crypto.sender_keys_helpers import (
 )
 from rine._crypto.sender_keys_store import merge_sender_key_states
 from rine._sender_key_ops import delete_sender_key
+from tests.conftest import sender_key_region_is_held_here
 
 READER_ID = "11111111-1111-4111-8111-111111111111"
 PEER_A_ID = "22222222-2222-4222-8222-222222222222"
@@ -357,11 +360,21 @@ class TestAcrossEventLoops:
         # holds its loop STRONGLY, so a table that never released would pin both
         # closed loops here — invisible from outside, hence the private read.
         assert sender_keys_store._locks == {}
+        # The thread tier is one table for the whole process, so it cannot pin a
+        # loop — but an entry left behind is a lock nothing will ever release,
+        # which is a hang for every later holder of that file.
+        assert sender_keys_thread_lock._thread_locks == {}
 
-    def test_decrypt_when_two_loops_run_at_once_then_neither_waits_on_the_other(
+    def test_decrypt_when_two_loops_run_at_once_then_both_open_without_deadlocking(
         self, tmp_config_dir
     ):
-        """Two event loops in two threads must not share one file's lock.
+        """Two event loops in two threads must not share one file's ``asyncio.Lock``.
+
+        🔴 The name used to say "neither waits on the other", and that is the one
+        thing this cannot claim: since the thread tier landed they DO wait on each
+        other, deliberately and correctly. What it asserts is that both readers
+        arrive — a lock shared across loops does not make them queue, it hangs
+        the one that waits.
 
         🔴 This is what the per-loop key buys that dropping the entry does not: a
         table keyed by file identity alone hands both loops ONE ``asyncio.Lock``,
@@ -371,9 +384,19 @@ class TestAcrossEventLoops:
         arrives, which is why the barrier and the join both carry timeouts: the
         failure is a hang, and a hang has to be reported as one.
 
-        The two decrypts are of different senders and the threads are not excluded
-        from each other, so nothing here asserts what the file ends up holding —
-        only that both readers got their plaintext.
+        🔴 The two threads ARE excluded from each other — the store's exclusion is
+        process-wide since the thread tier landed
+        (:mod:`rine._crypto.sender_keys_thread_lock`), and one file is one region
+        whichever loop reaches it — so the rendezvous below cannot be met and its
+        timeout is the expected outcome rather than a failure. It stays because it
+        gives the second thread every chance to be inside the first's region, and
+        because the regression this test exists for lands BEFORE the thread tier:
+        the per-loop table is read on the way in, so a table keyed by file alone
+        hands both loops one ``asyncio.Lock`` and hangs there, which the join's
+        timeout still reports.
+
+        The two decrypts are of different senders, so nothing here asserts what
+        the file ends up holding — only that both readers got their plaintext.
         """
         published = _peers(tmp_config_dir)
         a_state, a_posts = _backlog(tmp_config_dir, PEER_A_ID, 1)
@@ -384,14 +407,21 @@ class TestAcrossEventLoops:
             GROUP_ID,
             [_reader_view(a_state), _reader_view(b_state)],
         )
-        # Both loops are inside their decrypt, awaiting the key fetch, before
-        # either is answered — the overlap is forced rather than hoped for.
-        both_inside = threading.Barrier(2, timeout=10)
+        # Each loop offers to meet the other inside its decrypt, awaiting the key
+        # fetch. The offer is bounded and abandoned rather than waited on: see the
+        # docstring — the exclusion the store now holds is what the second thread
+        # is queued behind, so the meeting is an invitation, not a barrier.
+        both_inside = threading.Barrier(2, timeout=1)
+
+        def _offer_to_meet() -> None:
+            with contextlib.suppress(threading.BrokenBarrierError):
+                both_inside.wait()
+
         opened: dict[str, str] = {}
         failed: dict[str, BaseException] = {}
 
         def _read(peer_id: str, payload: str) -> None:
-            server = ReverseOrderKeyServer(published, both_inside.wait)
+            server = ReverseOrderKeyServer(published, _offer_to_meet)
             try:
                 result = asyncio.run(
                     decrypt_group_message_async(
@@ -417,6 +447,101 @@ class TestAcrossEventLoops:
             PEER_A_ID: f"post 0 from {PEER_A_ID}",
             PEER_B_ID: f"post 0 from {PEER_B_ID}",
         }
+
+
+class TestTwoSynchronousReadersOfOneRow:
+    """The synchronous decrypt's region, and the recheck that makes losing survivable.
+
+    ``TestConcurrentWriters`` covers this row-for-row on the async side, and the
+    sync path was covered by nothing: it is the path a sync host renders a
+    transcript on and the path the async client's own send runs through
+    ``asyncio.to_thread``, and both its region and its in-region replay recheck
+    could be deleted with the whole suite staying green.
+
+    🔴 The rendezvous is the point. The loser must pass the pre-region read-cache
+    check BEFORE the winner records anything, or it is answered by that first
+    check and never reaches the recheck this is about — which is why the second
+    reader is released from inside the winner's key fetch and then waited for by
+    ``holders``, rather than merely started and hoped about. A test that only
+    started it would pass with the recheck deleted most of the time.
+    """
+
+    def test_one_row_when_two_threads_open_it_at_once_then_both_get_the_plaintext(
+        self, tmp_config_dir
+    ):
+        """The sync twin of the two-readers case: the loser is answered from the cache.
+
+        The ratchet spends a message key exactly once, so the loser cannot repeat
+        the step. Without the recheck it gets ``CryptoError("Message key expired
+        or already consumed")``, which the render path treats as terminal and
+        shows as the sealed-message refusal — the defect, produced by the fix
+        for it.
+        """
+        published = _peers(tmp_config_dir)
+        a_state, a_posts = _backlog(tmp_config_dir, PEER_A_ID, 1)
+        save_sender_key_state(tmp_config_dir, READER_ID, GROUP_ID, [_reader_view(a_state)])
+        start_second = threading.Event()
+        opened: dict[str, object] = {}
+        failed: dict[str, BaseException] = {}
+
+        def _read(tag: str, server) -> None:
+            try:
+                result = decrypt_group_message_sync(
+                    tmp_config_dir, READER_ID, GROUP_ID, a_posts[0], server, PEER_A_ID
+                )
+                opened[tag] = json.loads(result.plaintext)
+            except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
+                failed[tag] = exc
+
+        def _let_the_loser_in() -> None:
+            # Inside the winner's region, before it has recorded its read: the
+            # loser passes the outer cache check here and then queues.
+            start_second.set()
+            deadline = time.monotonic() + 5
+            while _sync_region_holders(tmp_config_dir) < 2 and time.monotonic() < deadline:
+                time.sleep(0.002)
+
+        loser = threading.Thread(
+            target=lambda: (
+                start_second.wait(timeout=5),
+                _read("loser", _SyncKeyServer(published)),
+            ),
+            daemon=True,
+        )
+        loser.start()
+        _read("winner", _SyncKeyServer(published, _let_the_loser_in))
+        loser.join(timeout=20)
+
+        assert loser.is_alive() is False
+        assert failed == {}
+        expected = {"text": f"post 0 from {PEER_A_ID}"}
+        assert opened == {"winner": expected, "loser": expected}
+        # One row opened, so the ratchet moved by one: the loser was answered from
+        # the winner's recorded read rather than stepping it again.
+        assert _indices(tmp_config_dir) == {PEER_A_ID: 1}
+
+    def test_sync_decrypt_when_it_persists_then_the_region_is_held(
+        self, tmp_config_dir, monkeypatch
+    ):
+        """The fourth synchronous region, asked from inside its own merge."""
+        published = _peers(tmp_config_dir)
+        a_state, a_posts = _backlog(tmp_config_dir, PEER_A_ID, 1)
+        save_sender_key_state(tmp_config_dir, READER_ID, GROUP_ID, [_reader_view(a_state)])
+        held: list[bool] = []
+        real = message.merge_sender_key_states
+
+        def watched(config_dir, writer_id, gid, states):
+            held.append(sender_key_region_is_held_here(config_dir, writer_id, gid))
+            return real(config_dir, writer_id, gid, states)
+
+        monkeypatch.setattr(message, "merge_sender_key_states", watched)
+
+        result = decrypt_group_message_sync(
+            tmp_config_dir, READER_ID, GROUP_ID, a_posts[0], _SyncKeyServer(published), PEER_A_ID
+        )
+
+        assert held == [True]
+        assert json.loads(result.plaintext) == {"text": f"post 0 from {PEER_A_ID}"}
 
 
 class TestRetiredGroupRefusal:
@@ -456,19 +581,41 @@ class TestRetiredGroupRefusal:
 
 
 class _SyncKeyServer:
-    """The sync twin of :class:`ReverseOrderKeyServer`, with nothing to interleave."""
+    """The sync twin of :class:`ReverseOrderKeyServer`, with an optional interleave.
 
-    def __init__(self, published: dict[str, dict]) -> None:
+    ``on_fetch`` fires inside the key read, which is inside the holder's region —
+    the one place a second synchronous reader can be let loose while the first is
+    provably still inside. Callers that have nothing to interleave leave it unset
+    and get the plain server.
+    """
+
+    def __init__(self, published: dict[str, dict], on_fetch=None) -> None:
         """Serve the given agents' published keys, from cold."""
         self._published = published
         self._keys_cache = _AlwaysCold()
+        self._on_fetch = on_fetch
 
     def get(self, path: str, **_kwargs: object) -> dict:
         """Answer one key read."""
         match = _KEYS_PATH.match(path)
         if match is None or match.group(1) not in self._published:
             raise AssertionError(f"unexpected GET {path}")
+        if self._on_fetch is not None:
+            self._on_fetch()
         return self._published[match.group(1)]
+
+
+def _sync_region_holders(config_dir: str) -> int:
+    """How many callers hold or await this group's cross-thread lock right now.
+
+    ``holders`` is taken in ``_claim``, BEFORE the wait, which is exactly what
+    makes it usable as a rendezvous: a reader queued outside the region has
+    already been counted. Polling it is how a test proves the second reader is
+    committed to entering rather than merely started.
+    """
+    key = sender_keys_store._file_key(config_dir, READER_ID, GROUP_ID)
+    entry = sender_keys_thread_lock._thread_locks.get(key)
+    return 0 if entry is None else entry.holders
 
 
 def _row(sender_id: str, key_id: str, chain_key: bytes) -> SenderKeyState:

@@ -16,10 +16,15 @@ no later message reopens, and the render after that opens it.
 🔴 These drive the public function, not the fix. Only the network is a stand-in —
 the seal, the ratchet and the state file are the real thing — so a rewrite that
 keeps ``get_or_create_sender_key_sync``'s signature and gets the answers right
-passes. What they do NOT assert is exclusion: this path is sync and the async
-client runs it on a worker thread, so it holds no lock and the residual window
-between its own re-read and its save is documented rather than tested (see
-:mod:`rine._crypto.sender_keys_store`, residual 1).
+passes.
+
+Exclusion is asserted too, and separately: the re-read is only half of it, since
+nothing in a re-read stops another writer committing between it and the save.
+``TestTwoRotationsAtOnce`` interleaves two threads inside that window, and
+``TestTheThreadTier`` pins the primitive both tiers of the lock meet on — a
+worker thread and a coroutine over one file exclude each other, over two files
+they do not. Read :mod:`rine._crypto.sender_keys_thread_lock` for why a second
+tier exists at all.
 
 🔴 ``get_or_create_sender_key_sync`` is not the end of a send.
 ``rine._group_send.encrypt_for_group_sync`` calls
@@ -33,13 +38,18 @@ promise.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import itertools
 import json
 import re
+import threading
 from typing import Any
 
 import pytest
 
+from rine import _sender_key_ops
+from rine._crypto import message, sender_keys_store, sender_keys_thread_lock
 from rine._crypto.keys import (
     generate_agent_keys,
     load_agent_keys,
@@ -53,12 +63,14 @@ from rine._crypto.sender_keys import (
     generate_sender_key,
 )
 from rine._crypto.sender_keys_helpers import load_sender_key_states, save_sender_key_state
+from rine._crypto.sender_keys_store import with_sender_key_states, with_sender_key_states_sync
 from rine._sender_key_ops import (
     delete_sender_key,
     get_or_create_sender_key_sync,
     sender_key_state_exists,
 )
 from rine.errors import UnpersistedSenderKeyStateError
+from tests.conftest import sender_key_region_is_held_here
 
 SENDER_ID = "00000000-1111-2222-3333-444444444444"
 #: Already holds this agent's key.
@@ -788,3 +800,341 @@ class TestTheSendTailRefusesAnUnpersistedState:
 
         assert result.encryption_version == "sender-key-v1"
         assert sender_key_state_exists(tmp_config_dir, SENDER_ID, GROUP_ID) is False
+
+
+#: How long one side holds a region while the other is given every chance to
+#: barge into it, and how long a rendezvous waits for a partner the exclusion may
+#: never let arrive. Generous by design: the racing side's whole send runs
+#: against in-memory fakes, so it arrives in milliseconds when nothing stops it,
+#: and every case below distinguishes "did not arrive in half a second" from
+#: "arrived immediately" rather than measuring how long anything took.
+_RACE_WINDOW_SECONDS = 0.5
+
+
+class _Rendezvous:
+    """A two-party meeting that stops being one once the exclusion is real.
+
+    🔴 An unbounded barrier inside a region the fix makes exclusive is a deadlock,
+    not a test: the second party can never arrive, so both sides hang forever.
+    Every wait here is bounded and a timeout is an EXPECTED outcome — with the
+    lock in place the first party waits it out and goes on alone; with the lock
+    removed the two meet at once and the interleave happens. That difference is
+    the whole measurement.
+    """
+
+    def __init__(self, timeout: float) -> None:
+        """Arm a meeting for two, abandoned after *timeout* seconds."""
+        self._barrier = threading.Barrier(2, timeout=timeout)
+
+    def meet(self) -> None:
+        """Wait for the other party, and give up rather than hang."""
+        with contextlib.suppress(threading.BrokenBarrierError):
+            self._barrier.wait()
+
+
+class TestTwoRotationsAtOnce:
+    """Two threads of one client, each rotating this agent's key in the same group.
+
+    The realistic shape: an async client hands every group send to a worker
+    thread (``rine._mls.bridge.with_sync_http``), so two sends in flight are two
+    threads inside :func:`rine._sender_key_ops.get_or_create_sender_key_sync`.
+    Its rotation re-reads the file after the fan-out and then saves the WHOLE
+    array, which is an answer about rows it never looked at — so a rotation that
+    lands between another's re-read and its save is erased by it, and the erased
+    agent can never read its own post back.
+    """
+
+    def test_two_sends_when_both_rotate_at_once_then_neither_new_key_is_lost(
+        self, tmp_config_dir, monkeypatch
+    ):
+        """Both minted keys are on disk, whichever order the two regions ran in.
+
+        The interleave is forced where it matters: the rendezvous sits between the
+        rotation's fresh read and its save, which is inside the region, so under
+        exclusion the second thread cannot reach it and the first waits the
+        rendezvous out. Without exclusion both threads read before either writes,
+        and the second save silently drops the first agent's new key.
+        """
+        _seat_sender(tmp_config_dir)
+        _own_key(
+            tmp_config_dir, distributed_to=[MEMBER_A_ID], message_index=ROTATION_MESSAGE_LIMIT
+        )
+        rendezvous = _Rendezvous(_RACE_WINDOW_SECONDS)
+
+        def save_after_meeting(*args: Any, **kwargs: Any) -> None:
+            rendezvous.meet()
+            save_sender_key_state(*args, **kwargs)
+
+        monkeypatch.setattr("rine._sender_key_ops.save_sender_key_state", save_after_meeting)
+        minted: list[str] = []
+
+        def send() -> None:
+            server = FanOutServer(tmp_config_dir, [SENDER_ID, MEMBER_A_ID])
+            state = get_or_create_sender_key_sync(server, tmp_config_dir, SENDER_ID, _GROUP)
+            minted.append(state.sender_key_id)
+
+        threads = [threading.Thread(target=send) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert [t.is_alive() for t in threads] == [False, False]
+        # Both sends rotated, so both minted a key they will seal under and cache
+        # their own self-read key in.
+        assert len(minted) == 2
+        assert len(set(minted)) == 2
+        assert set(minted) <= set(_own_ids(tmp_config_dir))
+
+
+class TestTheThreadTier:
+    """The lock a coroutine takes and the lock a worker thread takes are ONE lock.
+
+    :func:`rine._crypto.sender_keys_store.with_sender_key_states` alone cannot
+    give this stack what ``withSenderKeyStates`` gives the TypeScript one. An
+    :class:`asyncio.Lock` binds to the loop that first contends it, and the group
+    send is synchronous, run on a thread that has no loop to contend from — so
+    the exclusion is built in two tiers and these are what say the two tiers meet
+    over the same file.
+    """
+
+    async def test_sync_region_when_a_coroutine_holds_the_file_then_it_waits(self, tmp_config_dir):
+        """A worker thread may not enter a file a coroutine is holding."""
+        held: list[str] = []
+        overlaps: list[str] = []
+        inside_loop = threading.Event()
+
+        def worker() -> None:
+            with with_sender_key_states_sync(tmp_config_dir, SENDER_ID, GROUP_ID):
+                if inside_loop.is_set():
+                    overlaps.append("the thread entered while the coroutine held it")
+                held.append("thread")
+
+        thread = threading.Thread(target=worker)
+        async with with_sender_key_states(tmp_config_dir, SENDER_ID, GROUP_ID):
+            inside_loop.set()
+            thread.start()
+            # The loop stays live while the thread queues, which is why the
+            # coroutine side polls for the thread tier instead of blocking on it:
+            # a blocking acquire here would stop every task in the process.
+            await asyncio.sleep(_RACE_WINDOW_SECONDS)
+            assert held == []
+            inside_loop.clear()
+
+        thread.join(timeout=5)
+        assert thread.is_alive() is False
+        assert overlaps == []
+        # And it did get in, once the coroutine left: exclusion, not exclusion
+        # forever.
+        assert held == ["thread"]
+        assert sender_keys_thread_lock._thread_locks == {}
+
+    async def test_coroutine_region_when_a_thread_holds_the_file_then_it_waits(
+        self, tmp_config_dir
+    ):
+        """And the other way round, which is the direction a send blocks a render."""
+        inside_thread = threading.Event()
+        release = threading.Event()
+        entered: list[str] = []
+        overlaps: list[str] = []
+
+        def worker() -> None:
+            with with_sender_key_states_sync(tmp_config_dir, SENDER_ID, GROUP_ID):
+                inside_thread.set()
+                release.wait(timeout=10)
+
+        async def enter() -> None:
+            async with with_sender_key_states(tmp_config_dir, SENDER_ID, GROUP_ID):
+                if inside_thread.is_set() and not release.is_set():
+                    overlaps.append("the coroutine entered while the thread held it")
+                entered.append("loop")
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        assert inside_thread.wait(timeout=5) is True
+        task = asyncio.create_task(enter())
+        await asyncio.sleep(_RACE_WINDOW_SECONDS)
+
+        assert entered == []
+        release.set()
+        await asyncio.wait_for(task, timeout=5)
+        thread.join(timeout=5)
+
+        assert thread.is_alive() is False
+        assert overlaps == []
+        assert entered == ["loop"]
+        assert sender_keys_thread_lock._thread_locks == {}
+
+    async def test_a_second_group_when_another_is_held_then_it_is_not_blocked(
+        self, tmp_config_dir
+    ):
+        """Per FILE, never one lock over the store.
+
+        Without this the two tests above pass just as well against a single global
+        lock, which would serialise every group in the process against every
+        other for the length of a network verify.
+        """
+        other_group = "cccccccc-dddd-4ddd-8ddd-000000000000"
+        entered: list[str] = []
+
+        def worker() -> None:
+            with with_sender_key_states_sync(tmp_config_dir, SENDER_ID, other_group):
+                entered.append("thread")
+
+        async with with_sender_key_states(tmp_config_dir, SENDER_ID, GROUP_ID):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            thread.join(timeout=5)
+            assert entered == ["thread"]
+
+        assert sender_keys_thread_lock._thread_locks == {}
+
+
+class TestEveryWriteHappensInsideItsRegion:
+    """Three of the four synchronous regions were asserted by nothing at all.
+
+    ``TestTwoRotationsAtOnce`` interleaves two threads inside the rotation's
+    region, so that one is pinned by behaviour. The send tail and
+    ``_record_distribution`` carried their region as a source line only:
+    replacing either with :func:`contextlib.nullcontext` left this whole suite
+    green, which is the definition of a fix nothing guards — and the region is
+    the half of the repair the merge cannot cover, since both of these writes
+    ASSERT an array rather than merging one.
+
+    Interleaving a second writer at these two is not available the way it is for
+    the rotation: the window is inside a real seal, with no hook to stop in. So
+    they ask from inside the write instead, which is a weaker statement honestly
+    made — it says the region is held, not that a competing writer was excluded.
+    ``sender_key_region_is_held_here`` says why that is still worth having.
+    """
+
+    def test_send_tail_when_it_writes_then_the_region_is_held(self, tmp_config_dir, monkeypatch):
+        """``encrypt_group_message``'s write-back of this agent's own row."""
+        _seat_sender(tmp_config_dir)
+        own = _own_key(tmp_config_dir, distributed_to=[MEMBER_A_ID])
+        held: list[bool] = []
+        real = message.save_sender_key_state
+
+        def watched(config_dir, writer_id, gid, states):
+            held.append(sender_key_region_is_held_here(config_dir, writer_id, gid))
+            return real(config_dir, writer_id, gid, states)
+
+        monkeypatch.setattr(message, "save_sender_key_state", watched)
+
+        encrypt_group_message(tmp_config_dir, SENDER_ID, GROUP_ID, own, {"body": "hi"})
+
+        assert held == [True]
+        # The seal still landed with the writer wrapped, so the region assertion
+        # is not passing over a path this test never reached.
+        assert _rows(tmp_config_dir)[own.sender_key_id].message_index == 1
+
+    def test_recorded_distribution_when_it_writes_then_the_region_is_held(
+        self, tmp_config_dir, monkeypatch
+    ):
+        """``_record_distribution``'s merge of ``distributed_to``, after the fan-out."""
+        _seat_sender(tmp_config_dir)
+        own = _own_key(tmp_config_dir, distributed_to=[MEMBER_A_ID])
+        server = FanOutServer(tmp_config_dir, [SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
+        held: list[bool] = []
+        real = _sender_key_ops.merge_sender_key_states
+
+        def watched(config_dir, writer_id, gid, states):
+            held.append(sender_key_region_is_held_here(config_dir, writer_id, gid))
+            return real(config_dir, writer_id, gid, states)
+
+        monkeypatch.setattr(_sender_key_ops, "merge_sender_key_states", watched)
+
+        get_or_create_sender_key_sync(server, tmp_config_dir, SENDER_ID, _GROUP)
+
+        assert held == [True]
+        assert _rows(tmp_config_dir)[own.sender_key_id].distributed_to == [
+            MEMBER_A_ID,
+            MEMBER_B_ID,
+        ]
+
+
+class TestTheThreadTierRefusesAFatalReentry:
+    """A re-entry that could only hang now raises, and says which file.
+
+    Non-reentrancy used to be prose in three docstrings. Breaking it parks a
+    thread in :meth:`threading.Lock.acquire` against a lock that thread itself
+    holds: no traceback, no file named, and — because ``rine-sdk``'s suite is a
+    publish gate — a whole release train stopped on a test run that never
+    finishes. These assert the refusal that replaces the hang, and just as
+    importantly the two shapes it must NOT refuse.
+    """
+
+    def test_sync_region_when_reached_from_inside_one_over_the_same_file_then_it_raises(
+        self, tmp_config_dir
+    ):
+        """The nested-region case, which is the one a reader introduces by accident."""
+        with with_sender_key_states_sync(tmp_config_dir, SENDER_ID, GROUP_ID):
+            with pytest.raises(RuntimeError, match="not reentrant"):
+                with with_sender_key_states_sync(tmp_config_dir, SENDER_ID, GROUP_ID):
+                    raise AssertionError("the second region was entered")
+
+        # The refused acquirer took a holder count before it raised, so the entry
+        # draining here is what says it gave that count back — a leak would leave
+        # the file's lock in the table forever and never be visible any other way.
+        assert sender_keys_thread_lock._thread_locks == {}
+
+    async def test_sync_region_when_reached_on_the_loop_thread_under_the_async_one_then_it_raises(
+        self, tmp_config_dir
+    ):
+        """The call-from-a-coroutine refusal, enforced rather than documented.
+
+        This is the shape that cannot be waited out: the loop thread parks in a
+        blocking acquire, so the coroutine holding the file can never be resumed
+        to release it. Refusing is the only answer that terminates.
+        """
+        async with with_sender_key_states(tmp_config_dir, SENDER_ID, GROUP_ID):
+            with pytest.raises(RuntimeError, match="not reentrant"):
+                with with_sender_key_states_sync(tmp_config_dir, SENDER_ID, GROUP_ID):
+                    raise AssertionError("the synchronous region was entered")
+
+        assert sender_keys_thread_lock._thread_locks == {}
+
+    def test_second_file_when_reached_from_inside_a_region_then_it_is_allowed(
+        self, tmp_config_dir
+    ):
+        """Per file, so a guard keyed on the thread alone would be too wide.
+
+        A send fans out one DM per member and the ingest walks several groups in
+        one pass; refusing every nested region would refuse work the product
+        does.
+        """
+        other_group = "dddddddd-eeee-4eee-8eee-111111111111"
+        entered: list[str] = []
+
+        with with_sender_key_states_sync(tmp_config_dir, SENDER_ID, GROUP_ID):
+            with with_sender_key_states_sync(tmp_config_dir, SENDER_ID, other_group):
+                entered.append("second file")
+
+        assert entered == ["second file"]
+        assert sender_keys_thread_lock._thread_locks == {}
+
+    async def test_polling_acquirer_when_the_holder_shares_its_ident_then_it_waits(
+        self, tmp_config_dir
+    ):
+        """Two tasks on ONE loop queue for a file; they do not raise at each other.
+
+        Every coroutine on a loop carries that loop thread's ident, so the ident
+        the refusal keys on cannot tell "I already hold this" from "somebody else
+        on my loop does". That is why the polling side records the holder and
+        never consults it. The primitive is driven directly here because
+        :func:`with_sender_key_states`' per-loop :class:`asyncio.Lock` excludes
+        this pair before the thread tier ever sees it — which is exactly what
+        would hide a wrong refusal until something reached the tier without it.
+        """
+        key = sender_keys_store._file_key(tmp_config_dir, SENDER_ID, GROUP_ID)
+        entered: list[str] = []
+
+        async def enter(tag: str) -> None:
+            async with sender_keys_thread_lock.held_across_threads_async(key):
+                entered.append(tag)
+                await asyncio.sleep(_RACE_WINDOW_SECONDS)
+
+        await asyncio.wait_for(asyncio.gather(enter("first"), enter("second")), timeout=5)
+
+        assert entered == ["first", "second"]
+        assert sender_keys_thread_lock._thread_locks == {}

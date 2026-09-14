@@ -21,6 +21,7 @@ from rine._constants import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_TIMEOUT,
     NOT_GIVEN,
+    PEEK_HEADER,
     NotGiven,
 )
 from rine._crypto._decrypt_memo import DecryptMemo
@@ -159,6 +160,27 @@ class BaseRineClient:
     def _actor_header_dict(self, agent_id: str | None) -> dict[str, str] | None:
         """The ``X-Rine-Agent`` header for a resolved actor, or None to let the server pick."""
         return {AGENT_HEADER: agent_id} if agent_id else None
+
+    def _with_peek(self, headers: dict[str, str] | None, *, peek: bool) -> dict[str, str] | None:
+        """``headers`` plus the peek header, when the caller asked not to consume the row.
+
+        The sync and async ``read()`` are independent copies of each other, so
+        the one thing they must not each own is the decision — a header spelled
+        two ways, or added on one client only, is this package's most-paid-for
+        defect class. This is the non-awaiting half of it, on the base class for
+        the reason :meth:`_needs_actor_resolution` gives.
+
+        Takes and returns the same ``extra_headers`` shape
+        :meth:`_actor_header_dict` produces, ``None`` included: a one-agent org
+        that configured no actor sends no ``X-Rine-Agent`` at all, and a peek
+        from that client is the peek header alone.
+
+        ``"1"`` because the server parses this slot as a boolean and takes every
+        spelling of true; the shortest one is the one that never needs quoting.
+        """
+        if not peek:
+            return headers
+        return {**(headers or {}), PEEK_HEADER: "1"}
 
     @staticmethod
     def _build_body(*pairs: tuple[str, Any]) -> dict[str, Any]:
@@ -312,7 +334,17 @@ class BaseRineClient:
         unset and their refusal is the earned verdict, with the code that says
         so. ``thread()`` spends **one** scan for the whole render rather than one
         per row, which is enough: the scan is untargeted, so every row after it
-        is answered by a recovery that ran. ``stream()`` yields raw events and
+        is answered by a recovery that ran.
+
+        ``send_and_wait()`` leaves it unset for a different reason, and the
+        difference is worth writing down: not that the recovery ran, but that
+        there is no recovery to run. ``/messages/sync`` is 1:1 only — a group
+        recipient is refused before anything is sealed — so a reply arriving
+        there is a DM, and a DM that will not open never failed on a cold sender
+        key. The weaker sentence ``no_recovery`` exists to write is a claim about
+        a group render, and there is no group render here to make it about.
+
+        ``stream()`` yields raw events and
         decrypts nothing, so a further decrypting receive path arriving here has
         to answer this question for itself rather than inherit an answer.
 
@@ -409,5 +441,3 @@ def _is_unopenable_group_read(error: Exception) -> bool:
     if isinstance(error, NoMlsGroupStateError):
         return True
     return isinstance(error, MlsError) and error.code == _MLS_PROTOCOL_CODE
-
-

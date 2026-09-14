@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import time
 
@@ -10,15 +9,13 @@ import pytest
 
 from rine._config import (
     cache_token,
-    get_cached_token,
+    get_cached_token_entry,
     get_credential_entry,
     load_credentials,
-    load_token_cache,
     resolve_api_url,
     resolve_config_dir,
     save_credentials,
 )
-from rine.errors import ConfigError
 
 
 class TestResolveConfigDir:
@@ -49,9 +46,7 @@ class TestResolveApiUrl:
 
 class TestCredentials:
     def test_save_and_load_round_trip(self, tmp_config_dir):
-        creds = {
-            "default": {"client_id": "test-id", "client_secret": "test-secret"}
-        }
+        creds = {"default": {"client_id": "test-id", "client_secret": "test-secret"}}
         save_credentials(tmp_config_dir, creds)
         loaded = load_credentials(tmp_config_dir)
         assert loaded["default"]["client_id"] == "test-id"
@@ -75,7 +70,9 @@ class TestCredentials:
     def test_env_vars_take_priority(self, tmp_config_dir, monkeypatch):
         monkeypatch.setenv("RINE_CLIENT_ID", "env-id")
         monkeypatch.setenv("RINE_CLIENT_SECRET", "env-secret")
-        save_credentials(tmp_config_dir, {"default": {"client_id": "file-id", "client_secret": "x"}})
+        save_credentials(
+            tmp_config_dir, {"default": {"client_id": "file-id", "client_secret": "x"}}
+        )
         entry = get_credential_entry(tmp_config_dir)
         assert entry is not None
         assert entry["client_id"] == "env-id"
@@ -83,7 +80,9 @@ class TestCredentials:
     def test_get_entry_from_file(self, tmp_config_dir, monkeypatch):
         monkeypatch.delenv("RINE_CLIENT_ID", raising=False)
         monkeypatch.delenv("RINE_CLIENT_SECRET", raising=False)
-        save_credentials(tmp_config_dir, {"default": {"client_id": "file-id", "client_secret": "s"}})
+        save_credentials(
+            tmp_config_dir, {"default": {"client_id": "file-id", "client_secret": "s"}}
+        )
         entry = get_credential_entry(tmp_config_dir)
         assert entry is not None
         assert entry["client_id"] == "file-id"
@@ -97,14 +96,38 @@ class TestCredentials:
 class TestTokenCache:
     def test_cache_and_retrieve(self, tmp_config_dir):
         cache_token(tmp_config_dir, "default", "my-token", 3600)
-        cached = get_cached_token(tmp_config_dir)
-        assert cached == "my-token"
+        cached = get_cached_token_entry(tmp_config_dir)
+        assert cached is not None
+        assert cached["access_token"] == "my-token"
+
+    def test_entry_carries_the_expiry_it_checked(self, tmp_config_dir):
+        # The caller needs the deadline, not just the string: a client that
+        # warm-starts from this cache has to seed its own expiry from it.
+        #
+        # 🔴 The deadline is asserted against the clock the entry was written by,
+        # not against the ``now`` it was queried with. ``> 1000.0`` was true of
+        # any wall-clock timestamp whatsoever — including one seeded from the
+        # wrong field, or a lifetime of zero — because ``now=1000.0`` is a
+        # 1970 clock and every real ``time.time()`` beats it. The value is the
+        # thing under test, so pin the value.
+        t0 = time.time()
+        cache_token(tmp_config_dir, "default", "my-token", 3600)
+        cached = get_cached_token_entry(tmp_config_dir, now=1000.0)
+        assert cached is not None
+        assert cached["expires_at"] == pytest.approx(t0 + 3600, abs=5)
 
     def test_expired_token_returns_none(self, tmp_config_dir):
         cache_token(tmp_config_dir, "default", "old-token", 0)
-        assert get_cached_token(tmp_config_dir) is None
+        assert get_cached_token_entry(tmp_config_dir) is None
 
     def test_nearly_expired_returns_none(self, tmp_config_dir):
         # Token expires in 30 seconds, but margin is 60
         cache_token(tmp_config_dir, "default", "almost-expired", 30)
-        assert get_cached_token(tmp_config_dir) is None
+        assert get_cached_token_entry(tmp_config_dir) is None
+
+    def test_injected_clock_decides_freshness(self, tmp_config_dir):
+        cache_token(tmp_config_dir, "default", "tok", 3600)
+        entry = get_cached_token_entry(tmp_config_dir)
+        assert entry is not None
+        # Same entry, a clock past its expiry: stale.
+        assert get_cached_token_entry(tmp_config_dir, now=entry["expires_at"] + 1) is None

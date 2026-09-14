@@ -170,14 +170,16 @@ def save_token_cache(config_dir: str, cache: dict[str, CachedToken]) -> None:
     _write_atomic(path, json.dumps(cache, indent=2))
 
 
-def cache_token(config_dir: str, profile: str, token: str, expires_in: int) -> None:
+def cache_token(config_dir: str, profile: str, token: str, expires_in: float) -> None:
     """Cache an OAuth token with computed expiration.
 
     Args:
         config_dir: Path to config directory.
         profile: Profile name.
         token: Access token string.
-        expires_in: Token lifetime in seconds.
+        expires_in: Token lifetime in seconds. Typed ``float`` because it arrives
+            from a JSON response body, where a conforming server may legally send
+            a non-integer, and the only arithmetic done with it is float-safe.
     """
     cache = load_token_cache(config_dir)
     cache[profile] = {
@@ -187,10 +189,38 @@ def cache_token(config_dir: str, profile: str, token: str, expires_in: int) -> N
     save_token_cache(config_dir, cache)
 
 
-def get_cached_token(
-    config_dir: str, profile: str = "default", margin: float = TOKEN_REFRESH_MARGIN
-) -> str | None:
-    """Get a cached token if it's still valid (with refresh margin).
+def token_is_fresh(expires_at: float, margin: float, now: float) -> bool:
+    """Whether a token with this expiry is still usable, given the refresh margin.
+
+    The one place the comparison lives, because it has to hold identically for
+    the on-disk cache and for each client's in-memory token — and for both the
+    sync and the async client. Skipping it on the in-memory path is what cost an
+    always-on agent one rejected request per token lifetime, forever: the token
+    expired, nothing noticed, and a 401 was the only thing that ever said so.
+
+    Args:
+        expires_at: Absolute expiry of the token, as a Unix timestamp.
+        margin: Seconds before expiry at which the token is considered stale.
+        now: Current time as a Unix timestamp (injected so callers that mock
+            their clock compare against the same one).
+
+    Returns:
+        ``True`` if the token can still be used without refreshing.
+    """
+    return expires_at - now > margin
+
+
+def get_cached_token_entry(
+    config_dir: str,
+    profile: str = "default",
+    margin: float = TOKEN_REFRESH_MARGIN,
+    now: float | None = None,
+) -> CachedToken | None:
+    """Get a cached token entry if it's still valid (with refresh margin).
+
+    Returns the whole entry, not just the token string: a caller that warm-starts
+    from this cache needs the expiry too, or its own in-memory copy of the token
+    is blind to the expiry this function just checked.
 
     Args:
         config_dir: Path to config directory.
@@ -198,14 +228,17 @@ def get_cached_token(
         margin: Seconds before expiry at which the token is considered stale.
             Defaults to the flat base; callers pass a per-client jittered value
             so co-located clients desynchronize their refreshes.
+        now: Current time as a Unix timestamp. Defaults to the wall clock.
 
     Returns:
-        Access token string, or ``None`` if expired or missing.
+        The cached token entry, or ``None`` if expired or missing.
     """
     cache = load_token_cache(config_dir)
     entry = cache.get(profile)
-    if entry and entry["expires_at"] - time.time() > margin:
-        return entry["access_token"]
+    if entry and token_is_fresh(
+        entry["expires_at"], margin, now if now is not None else time.time()
+    ):
+        return entry
     return None
 
 

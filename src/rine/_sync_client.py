@@ -791,6 +791,7 @@ class SyncRineClient(BaseRineClient):
         message_id: str,
         *,
         agent: str | None = None,
+        peek: bool = False,
     ) -> DecryptedMessage:
         """Fetch and decrypt a single message.
 
@@ -798,6 +799,13 @@ class SyncRineClient(BaseRineClient):
         verify comes back with ``decrypt_error`` set and ``plaintext = None``,
         exactly as it would from :meth:`inbox`. Check ``decrypt_error`` before
         touching ``plaintext``.
+
+        Reading a message marks it delivered for the acting agent **whether or
+        not it decrypts** — the server holds no key and stamps the mark before
+        this client has tried — and there is no un-mark route, so the row leaves
+        :meth:`inbox` with ``status="new"``, :meth:`poll` and SSE catch-up and
+        stays fetchable only by id. Pass ``peek=True`` to read without
+        consuming it.
 
         Reading a **group** message a second time is answered from a local copy,
         not from the group's cryptography, which spends a message's key on first
@@ -811,12 +819,17 @@ class SyncRineClient(BaseRineClient):
         Args:
             message_id: Message UUID.
             agent: Agent to read as.
+            peek: Read without consuming the message — it stays new, and stays
+                offered by ``inbox(status="new")``, :meth:`poll` and SSE
+                catch-up. What an unattended loop wants for a message it may not
+                be able to open yet: the acting agent is still named and still
+                refused if it names nobody, so only the mark is suppressed.
 
         Returns:
             Decrypted message, or the message carrying ``decrypt_error``.
         """
         agent_id = self._resolve_agent_id(agent)
-        extra = self._agent_header(agent)
+        extra = self._with_peek(self._agent_header(agent), peek=peek)
         data = self._http.get(f"/messages/{message_id}", extra_headers=extra)
         msg = DecryptedMessage.model_validate(data)
         try:
@@ -991,6 +1004,7 @@ class SyncRineClient(BaseRineClient):
         """
         from rine._crypto.keys import agent_id_from_kid
         from rine._crypto.message import decrypt_message_sync
+        from rine._crypto.sender_keys_store import with_sender_key_states_sync
         from rine._crypto.sk_distribution import (
             already_held,
             distribution_group_id,
@@ -1040,33 +1054,34 @@ class SyncRineClient(BaseRineClient):
                 # otherwise refuse every distribution forever.
                 if sender_keys_retired(self._config_dir, agent_id, group_id):
                     continue
-                # 🔴 The sync twin of the unlocked whole-array writer documented in
+                # 🔴 The sync twin of the whole-array writer documented in
                 # ``rine._client.RineClient._scan_pending_sk_distributions``, and it
-                # has a WEAKER argument than that one, not the same: there are no
-                # coroutines here to exclude, and nothing in this stack takes a lock
-                # a thread can see, so what keeps it whole is only that no other
-                # writer in this process holds a load across this load and save.
-                # :mod:`rine._crypto.sender_keys_store` does not serialise it (its
-                # region is per event loop) and cannot; a host that drives a sync
-                # client on one thread and an async one on another races here.
-                states = load_sender_key_states(self._config_dir, agent_id, group_id)
-                # 🔴 The VERIFIED signer, never ``payload["sender_agent_id"]`` — the
-                # async twin's reasoning, and the same hole. The comment at the top of
-                # this loop already says the DM is verified "never against the agent
-                # id inside its own payload"; the row's identity then came from that
-                # very field. See
-                # ``rine._client.RineClient._scan_pending_sk_distributions``.
-                new_state = sender_key_state_from_distribution(
-                    payload, group_id, agent_id_from_kid(result.sender_kid)
-                )
-                # Per SENDER, not per key id: a global check made the first
-                # distribution to claim an id the owner of that slot, so a shadow
-                # could displace a peer's genuine key. See
-                # :func:`rine._crypto.sk_distribution.already_held`.
-                if already_held(states, new_state):
-                    continue
-                states.append(new_state)
-                save_sender_key_state(self._config_dir, agent_id, group_id, states)
+                # takes the THREAD tier of the same region — the one a sync caller
+                # is entitled to. There are no coroutines here to exclude, so the
+                # tier is the whole of the exclusion this side needs and the whole
+                # of what it gets: a host that drives a sync client on one thread
+                # and an async one on another used to race here, and the two now
+                # queue behind one another over one file. Two PROCESSES over one
+                # config dir still race — residual 2 of that module, unchanged.
+                with with_sender_key_states_sync(self._config_dir, agent_id, group_id):
+                    states = load_sender_key_states(self._config_dir, agent_id, group_id)
+                    # 🔴 The VERIFIED signer, never ``payload["sender_agent_id"]`` — the
+                    # async twin's reasoning, and the same hole. The comment at the top of
+                    # this loop already says the DM is verified "never against the agent
+                    # id inside its own payload"; the row's identity then came from that
+                    # very field. See
+                    # ``rine._client.RineClient._scan_pending_sk_distributions``.
+                    new_state = sender_key_state_from_distribution(
+                        payload, group_id, agent_id_from_kid(result.sender_kid)
+                    )
+                    # Per SENDER, not per key id: a global check made the first
+                    # distribution to claim an id the owner of that slot, so a shadow
+                    # could displace a peer's genuine key. See
+                    # :func:`rine._crypto.sk_distribution.already_held`.
+                    if already_held(states, new_state):
+                        continue
+                    states.append(new_state)
+                    save_sender_key_state(self._config_dir, agent_id, group_id, states)
                 ingested += 1
             except Exception:
                 logger.debug("SK ingestion failed", exc_info=True)
@@ -1171,6 +1186,13 @@ class SyncRineClient(BaseRineClient):
         (:meth:`_a_group_the_sync_endpoint_refuses`). Use :meth:`send` for a
         group.
 
+        A reply that arrives but will not open is reported, never raised: the
+        send has already landed and the answer is already on the wire, so the row
+        comes back with ``decrypt_error`` set and ``plaintext = None``, exactly as
+        it would from :meth:`read`. Check ``reply.decrypt_error`` before touching
+        ``reply.plaintext``, and read ``reply=None`` as the timeout it is — a
+        different outcome from a reply this agent could not read.
+
         Args:
             to: Recipient handle or agent UUID. A group is not a legal
                 recipient here, by handle or by id.
@@ -1180,7 +1202,9 @@ class SyncRineClient(BaseRineClient):
             agent: Agent to send as.
 
         Returns:
-            SendAndWaitResult with sent message and reply (or None on timeout).
+            SendAndWaitResult with the sent message and one of three answers in
+            ``reply``: the decrypted reply, ``None`` if the wait timed out, or the
+            reply row carrying ``decrypt_error`` because it would not open.
 
         Raises:
             UnsupportedTargetError: The recipient names a group.
@@ -1209,7 +1233,17 @@ class SyncRineClient(BaseRineClient):
         raw_reply = data.get("reply")
         if raw_reply is not None:
             reply_msg = DecryptedMessage.model_validate(raw_reply)
-            reply_msg = self._decrypt_message(agent_id, reply_msg)
+            # The same degrade every other receive surface runs: the send has
+            # already happened and the reply is already on the wire, so raising
+            # here would take the whole call down over one unreadable answer and
+            # hand the caller no row to inspect. There is no group self-heal arm
+            # because ``/messages/sync`` is 1:1 only — a group is refused above,
+            # before anything is sealed — so the arm ``read()`` has for a cold
+            # sender key could only ever forward to this same degrade.
+            try:
+                reply_msg = self._decrypt_message(agent_id, reply_msg)
+            except Exception as e:  # noqa: BLE001 — degrade, never raise (inbox's contract)
+                reply_msg = self._apply_decrypt_failure(reply_msg, e)
             return SendAndWaitResult(sent=sent, reply=reply_msg)
         return SendAndWaitResult(sent=sent, reply=None)
 

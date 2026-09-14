@@ -8,65 +8,65 @@ was in flight — another row's ratchet advance, or a peer's key an ingest had j
 installed. The reader is then told the group is sealed and that no later message
 reopens it, which is false in every clause: the next render reads the lot.
 
-The two halves below close different holes and neither subsumes the other:
+The three halves below close different holes and no one of them subsumes another:
 
-- :func:`with_sender_key_states` serialises holders against each other, which is
-  the only thing that can make two decrypts of the same sender key advance the
-  ratchet twice instead of once. No merge can recover that.
-- :func:`merge_sender_key_states` keeps entries the holder never touched. It is
-  what survives a writer that takes no lock at all.
+- :func:`with_sender_key_states` serialises COROUTINE holders against each other,
+  which is the only thing that can make two decrypts of the same sender key
+  advance the ratchet twice instead of once. No merge can recover that.
+- :func:`with_sender_key_states_sync` extends the same exclusion to a SYNCHRONOUS
+  holder, which on this stack means a worker thread. The TypeScript stack needs
+  no such half — its runtime is single-threaded — and this one cannot do without
+  it, because the group send is sync and the async client runs it on a thread. The
+  tier itself lives in :mod:`rine._crypto.sender_keys_thread_lock`, which
+  documents why an :class:`asyncio.Lock` cannot serve it.
+- :func:`merge_sender_key_states` keeps entries the holder never touched, so a
+  holder asserts only what it actually derived. It is what survives a writer no
+  region can reach — a SECOND PROCESS over the same config dir (residual 1
+  below), which is the only unserialised writer left, on either stack.
 
 The TypeScript twin is ``rine-core/src/crypto/sender-keys-store.ts``, and this is
-a port of it. It is applied at
-:func:`rine._crypto.message.decrypt_group_message_async` and nowhere else.
+a port of it, with the thread tier added. Every read-modify-write of a state file
+this package owns is inside a region — all seven of them, which is the claim, not
+a summary of most of them:
+
+- :func:`rine._crypto.message.decrypt_group_message_async` (both tiers),
+- :func:`rine._crypto.message.decrypt_group_message_sync`,
+- the tail of :func:`rine._crypto.message.encrypt_group_message`,
+- the rotation in :func:`rine._sender_key_ops.get_or_create_sender_key_sync`,
+- :func:`rine._sender_key_ops._record_distribution`,
+- the distribution ingest ``rine._client.RineClient._scan_pending_sk_distributions``,
+- its sync twin in ``rine._sync_client.SyncRineClient``.
+
+🔴 Three of the seven ASSERT a whole array rather than merging — the encrypt
+tail, the rotation, and both ingests, which is four of the seven counting the
+pair as two. So "the holders merge, so an unlocked writer cannot hurt them" was
+never a property of a region here, and must not be written down as one: it is a
+property of the three sites that call :func:`merge_sender_key_states`. An
+asserting writer outside a region erases whatever landed in the file while it
+worked, and the two ingests were exactly that until they took the region.
 
 🔴 **"No ``await`` between the load and the save" is not a soundness argument on
 this stack.** It is one on the TypeScript stack, whose runtime is single-threaded.
-Here it excludes other COROUTINES and nothing else: a group send runs its whole
-read-modify-write on a WORKER THREAD (residual 1), and Python threads preempt
-between bytecodes — the load is file I/O, which releases the GIL outright. Read
-every "no await between them" below and at the sites as "no coroutine interleaves
-with it", never as "nothing else in this process runs".
+Here it excludes other COROUTINES and nothing else: the group send runs its whole
+read-modify-write on a WORKER THREAD, and Python threads preempt between
+bytecodes — the load is file I/O, which releases the GIL outright. Read every "no
+await between them" below and at the sites as "no coroutine interleaves with it",
+never as "nothing else in this process runs". It is why the exclusion here has a
+tier the TypeScript twin does not.
 
 Residuals this module does NOT close, each named because a later reader will
 otherwise take "the file's writes are serialised" for more than it says:
 
-1. 🔴 **The worker-thread writer**, which the TypeScript stack does not have. An
-   async group send runs :func:`rine._sender_key_ops.get_or_create_sender_key_sync`
-   on a worker thread (:meth:`rine._client.RineClient.send` ->
-   ``rine._mls.bridge.with_sync_http`` -> ``asyncio.to_thread`` ->
-   ``rine._group_send.encrypt_for_group_sync``): it loads the array, fans the key
-   out to every member as 1:1 DMs, and saves the whole array afterwards. Two
-   halves, one of them a design change and one not:
-
-   - Excluding a thread from a coroutine's region IS the design change. An
-     :class:`asyncio.Lock` cannot see a thread, and a :class:`threading.Lock` held
-     across the fan-out would have to be taken by the event loop. Not attempted.
-   - Asserting the PRE-fan-out array where a fresh read would do is not, and that
-     half is CLOSED, on this stack as on the TypeScript one. Both of
-     ``rine._sender_key_ops``'s writes after the fan-out now re-read: the rotation
-     derives its array from a load taken AFTER the fan-out, and
-     ``rine._sender_key_ops._record_distribution`` unions ``distributed_to`` onto
-     the row as the file holds it now (twin: ``recordDistribution`` in
-     ``rine-core/src/sender-key-ops.ts``, which takes its lock on top). What is
-     left here is the lock alone — the window between one of those re-reads and
-     its own save is narrow, and no coroutine interleaves with it, but the worker
-     thread's peers still can.
-
-2. **Three writers take no lock at all**: the distribution ingest
-   (``rine._client.RineClient._scan_pending_sk_distributions``), its sync twin in
-   ``rine._sync_client``, and the tail of
-   :func:`rine._crypto.message.encrypt_group_message`. None has an ``await``
-   between its own load and its save, so no coroutine interleaves with them — see
-   the warning above for what that does and does not buy — and each says so at its
-   site. Holders of this region survive all three the other way round, because
-   they MERGE rather than assert.
-3. **Two-process concurrency.** A ``rine stream`` and a ``rine thread`` against
-   one config dir in two terminals still race, on either stack.
-4. :func:`rine._crypto.message.decrypt_group_message_sync` has the same
-   load/verify/save shape. No coroutine can interleave with it, but two threads
-   could. It was not examined by the work that produced this module.
-5. The Python renderer is already sequential
+1. **Two-process concurrency.** The exclusion is a property of the PROCESS: no
+   ``flock`` is taken, so a ``rine stream`` and a ``rine thread`` against one
+   config dir in two terminals still race, on either stack.
+2. **A region entered from a thread the holder is waiting on.** The thread tier
+   is not reentrant and detects same-thread re-entry only
+   (:func:`rine._crypto.sender_keys_thread_lock.held_across_threads`), so a
+   coroutine that holds a region and then hands synchronous work over the same
+   file to :func:`asyncio.to_thread` deadlocks rather than raising. No in-tree
+   site does it; nothing stops one being added.
+3. The Python renderer is already sequential
    (``rine._client.RineClient._transcript_rows`` iterates rows with a plain
    ``for``), so the TypeScript fix's other half — making the render sequential —
    has no counterpart to port. The loss here comes from a SECOND decrypt site in
@@ -79,7 +79,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
 
 from rine._config import sender_keys_dir
@@ -88,9 +88,13 @@ from rine._crypto.sender_keys_helpers import (
     save_sender_key_state,
     sender_keys_retired,
 )
+from rine._crypto.sender_keys_thread_lock import (
+    held_across_threads,
+    held_across_threads_async,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterable, Sequence
+    from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
 
     from rine._crypto.sender_keys import SenderKeyState
 
@@ -196,8 +200,14 @@ async def with_sender_key_states(
     two attempts. That is why the decrypt takes the lock inside itself rather than
     the recovery taking it around both.
 
-    🔴 It is also in-process, per-loop only, and blind to the worker thread the
-    async send runs on. See this module's own docstring for the residuals.
+    Two coroutines re-entering here still wait on themselves forever —
+    :class:`asyncio.Lock` gives no diagnostic for that and neither does the tier
+    below it, on purpose (:func:`rine._crypto.sender_keys_thread_lock._refuse_reentry`
+    says why). Reaching :func:`with_sender_key_states_sync` for the same file from
+    inside this block DOES now raise rather than hang.
+
+    🔴 It is in-process only: two processes over one config dir still race (see
+    this module's own docstring for that residual and the others).
 
     Args:
         config_dir: Config directory path.
@@ -209,10 +219,44 @@ async def with_sender_key_states(
     """
     loop_id, key, file_lock = _enter(config_dir, agent_id, group_id)
     try:
-        async with file_lock.lock:
+        async with file_lock.lock, held_across_threads_async(key):
             yield
     finally:
         _leave(loop_id, key, file_lock)
+
+
+@contextmanager
+def with_sender_key_states_sync(config_dir: str, agent_id: str, group_id: str) -> Iterator[None]:
+    """Hold exclusive in-process access to one group's sender-key state, from a thread.
+
+    The synchronous counterpart to :func:`with_sender_key_states`, and the reason
+    the exclusion has a thread tier at all: the group SEND path is synchronous,
+    and the async client runs it on a worker thread where no
+    :class:`asyncio.Lock` reaches it. A caller of this and a caller of
+    :func:`with_sender_key_states` over the same file exclude each other.
+
+    Everything the async version's docstring says about entering the block with
+    an already-loaded array, and about the block not being reentrant, holds here
+    unchanged. The one rule specific to this side: it must never be called from
+    a coroutine. It acquires blocking, so the event loop would stop until the
+    holder — possibly a worker thread waiting on that same loop — finished.
+
+    Both of those refusals are enforced rather than merely documented: this side
+    raises :class:`RuntimeError` when the thread reaching it is the one already
+    holding the file, which covers the nested-region case and the call-from-a-
+    coroutine case alike. It is the only re-entry either tier can catch; see
+    :func:`rine._crypto.sender_keys_thread_lock._refuse_reentry`.
+
+    Args:
+        config_dir: Config directory path.
+        agent_id: The sending agent's UUID.
+        group_id: The rine group UUID.
+
+    Yields:
+        Nothing; the block is entered for the exclusion alone.
+    """
+    with held_across_threads(_file_key(config_dir, agent_id, group_id)):
+        yield
 
 
 def sender_key_identity(state: SenderKeyState) -> tuple[str, str]:
@@ -325,11 +369,15 @@ def merge_sender_key_states(
     the hole this closes, and on UUID ids the two tests never disagree about that.
 
     A caller that must genuinely drop states re-derives its whole array from a
-    fresh read instead — inside :func:`with_sender_key_states` where it can hold
-    that region. :func:`rine._sender_key_ops.get_or_create_sender_key_sync`'s
-    rotation is the one that cannot, being sync and run on a worker thread, and it
-    re-reads regardless: the fresh read is the half of the fix that needs no lock,
-    and it is worth having on its own.
+    fresh read instead, inside a region: :func:`with_sender_key_states` for a
+    coroutine, :func:`with_sender_key_states_sync` for a synchronous one.
+    :func:`rine._sender_key_ops.get_or_create_sender_key_sync`'s rotation is the
+    asserting caller, and it holds the second of those — being sync and run on a
+    worker thread is what decides WHICH tier it is entitled to, not whether it
+    can have one, and the sentence that said it could not predates that tier. It
+    re-reads inside the region regardless: the fresh read is the half of the fix
+    that keeps what another writer had already committed, and it is worth having
+    on its own, because the region excludes no second PROCESS.
 
     🔴 A merge never RE-CREATES a retired group's file.
     :func:`rine._sender_key_ops.delete_sender_key` unlinks it and marks the group
@@ -385,4 +433,5 @@ __all__ = [
     "sender_key_identity",
     "states_from_sender",
     "with_sender_key_states",
+    "with_sender_key_states_sync",
 ]

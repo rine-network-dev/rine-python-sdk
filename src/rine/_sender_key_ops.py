@@ -26,7 +26,11 @@ from rine._crypto.sender_keys_helpers import (
     mark_sender_keys_retired,
     save_sender_key_state,
 )
-from rine._crypto.sender_keys_store import merge_sender_key_states, states_from_sender
+from rine._crypto.sender_keys_store import (
+    merge_sender_key_states,
+    states_from_sender,
+    with_sender_key_states_sync,
+)
 from rine._logging import logger
 from rine._utils import to_base64url
 
@@ -235,15 +239,28 @@ def get_or_create_sender_key_sync(
         # stack as on the TypeScript one. Twin: ``sender-key-ops.ts``, which retains one the
         # same way and additionally drops departed members' peer rows on a removal
         # rotation, which this stack does not.
-        current = load_sender_key_states(config_dir, sender_agent_id, group_id)
-        current_own = [s for s in current if s.sender_agent_id == sender_agent_id]
-        peer_states = [s for s in current if s.sender_agent_id != sender_agent_id]
-        save_sender_key_state(
-            config_dir,
-            sender_agent_id,
-            group_id,
-            [*peer_states, *current_own[-1:], new_state],
-        )
+        #
+        # 🔴 The fresh read and this save are held EXCLUSIVE, and the fan-out
+        # above is deliberately outside that region. The re-read alone keeps
+        # what another writer had already committed; it cannot stop one
+        # committing between this load and this save, and that writer's loss is
+        # total — a whole-array save asserts rows this call never looked at. The
+        # lock is a THREAD lock because this function is sync and the async
+        # client runs it on a worker — ``with_sender_key_states_sync`` explains
+        # the pairing with the coroutine tier; the TypeScript twin wraps these
+        # same two statements in ``withSenderKeyStates`` and leaves its fan-out
+        # outside for the same reason — one DM per member is not a region to hold
+        # a lock across.
+        with with_sender_key_states_sync(config_dir, sender_agent_id, group_id):
+            current = load_sender_key_states(config_dir, sender_agent_id, group_id)
+            current_own = [s for s in current if s.sender_agent_id == sender_agent_id]
+            peer_states = [s for s in current if s.sender_agent_id != sender_agent_id]
+            save_sender_key_state(
+                config_dir,
+                sender_agent_id,
+                group_id,
+                [*peer_states, *current_own[-1:], new_state],
+            )
         return new_state
 
     assert own_state is not None
@@ -302,16 +319,16 @@ def _record_distribution(
     deletion — exactly what that merge is entitled to assert — and it carries the
     retired-group refusal with it.
 
-    🔴 No lock, deliberately.
-    :func:`rine._crypto.sender_keys_store.with_sender_key_states` is an ``async``
-    context manager and this function is sync, run on a WORKER THREAD by the
-    async client (residual 1 of that module): excluding a thread from a
-    coroutine's region is a design change, not a re-read. So the window between
-    this load and the merge's own is narrow but real, and the honest sentence
-    about it is "no coroutine interleaves with it", never "nothing else in this
-    process runs". The TypeScript twin is ``recordDistribution``
+    🔴 The load, the union and the merge's own read-modify-write are held as ONE
+    region, by :func:`rine._crypto.sender_keys_store.with_sender_key_states_sync`
+    — the thread tier, because this function is sync and the async client runs it
+    on a worker thread, where an :class:`asyncio.Lock` reaches nothing. Without
+    it the window between this load and the merge's own is narrow but real, and
+    the honest sentence about a sync region on this stack is "no coroutine
+    interleaves with it", never "nothing else in this process runs". The
+    TypeScript twin is ``recordDistribution``
     (``rine-core/src/sender-key-ops.ts``), which closes the same half and takes
-    its lock on top.
+    its lock over the same span.
 
     Args:
         config_dir: Config directory path.
@@ -322,16 +339,17 @@ def _record_distribution(
     """
     if not succeeded:
         return
-    current = states_from_sender(
-        load_sender_key_states(config_dir, sender_agent_id, group_id), sender_agent_id
-    )
-    live = next((s for s in current if s.sender_key_id == sender_key_id), None)
-    if live is None:
-        return
-    # ``dict.fromkeys`` for the union because ``distributed_to`` is an ordered
-    # list on the wire and a ``set`` would reshuffle it on every write.
-    live.distributed_to = list(dict.fromkeys([*live.distributed_to, *succeeded]))
-    merge_sender_key_states(config_dir, sender_agent_id, group_id, [live])
+    with with_sender_key_states_sync(config_dir, sender_agent_id, group_id):
+        current = states_from_sender(
+            load_sender_key_states(config_dir, sender_agent_id, group_id), sender_agent_id
+        )
+        live = next((s for s in current if s.sender_key_id == sender_key_id), None)
+        if live is None:
+            return
+        # ``dict.fromkeys`` for the union because ``distributed_to`` is an ordered
+        # list on the wire and a ``set`` would reshuffle it on every write.
+        live.distributed_to = list(dict.fromkeys([*live.distributed_to, *succeeded]))
+        merge_sender_key_states(config_dir, sender_agent_id, group_id, [live])
 
 
 def _state_paths(config_dir: str, agent_id: str, group_id: str) -> list[str]:

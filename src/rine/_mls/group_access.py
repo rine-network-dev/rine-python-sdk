@@ -11,6 +11,32 @@ because the memo and the state it remembers have to be retired together. The
 TypeScript mirror is ``rine-core/src/crypto/mls-state.ts``, with the same names
 and the same per-key semantics: a memo whose staleness differs per stack is the
 same defect class as a guard whose input differs per stack.
+
+🔴 **Nothing serialises this store, and the sender-key lock is not the mechanism
+for it.** The warning is about the whole package this module opens the door to,
+not about these two functions: every ``_mls`` module that mutates a group saves
+it back — ``_mls.welcomes``, ``_mls.external_join``, ``_mls.admission_state``,
+``_mls.orphans``, ``_mls.messages`` (twice), ``_mls.resync``, ``_mls.sync`` and
+``_mls.removal``. All but one of them reach their handle through
+:func:`open_mls_group` or :func:`load_mls_group`; ``_mls.external_join`` takes
+its own from ``join_by_external_commit``, which is the shape of every
+establishment path and the reason a lock at THESE entry points would not even
+cover the set. Each save is a
+read-modify-write of one group's serialised state, and two clients over one
+config dir — a CLI and an SDK, the ordinary cross-stack case — can each save
+over the other. Three facts about why the answer is not the sender-key store's:
+the racing writer is another PROCESS, which an in-process lock cannot exclude;
+the whole read-modify-write happens inside the compiled core
+(``rine-mls/crates/rine-mls-core/src/store``, which is temp-plus-rename with no
+``flock``), so a lock a Python call site takes says nothing to the Node addon on
+the other side; and there is no merge half available as a fallback — the state is
+an opaque ratchet tree, not an array of independently-named rows, so a lost
+update is total rather than partial. Add nothing here without deciding all
+three: a naive lock at these entry points would also deadlock the recovery path,
+because :func:`rine._mls.sync.sync_mls_group` is both a public export and
+re-entered from inside a decrypt (``rine._mls.messages._recover``). An MLS agent's
+config dir is live cryptographic state, which is why the standing rule is one
+client at a time rather than a lock.
 """
 
 from __future__ import annotations

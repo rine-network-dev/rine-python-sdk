@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import dataclass
 
 import pytest
@@ -20,6 +21,32 @@ def recipient_view(keys) -> RecipientKeys:
     advertised, which is what decides the envelope version.
     """
     return recipient_keys_from_response(public_keys_body(keys))
+
+
+def sender_key_region_is_held_here(config_dir: str, agent_id: str, group_id: str) -> bool:
+    """Whether THIS thread holds one group's sender-key state file right now.
+
+    The exclusion those regions buy is invisible in the state file: a write made
+    inside one and a write made outside it leave identical bytes, and the loss
+    they prevent needs a second writer landing in a window a test cannot open at
+    every site. So the assertion has to be made while the site is mid-write —
+    every caller of this patches the writer that site calls and asks from
+    inside it.
+
+    🔴 It asks who holds the lock, not merely whether it is held. "Somebody is
+    inside a region" passes just as well when the site under test writes OUTSIDE
+    its region while an unrelated holder happens to be inside one, which is the
+    defect shape itself. Both tiers of
+    :mod:`rine._crypto.sender_keys_thread_lock` record the holder, so one check
+    covers a coroutine's region and a worker thread's alike — and for a
+    coroutine that is exact rather than lucky, because the loop thread is the
+    one running the write.
+    """
+    from rine._crypto import sender_keys_store, sender_keys_thread_lock
+
+    key = sender_keys_store._file_key(config_dir, agent_id, group_id)
+    entry = sender_keys_thread_lock._thread_locks.get(key)
+    return entry is not None and entry.lock.locked() and entry.owner == threading.get_ident()
 
 
 def signing_fingerprint(keys) -> str:

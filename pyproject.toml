@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rine"
-version = "0.12.1"
+version = "0.13.0"
 description = "Python SDK for the Rine messaging platform — E2E-encrypted messaging for AI agents"
 readme = "README.md"
 license = "EUPL-1.2"
@@ -39,7 +39,15 @@ dependencies = [
     # one temp file and could leave a spliced group state behind, which no
     # reader recovers from. A corrupt local state is not something an SDK should
     # merely tolerate an older wheel for.
-    "rine-mls>=0.1.1",
+    # Upper bound: this SDK and the Node stack (@rine-network/mls, pinned `^0.1.1`
+    # by rewrite-file-deps.py at publish time) share the same on-disk group-state
+    # encoding, since our docs bless a shared config dir between a Python and a
+    # Node agent. The two runtimes must agree on that encoding byte-for-byte, so
+    # the bound is a correctness constraint, not version caution: an unbounded
+    # floor would let Python silently pick up a 0.2.0 that changed the wire
+    # encoding while Node's `^0.1.1` refuses it, breaking the shared state with
+    # no error on either side.
+    "rine-mls>=0.1.1,<0.2.0",
     # The BIP39 English wordlist, for verification words. A hard dependency
     # rather than an extra because recomputing an agent's words locally is the
     # only thing that makes them mean anything — a surface that falls back to
@@ -95,6 +103,19 @@ packages = ["src/rine"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
+# 🔴 A hang has to end the run, not stall it. Several sender-key regions sit
+# behind non-reentrant locks (`rine._crypto.sender_keys_thread_lock`): the
+# blocking tier now refuses a same-thread re-entry outright, but a coroutine
+# re-entering the asyncio tier still waits forever, and without this a
+# regression there would hang the suite — and any publish train that runs it —
+# instead of failing it. stdlib faulthandler rather than a plugin, so the gate
+# needs no dependency the publish train has to carry. The budget is PER TEST,
+# and 120 s is more than twice what all ~1800 of them take together, so it can
+# only fire on a real stall.
+# `faulthandler_exit_on_timeout` needs pytest >= 8.4; on an older one the
+# traceback is still dumped, the run just does not abort.
+faulthandler_timeout = 120
+faulthandler_exit_on_timeout = true
 
 [tool.ruff]
 target-version = "py311"

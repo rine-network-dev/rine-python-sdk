@@ -7,6 +7,188 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-14
+
+### Fixed — a long-lived client refreshes its token before it expires, not after
+
+Both clients now check a remembered expiry — in memory first, then on disk — before every
+request, instead of finding out a token has expired by sending it and getting rejected. A
+process that stays up across several token lifetimes previously discovered expiry this way on
+every single cycle, forever, with a suite that stayed green throughout because nothing exercised
+a client that lived that long.
+
+**What you will see differently:** an always-on agent no longer produces a rejected-then-retried
+request once per token lifetime. A client that runs briefly and exits before its first token
+would have expired never saw the defect and sees no change here.
+
+### Added — read a message without marking it delivered
+
+`read(message_id, ..., peek=True)` reads a message without marking it delivered for the calling
+agent, so it is still offered by `?status=new`, `/poll` and SSE catch-up afterward. A plain
+`read()` marks the row delivered exactly as before — `peek` is opt-in and a keyword-only argument
+on both the sync and async client.
+
+This matters because the server marks a message delivered the moment it is fetched, before any
+client attempts to decrypt it, and there is no way to undo that mark afterward. Without `peek`, a
+message that fails to decrypt is gone from every listing on the first look even though nothing
+was actually read. `peek=True` lets a caller inspect a message, or wait for the material that
+would let it decrypt, without spending that one chance.
+
+### Changed — BREAKING: `send_and_wait()` reports an unreadable reply instead of raising
+
+A reply that cannot be decrypted or verified used to raise out of `send_and_wait()`, while every
+other read path (`read()`, `inbox()`) already returned it as a message carrying `decrypt_error`
+with `plaintext` unset. `send_and_wait()` now does the same: the result's `reply` carries
+`decrypt_error` rather than the call raising.
+
+**What you will see differently:** code that wrapped `send_and_wait()` in `except CryptoError`
+(or a bare `except Exception`) no longer sees an exception from that path — the `except` block
+becomes dead code, and reading `result.reply.plaintext` without checking `decrypt_error` first
+now raises on `None` instead. Check `decrypt_error` on the reply the same way you already do for
+`read()`.
+
+The shape that breaks, and the fix:
+
+```python
+# BEFORE 0.13.0 — the except caught the unreadable reply, and the next line never ran
+try:
+    result = client.send_and_wait(to="peer@org", body="ping")
+except Exception:
+    result = None
+payload = json.loads(result.reply.plaintext)   # 0.13.0: TypeError, plaintext is None
+
+# 0.13.0 onward — the reply arrives, and says it could not be read
+result = client.send_and_wait(to="peer@org", body="ping")
+if result.reply is None or result.reply.decrypt_error:
+    ...                                        # handle it; there is no plaintext
+else:
+    payload = json.loads(result.reply.plaintext)
+```
+
+Nothing else about the call changed: it still raises for a send failure, a timeout still returns
+a result with no reply.
+
+### Changed — the token-refresh-on-401 log line is a warning again
+
+`401 received, refreshing token` moves from DEBUG back to WARNING. It was demoted to DEBUG while
+this path was the client's only refresh mechanism, firing once every token lifetime as ordinary
+operation — genuinely a routine hourly entry at the time. Now that the client refreshes ahead of
+its token's expiry (see above), reaching this line means the server rejected a token the client
+believed was still live: a revocation, a clock skew, a credential change. That is rare and
+unexpected, which is what a warning is for. If it starts appearing on every cycle again, the
+proactive refresh has regressed — that is the thing to fix, not the log level.
+
+### Fixed — a concurrent group send can no longer lose a just-rotated sender key
+
+Two sends racing on the same group could each load this agent's sender-key state, rotate or
+record a key, and save — and the second save overwrote the first's row outright, discarding a key
+that had already been distributed to every group member. The read-modify-write around a group
+send now holds an exclusive lock across the whole operation, whether the caller is a coroutine or
+a worker thread, so a losing writer's update is merged instead of discarded.
+
+0.12.1 closed this for callers racing in the same event loop. What is new here is the cross-thread
+half: the group send runs its whole read-modify-write on a worker thread, which an `asyncio` lock
+binds no thread to, so the exclusion is now built in two tiers that a coroutine and a worker thread
+can both hold.
+
+This closes the race between callers in one process. Two separate processes sharing one config
+directory can still race on the same file; that is unchanged.
+
+### Changed — `rine-mls` now has an upper version bound
+
+The dependency was `rine-mls>=0.1.1` with no ceiling; it is now `rine-mls>=0.1.1,<0.2.0`. This
+SDK and the Node stack read and write the same on-disk MLS group-state encoding when they share a
+config directory, and the published Node package already bounds itself to the same range. An
+unbounded Python floor could resolve a future `rine-mls` release that changed that encoding with
+nothing to stop it; the ceiling keeps the two stacks agreeing on what `pip install rine` can bring
+in.
+
+## [0.12.1] - 2026-09-09
+
+🔴 **This release contains security fixes to the group sender-key path. Upgrade from 0.12.0 or
+earlier.** Written up on 2026-09-14: 0.12.1 shipped with its notes still unwritten, so the two
+paragraphs below were never published with the release they describe.
+
+### Fixed — a sender key is now bound to the signer the server stamped, not to a claim inside it
+
+A sender-key distribution arrives as a direct message whose signature this SDK verifies. The
+signature was checked, and it decided *whether* to store the key — but the row was then built from
+fields inside the message body, including which agent the key belonged to. So the identity on a
+stored key was chosen by whoever sent the message, while its signature checked out.
+
+The practical consequence: anyone who could send the reader a direct message and knew the group's
+id — which includes every former member — could have a key of their own stored as if it were the
+reader's. The reader would then have sealed its own group posts under a key the sender already
+held. There was no membership check on the sender, and nothing aged the planted row out.
+
+Both places that ingest a key now take the agent id from the verified signature and nowhere else.
+Alongside it: a key id identifies a row only together with its sender, so one peer can no longer
+occupy another's slot (previously that peer's posts would refuse to open, indefinitely, and read
+like a decryption bug); an id taken from a message body is never used to build a filesystem path;
+key material and counters are length- and range-checked before use; and a payment quote reference
+is no longer taken as a caller-supplied path segment.
+
+### Fixed — a concurrent group send no longer discards a just-rotated sender key
+
+A send distributes the sender key as one message per member, so the shared state file could move
+underneath a single send many times over. Both of that send's writes saved an array they had read
+*before* that fan-out, discarding every peer key ingested and every ratchet advanced in the window.
+It is a lost update rather than a torn write, so writing the file atomically did nothing for it, and
+the loss was silent — a reader was simply told the group was sealed. The distribution now re-reads
+and merges only the row it is entitled to update.
+
+A rotation also keeps exactly one superseded key below the new one, so an agent can still read its
+own recent posts after rotating. Previously it could not, and the refusal it printed offered two
+explanations that are both untrue of one's own message.
+
+This closes the race between callers in the same event loop. The group **send** path additionally
+runs its read-modify-write on a worker thread, which an `asyncio` lock cannot reach; that half is
+closed in 0.13.0.
+
+## [0.12.0] - 2026-09-01
+
+Eight group defects found by hands-on production use. Written up on 2026-09-14 — this release also
+shipped with its notes unwritten.
+
+### Fixed — an agent whose key packages ran out is no longer permanently un-addable
+
+Key packages are single-use: a peer claims one each time it adds this agent to a group. At zero the
+agent cannot be given a Welcome — but a vote carried in its favour still seats it on the roster. The
+result was a member listed in the group, holding no leaf in the ratchet tree, reading nothing, and
+reporting it as a raw decryption error.
+
+Zero was permanent, because the only path that published more key packages ran where a Welcome had
+been processed, and joining a group yourself processes none. Publishing now rides every MLS
+operation instead. For an agent already drained, `group sync` carries a recovery top-up, and it
+reports what it did — that none were needed, that it published some, or that publishing failed and
+why, with the consequence spelled out rather than a bare count.
+
+### Fixed — sending to a group by its id answered "agent not found"
+
+An id in the recipient slot was put to the agent namespace alone, so addressing a group by its
+id could not work. An id is now read against the group namespace first and falls through to the
+agent one on a miss. The order is deliberate: reading a group answers only for a group this caller
+is seated in or owns, while the agent key lookup is unauthenticated and global, so asking the agent
+side first would prefer a stranger's namespace over the caller's own. A miss and a refusal answer
+alike, so no caller learns which ids it cannot see exist. When an id is read as a group, the SDK
+says so rather than substituting silently.
+
+### Fixed — replying to a group post is refused outright
+
+A reply to a group post was filed into a separate child conversation. No caller reached that path
+in practice, but it sat one guard away from publishing who replied privately to whom to every
+organisation in the group. It is now refused, and the refusal says why. To answer a group, send to
+the group's handle.
+
+### Changed — clearer refusals, and a corrected API reference
+
+Several error messages that named the wrong cause or offered an impossible remedy were rewritten,
+the vote table renders one convention throughout, and `--agent` is honoured everywhere it is
+accepted. The docstrings that publish as this package's API reference were corrected, as were the
+README and the AI rules files — several described behaviour the package did not have.
+
+## [0.11.0] - 2026-08-26
+
 ### Changed — resolving a group by id checks the group that answers
 
 `resolve_group()` reads the group a UUID names before it answers. That read is now
