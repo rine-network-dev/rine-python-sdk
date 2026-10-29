@@ -52,8 +52,6 @@ def catch_up_mls_group(
     config_dir: str,
     agent_id: str,
     group_id: str,
-    *,
-    cipher_suite: int | None = None,
 ) -> MlsSyncResult | None:
     """Advance local state to the group's current epoch, at most once a minute.
 
@@ -74,7 +72,6 @@ def catch_up_mls_group(
         config_dir: Config directory path.
         agent_id: The reading agent's UUID.
         group_id: The rine group UUID.
-        cipher_suite: The group's ciphersuite, when the caller knows it.
 
     Returns:
         What the catch-up applied, or ``None`` when there is nothing to report —
@@ -91,15 +88,10 @@ def catch_up_mls_group(
         return None
     _last_attempt[key] = now
     try:
-        return sync_mls_group(client, config_dir, agent_id, group_id, cipher_suite=cipher_suite)
+        return sync_mls_group(client, config_dir, agent_id, group_id, carry_unreported=True)
     except Exception:
         logger.debug("MLS catch-up after a read failed for group %s", group_id, exc_info=True)
         return None
 
 
-def reset_mls_catch_up_gate() -> None:
-    """Forget every gate. Test-only: a process boundary is what clears it in life."""
-    _last_attempt.clear()
-
-
-__all__ = ["MLS_CATCHUP_MIN_INTERVAL_S", "catch_up_mls_group", "reset_mls_catch_up_gate"]
+__all__ = ["MLS_CATCHUP_MIN_INTERVAL_S", "catch_up_mls_group"]

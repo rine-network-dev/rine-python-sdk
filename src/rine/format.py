@@ -43,6 +43,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
+from rine._seat_words import RECOVERY_EVICTED, seat_update_line
+
 if TYPE_CHECKING:
     from rine._group_recovery import (
         GroupRecoveryResult,
@@ -182,7 +184,7 @@ _ENCRYPTION_WORDS: dict[GroupEncryption, str] = {
     # failed; the second leaves ``mls_pending`` set server-side
     # (``api/mls.py::init_mls_group``), which is ``is_mls_frozen``
     # (``api/group_helpers.py``), and ``POST /messages`` then refuses every
-    # non-``mls-v1`` send with a 409 (``api/messages.py``) until the server's own
+    # non-``mls-v1`` send with a 409 (``api/messages_send_group.py``) until the server's own
     # 900 s self-heal clears it (``api/mls_confirmation.py``). The object this is
     # rendered from is the create response, minted BEFORE the init, so its
     # ``mls_pending`` is false on both and cannot tell them apart — the sentence
@@ -646,11 +648,6 @@ def key_package_top_up_line(top_up: KeyPackageTopUp | None) -> str:
     return _KEY_PACKAGE_PUBLISHED.format(published=top_up.published)
 
 
-_RECOVERY_EVICTED = (
-    "This agent was removed from the group by a commit it just replayed: messages that "
-    "already arrived still open, and nothing committed after the Remove ever will."
-)
-
 _SCAN_DONE = (
     "This sync is finished; nothing here is a message from the group, so read the "
     "group's own messages next."
@@ -830,6 +827,8 @@ def describe_mls_recovery(group_ref: str, result: GroupRecoveryResult) -> str:
     # 🔴 APPENDED, never prepended. Two matrix drivers match this answer's head
     # with ``^``-anchored regexes and read a miss as the surface refusing — a
     # successful recovery graded as a broken surface.
+    if result.regime == "mls":
+        body = _join_lines(body, seat_update_line(result.seat))
     return _join_lines(body, key_package_top_up_line(result.key_packages))
 
 
@@ -854,7 +853,7 @@ def _describe_mls_rung(group_ref: str, result: MlsRecoveryResult) -> str:
         )
     if not result.evicted:
         return head
-    return f"{head}\n{_RECOVERY_EVICTED}"
+    return f"{head}\n{RECOVERY_EVICTED}"
 
 
 __all__ = [

@@ -40,13 +40,7 @@ import respx
 from rine import _client as async_client_module
 from rine import _sync_client as sync_client_module
 from rine._constants import MessageType
-from rine._crypto._agent_keys import recipient_keys_from_response
-from rine._crypto.keys import (
-    generate_agent_keys,
-    load_agent_keys,
-    public_keys_body,
-    save_agent_keys,
-)
+from rine._crypto.keys import load_agent_keys, save_agent_keys
 from rine._crypto.message import (
     decrypt_group_message_sync,
     encrypt_group_message,
@@ -56,7 +50,8 @@ from rine._crypto.sender_keys import generate_sender_key
 from rine._crypto.sender_keys_helpers import load_sender_key_states, save_sender_key_state
 from rine._http import SyncHttpClient
 from rine._utils import to_base64url
-from tests.conftest import sender_key_region_is_held_here
+from rine.testing import WORLD
+from tests.conftest import recipient_view, sender_key_region_is_held_here
 
 API = "https://rine.network"
 #: Any agent that can DM the reader — it never has to be a member to send the DM.
@@ -95,9 +90,8 @@ class HonestKey:
 
 def _publish(config_dir: str, agent_id: str) -> dict:
     """Mint one agent's keys into *config_dir* and return their published form."""
-    keys = generate_agent_keys()
-    save_agent_keys(config_dir, agent_id, keys)
-    return public_keys_body(keys)
+    save_agent_keys(config_dir, agent_id, WORLD.keys(agent_id))
+    return WORLD.keys_response(agent_id)
 
 
 def _distribution(
@@ -113,12 +107,8 @@ def _distribution(
     The HPKE seal, the Ed25519 signature and the ``from_agent_id`` the server would
     stamp are all genuine; *payload* is the part under the sender's sole control.
     """
-    sealed = encrypt_message(
-        foreign_dir,
-        signer_id,
-        recipient_keys_from_response(public_keys_body(load_agent_keys(reader_dir, reader_id))),
-        payload,
-    )
+    recipient = recipient_view(load_agent_keys(reader_dir, reader_id), reader_id)
+    sealed = encrypt_message(foreign_dir, signer_id, recipient, payload)
     return {
         "id": message_id,
         "conversation_id": "cccccccc-dddd-eeee-ffff-000000000103",
@@ -136,7 +126,7 @@ def _register(reader_id: str, rows: list[dict], published: dict[str, dict]) -> N
     """Every route the ingest and the follow-up group decrypt read.
 
     *rows* is listed in the order given — the server lists the distribution inbox
-    newest-first (``src/rine/api/messages.py`` orders by ``created_at DESC``) and the
+    newest-first (``src/rine/api/messages_inbox.py`` orders by ``created_at DESC``) and the
     scan imposes no ordering of its own, which is what makes the squat winnable with
     no race at all.
     """

@@ -19,8 +19,10 @@ agent can be invited and unseated, or seated and not yet a member.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
+
+from rine._mls.escrow_report import EscrowReport
 
 #: Why a requested agent did not get a leaf in this admission.
 #:
@@ -30,13 +32,22 @@ from typing import Literal
 #: * ``already_in_group`` — its leaf already resolves in the ratchet tree. This
 #:   is what makes the loop a **resume** rather than a re-run: an admission over
 #:   a partly-founded group re-admits nobody.
+#: * ``key_package_not_current`` — the claimed KeyPackage was minted under a key
+#:   generation the agent has since rotated away from. The package is spent; the
+#:   agent publishes current ones on its next MLS operation.
 #: * ``rejected_by_server`` — the server refused this recipient (422
 #:   ``welcome_recipient_rejected``), and the batch was retried once without
 #:   them.
+#: * ``revoked_seat_unreclaimed`` — the tree holds a leaf no key read serves, because
+#:   its agent was revoked and no member has reclaimed the leaf. A Welcome minted over
+#:   that tree could never be opened, so the newcomer is held until a member reclaims
+#:   the leaf; the admission never removes it.
 MlsAdmissionSkipReason = Literal[
     "no_key_package",
     "already_in_group",
+    "key_package_not_current",
     "rejected_by_server",
+    "revoked_seat_unreclaimed",
 ]
 
 
@@ -57,11 +68,10 @@ class MlsAdmissionOutcome:
 #:   ``GET /agents/keys`` omits revoked agents, and an invitation outlives the
 #:   revocation of the agent it names: dropping that agent's leaf while its
 #:   voucher stands would evict somebody the group still holds a seat for.
-#: * ``identity_unseated`` — an agent the server calls a **member** publishes a
-#:   signing key that occupies no leaf in the tree. Membership and the ratchet
-#:   tree have come apart — a key rotation is the ordinary cause — and while
-#:   they are apart no leaf can be attributed, so a set difference would evict a
-#:   seated member whose leaf still carries the key they published before.
+#: * ``identity_unseated`` — an agent the server calls a **member** occupies no
+#:   leaf in the tree. Membership and the ratchet tree have come apart, and
+#:   while they are apart no leaf can be attributed, so a set difference could
+#:   evict a seated member.
 #: * ``outstanding_unknown`` — the group's live invitations could not be read,
 #:   so every agent invited and not yet accepted would look like an orphan.
 #:
@@ -109,6 +119,10 @@ class MlsReclamation:
     declined: MlsReclamationDecline | None = None
     """Set when nothing was reclaimed because the set could not be trusted."""
 
+    escrow: EscrowReport = field(default_factory=EscrowReport)
+    """What the escrow drains of the Remove commits could not do: epochs with no
+    escrow, a deferral, and what waits queued."""
+
 
 @dataclass(frozen=True)
 class MlsAdmissionResult:
@@ -133,6 +147,10 @@ class MlsAdmissionResult:
     ``None`` when it was not asked for — never a zeroed report, so "nobody ran
     it" and "it ran and found nothing" stay distinguishable.
     """
+
+    escrow: EscrowReport = field(default_factory=EscrowReport)
+    """What the escrow drains of this admission's commits could not do: epochs with
+    no escrow, a deferral, and what waits queued."""
 
 
 __all__ = [

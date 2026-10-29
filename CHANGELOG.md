@@ -5,7 +5,198 @@ All notable changes to the `rine` Python SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.14.0] - 2026-10-29
+
+An org is now built from one secret, the **org root**, and `client_secret` no longer exists.
+This is a breaking release: an SDK older than 0.14.0 cannot sign in to a server that runs this
+release, and every org registered before it is retired, so you onboard again. It needs
+`rine-mls>=0.2.0,<0.3.0`.
+
+**What you will see differently:**
+
+- Onboarding creates a 32-byte org root and a 24-word recovery phrase in an owner directory
+  (`RINE_OWNER_DIR`, default `~/.config/rine-owner`) that the SDK refuses to place inside a git
+  checkout or the config directory. The result carries the phrase file's path, never the words.
+  Losing both `root.key` and the phrase loses the org; anyone who reads either controls it. The
+  phrase does not restore wallet keys.
+- `client_id`, `client_secret` and `credentials.json` are gone, and so are the `RINE_CLIENT_ID`
+  and `RINE_CLIENT_SECRET` variables, which are ignored. A client signs in with a short-lived
+  signed assertion (`private_key_jwt`). A clock more than 30 seconds ahead cannot sign in, and
+  the error says so. `profiles.json` holds the principal, agent id and poll URL and no secret.
+- Every 1:1 message is post-quantum (`hpke-hybrid-v2`) and every closed group uses the
+  post-quantum MLS suite only; an agent without a post-quantum key cannot be created, and a
+  message sealed any older way is refused.
+- Org ids are derived from the org's keys, so a recovered org keeps its id. Every agent's
+  verification words change with its new keys, and an org has eight of its own.
+- The root of every member org reads what a group's other members said in the epochs its own
+  agents held. Each member agent uploads a read escrow for every closed-group epoch it holds, and
+  a post into a new epoch waits for it.
+- Rotating an agent's keys needs the org root or a branch key; after it, the holder of the root
+  can still read the older generation's 1:1 traffic.
+- Rotating an agent's keys moves its seat in every closed group it sits in to the new key, in
+  place, on a host that holds the group's state; no member has to add it back. `rotate_keys`
+  returns the seat report, and a group the host cannot reach is moved on the next sync. A group
+  that admits members by open enrollment holds the move until a member acknowledges it, and
+  `rotate_keys` says it is waiting.
+
+### Added
+
+- **`rotate_keys` and `async_rotate_keys` return a `RotatedAgent`.** It is the agent read
+  (`result.id`, `result.key_gen`, ...) plus `key_packages` (a `KeyPackageRotation`: `republished`,
+  `pending` or `not_held`) and `group_seats`, one `SeatUpdate` per group. A seat is `updated`, `current`,
+  `deferred` (`epoch_race`, `awaiting_ack`, `rolled_back`, `unreachable`) or `failed` (`evicted`,
+  `seat_unhealable`, `key_not_current`, `refused`); `SeatDeferReason` and `SeatFailReason` carry the
+  reasons. Progress is kept in `keys/<agent>/mls-rotation.json` so an interrupted sweep resumes.
+- **A member refuses a KeyPackage sealed to a superseded key** (`key_package_not_current`) and
+  skips that agent rather than claiming another package.
+- **The recovery report names the seat outcome** after a rotation, before the KeyPackage top-up.
+- **`MlsRotatedLeafError`** now says to remove the agent and invite it again, the only remedy on a
+  host that holds no group state able to move the leaf.
+- **`recover_org` and `async_recover_org`** rebuild a device from the phrase and report each
+  agent and group reseat (`RecoveryReport`, `AgentRecovery`, `GroupReseat`).
+- **Derivation, certificates and signed assertions** for the org, branches and agents, with
+  typed errors (`OrgMismatchError`, `AgentIdMismatchError`, `PrincipalRevokedError`,
+  `EscrowGapError`) and `WhoAmIPrincipal`.
+- **`rine.testing`**, a self-consistent test org with real derivation and real certificates.
+- **A cleartext A2A turn says so in `thread()`.** A turn an external A2A client posted in
+  cleartext now leads with `A2A_CLEARTEXT_NOTICE` in brackets, so a transcript handed to a model
+  never reads it as end-to-end encrypted. `with_a2a_cleartext_notice(msg, text)` applies the same
+  lead to a body a caller renders itself. The `ThreadEntry` also carries `a2a_cleartext=True`.
+- A message an external A2A client posted in cleartext now reads as its plain text, with
+  `a2a_cleartext` and `a2a_cleartext_notice` set on the `DecryptedMessage`, on both clients.
+  It used to come back as an unsupported encryption version. `plaintext` is the posted parts'
+  JSON text, the same string the TypeScript clients decode for the message.
+- **`rine.x402.CorruptSpendJournalError`.** An x402 spend journal that cannot be read (not
+  JSON, a missing day, a malformed total or paid-id list, not UTF-8) refuses every payment and
+  names the file, which it leaves as it is; it used to read as a fresh day with nothing spent.
+  The error is not an `X402Error`. A journal dated tomorrow (UTC), after the clock moved back
+  across midnight, keeps its spend and paid ids. One dated two or more days ahead refuses
+  payments with `CorruptSpendJournalError` naming the file, and says to check the system clock.
+
+### Removed
+
+- `HPKE_V1` and the `"hpke-v1"` default of the encryption version.
+- `CLASSICAL_CIPHER_SUITE` and the classical MLS suite.
+- `sign_payload` as an unprefixed signer; signatures carry a domain prefix.
+- `CredentialEntry` and the credentials file.
+- The `client_secret` field of the onboarding result.
+
+### Changed — internal
+
+- `_mls/welcomes.py` is split into `welcome_install.py` and `welcome_pick.py`; no public change.
+  The Welcome join now invalidates the local state memo inside the install step, right after the join and before the refusal check.
+
+### Added — `agent_only` clients, and the org-words constants
+
+`RineClient`, `SyncRineClient` and both HTTP clients take `agent_only=True`: the client signs
+only as an agent whose leaf keys are in its config dir and never reads an owner dir, so a host
+that also holds `root.key` cannot turn an agent runtime into the org. Combining it with an
+explicit `owner_dir` raises `ConfigError`. `GROUP_READERS_NOTICE`, `PHRASE_INSTRUCTION` and
+`PROFILES_FILE` are now exported from `rine`, so the framework adapters import one copy of each.
+
+**What you will see differently:** nothing, until you pass `agent_only=True`.
+
+### Fixed — a catch-up across an Add that was not yet verified no longer fails
+
+A member that was offline while another member added and then removed a third now catches up
+across both commits and reads the next message. The native core refuses a leaf whose
+`(agent id, leaf key)` is not in the allowed set and names the refused agent
+(`PeerNotAdmittedError`, `refused_peer()`); sync, resync, removal, orphan removal and the
+recovery reseat now chain-verify that agent once, then retry the same input. A leaf that does
+not verify stays refused and is NACKed, and a transport failure while verifying earns no NACK.
+
+**What you will see differently:** an agent that fell behind across an Add and a Remove syncs
+instead of stalling on the recovery ladder. A commit carrying an unverifiable leaf is refused
+exactly as before.
+
+### Fixed — a lost parked state is filed under the fork it held
+
+An escrow gap the core reports now carries the fork it is lost for, and a parked state records
+the fork of each queued epoch beside it. When that state can never be read, each lost epoch is
+filed under its own fork instead of for no fork. The drain also lets the escrow head follow the
+live group onto another fork at a lower epoch.
+
+**What you will see differently:** a send on the live fork is no longer blocked by the loss of
+another fork of the same epoch.
+
+### Fixed — a Welcome dropped unopened releases its key package
+
+A Welcome that ages out, is evicted, or ends unopened (its group is gone, it cannot be joined,
+or it is refused for good) now releases the private half it was sealed to, so the local pool
+count stays honest and the next heartbeat publishes a replacement.
+
+**What you will see differently:** an agent whose spooled Welcomes expired publishes fresh key
+packages on its next pass instead of staying addable only on paper.
+
+### Fixed — a Welcome naming a member the roster no longer lists installs
+
+A Welcome whose group holds a member added or removed since the agent read the roster now
+installs. The native core refuses the unlisted leaf; the Welcome pass chain-verifies each such
+member once and opens the same Welcome again. A member that does not verify (revoked, deleted,
+or carrying a key its owner no longer vouches for) is still a final refusal, and so is a
+Welcome that names more than 64 such members: the Welcome is discarded and its key package
+released. A failed verification read keeps the Welcome for the next pass, and an ordinary pass
+makes no extra request.
+
+**What you will see differently:** a join that used to be discarded as unjoinable now installs.
+When a Welcome is discarded for a member that does not verify, the warning names that member
+and the recovery (a member reclaims the leaf and invites the agent again) instead of blaming a
+different MLS core. An agent re-invited to a group it still holds old state for no longer sees
+that group reported as joined when the new Welcome is refused for such a member: the group is
+absent from `group_ids`, the Welcome counts in `discarded`, and its key package is released.
+
+### Fixed
+
+- **A wrong clock no longer reads as a wrong phrase.** When recovery is refused because
+  this machine's clock is outside the window the server accepts, the error now says the
+  clock is off instead of "no org matches this phrase". `AuthenticationError.raw` carries
+  the server's `reason`, and `names_clock_skew` tests for it.
+- **Recovery refuses a server that rolls an agent back.** `recover_org` now checks, as the
+  TypeScript client does, that the server does not also serve a generation newer than the
+  one it reports as current, and reports that agent as a mismatch.
+- **A principal string with a trailing newline is rejected** instead of parsed.
+- **A read escrow with an impossible tree size is refused before sealing.**
+
+### Fixed — files, locks and recognised refusals
+
+- `save_root` creates `root.key` exclusively and raises `ConfigError` when another root lands concurrently, where it
+  used to overwrite it.
+- Profile writes take `profiles.json.lock`; a writer that outwaits a live holder for 10 seconds raises
+  `ConfigError`, so concurrent runs no longer lose a profile. The spend lock works on filesystems without hard links.
+- `profiles.json`, `token_cache.json` and the spend journal are fsynced before the rename, so a crash cannot leave
+  them empty. So is every other file written through `rine._config._write_atomic` (the owner `recovery-phrase.txt`,
+  agent keys, the wallet key, sender keys), which adds one fsync per group message a client decrypts.
+- A spend journal that is not valid UTF-8 refuses payments with `CorruptSpendJournalError`, as on the TypeScript
+  side. A clock set back by two or more days refuses every x402 payment until the clock is right again.
+- KeyPackage top-up recognises the server's `key_package_inventory_full` code, so a full inventory stays a clean
+  no-op if the error sentence changes. An MLS self-join that meets an epoch conflict raised by the MLS core retries
+  once, as it already did for the server's 409 `epoch_conflict`.
+- Pending escrow files named with a non-canonical epoch (a leading zero, 16 or more digits) are ignored; the SDK
+  never writes such names. Temp files are named `<path>.<hex>.tmp` and removed on any `OSError`.
+
+### Changed
+
+**What you will see differently:**
+
+- **Breaking:** `prepare_payment` now requires the keyword `quote`, the received quote message; a call without it
+  raises `TypeError`. It refuses a quote whose sender is not `verified`: `inauthentic-sender` when the quote was
+  not signed by its sender, and the new `sender-unverifiable` when the check could not run (the sender's signing
+  key could not be looked up). Nothing is signed or debited either way; `sender-unverifiable` is retryable.
+  A quote that failed to decrypt, has no authenticated sender or is a cleartext A2A message keeps
+  `inauthentic-sender`, as does a payment of that kind in `fulfill`.
+  `message_id`, if given, must be that quote's id, and the payment requirement must be the one the quote
+  carries; otherwise it raises `requirement-mismatch`.
+- `fulfill` returns a failed receipt with `errorReason: inauthentic-sender`, and calls no facilitator, for a
+  payment its sender did not sign. For a payment whose sender could not be checked it raises
+  `sender-unverifiable` instead: no receipt is sent, the payer's thread stays open, and fulfilling the same
+  payment again works once the key lookup does.
+- A signing key id must be canonical: a lower-case UUID and a generation without leading zeros. Anything else
+  is a `sender-mismatch` verdict.
+- A sender-key state that belongs to another sender is refused before it is saved.
+- `rotate_agent_keys` chain-verifies the key set it reads and refuses one from another org or older than the
+  generation held on this device.
+- A server-supplied `verified` or other local verdict field on a message row is ignored; the SDK reaches each
+  verdict by decrypting.
 
 ## [0.13.0] - 2026-09-14
 

@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 
 import httpx
 import pytest
 import respx
 
-from rine._crypto.keys import generate_agent_keys, save_agent_keys
+from rine._crypto.keys import save_agent_keys
 from rine._mls import (
     DEFAULT_CIPHER_SUITE,
     load_mls_group,
@@ -29,23 +30,11 @@ from rine._mls import (
     publish_mls_key_packages,
     recover_mls_group,
 )
-from rine._mls.binding import MlsGroup
 from rine.errors import MlsResyncUnavailableError
+from rine.testing import WORLD
+from tests.escrow_outcomes import DEFERRED, DEFERRED_REPORT
 
-#: The tree-query and resync surface lands in ``rine-mls`` 0.1.1, and reaching
-#: Python needs a wheel built from it — a ``--native`` artifact build, not a
-#: source change. Every installed wheel at the time of writing predates it, so
-#: these tests are skipped rather than silently passing against a binding that
-#: cannot answer. The TypeScript twin (``rine-core/test/mls-resync.test.ts``)
-#: runs against a rebuilt napi addon and covers the same ladder.
-pytestmark = pytest.mark.skipif(
-    not hasattr(MlsGroup, "current_member_index"),
-    reason=(
-        "the installed rine-mls wheel predates the tree-query surface "
-        "(MlsGroup.current_member_index); rebuild it with "
-        "./scripts/build-mls-artifacts.sh and reinstall to run these"
-    ),
-)
+pytestmark = pytest.mark.usefixtures("mls_escrow_stub")
 
 API = "https://rine.network"
 GROUP_ID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
@@ -63,9 +52,18 @@ def _mock_token() -> None:
     )
 
 
-def _peer_client(tmp_path, agent: str):
+def _peer_client(tmp_path, agent: str, *also: str):
+    """This peer's MLS client, minting its keys once and reopening them after.
+
+    The extra ids are agents this peer will seat: the core refuses a leaf whose
+    ``(agent id, leaf key)`` pair is outside the client's allowed set, which is
+    every agent whose keys live in its config dir.
+    """
     peer_dir = str(tmp_path / f"peer-{agent}")
-    save_agent_keys(peer_dir, agent, generate_agent_keys())
+    if not os.path.isdir(peer_dir):
+        save_agent_keys(peer_dir, agent, WORLD.keys(agent))
+        for other in also:
+            save_agent_keys(peer_dir, other, WORLD.keys(other))
     return open_mls_client(peer_dir, agent)
 
 
@@ -79,10 +77,14 @@ def _found_and_seat(sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_p
     ours = base64.b64decode(
         json.loads(route.calls[0].request.content)["packages"][0], validate=True
     )
-    peer = _peer_client(tmp_path, other_agent_id)
+    peer = _peer_client(tmp_path, other_agent_id, agent_id, THIRD_ID)
     group = peer.create_group_with_members(mls_group_id_bytes(GROUP_ID), [ours])
     group.save()
 
+    # Our client has to know every leaf key in the tree it adopts: the founder's,
+    # and the third agent the peer later adds.
+    save_agent_keys(tmp_config_dir, other_agent_id, WORLD.keys(other_agent_id))
+    save_agent_keys(tmp_config_dir, THIRD_ID, WORLD.keys(THIRD_ID))
     respx.get(f"{API}/agents/{agent_id}/mls/welcomes").mock(
         side_effect=[
             httpx.Response(
@@ -115,7 +117,15 @@ def _peer_advances(group, tmp_path) -> tuple[int, str, str]:
 
 def _mock_group_info(blob: str | None, epoch: int | None) -> None:
     respx.get(f"{API}/groups/{GROUP_ID}/mls/group-info").mock(
-        return_value=httpx.Response(200, json={"group_info": blob, "epoch": epoch})
+        return_value=httpx.Response(
+            200,
+            json={
+                "group_info": blob,
+                "epoch": epoch,
+                "confirmed_epoch": epoch,
+                "latch_epoch": epoch,
+            },
+        )
     )
 
 
@@ -191,6 +201,21 @@ class TestTheCheapRung:
         assert posted.call_count == 0
 
     @respx.mock
+    def test_recover_when_the_escrow_drain_defers_then_the_result_carries_the_report(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path, monkeypatch
+    ):
+        group = _found_and_seat(sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path)
+        epoch, commit, group_info = _peer_advances(group, tmp_path)
+        _mock_group_info(group_info, epoch)
+        _mock_handshakes(commit=commit, epoch=epoch)
+        monkeypatch.setattr("rine._mls.sync.drain_escrow", lambda *_a, **_k: DEFERRED)
+
+        result = recover_mls_group(sync_client._http, tmp_config_dir, agent_id, GROUP_ID)
+
+        assert result.rung == "replay"
+        assert result.escrow == DEFERRED_REPORT
+
+    @respx.mock
     def test_recover_when_the_group_moves_during_the_replay_then_it_does_not_escalate(
         self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
     ):
@@ -219,7 +244,14 @@ class TestTheCheapRung:
 class TestTheExpensiveRung:
     @respx.mock
     def test_recover_when_the_server_refuses_the_replay_then_it_resyncs_admitting_nobody(
-        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+        self,
+        sync_client,
+        tmp_config_dir,
+        agent_id,
+        other_agent_id,
+        tmp_path,
+        mls_escrow_stub,
+        escrow_calls,
     ):
         group = _found_and_seat(sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path)
         stale_epoch = _local(tmp_config_dir, agent_id).epoch()
@@ -248,6 +280,9 @@ class TestTheExpensiveRung:
         seats = group.member_identities()
         assert len(seats) == seated_before + 1  # the peer's own Add landed too
         assert len([s for s in seats if s.index == stale_leaf]) == 1
+        assert mls_escrow_stub[-1] == (GROUP_ID, result.epoch)
+        # The old state is settled before the resynced group is saved over it.
+        assert escrow_calls[-2:] == [("settle", GROUP_ID), ("drain", GROUP_ID)]
 
     @respx.mock
     def test_recover_when_the_replay_leaves_a_gap_then_it_escalates(

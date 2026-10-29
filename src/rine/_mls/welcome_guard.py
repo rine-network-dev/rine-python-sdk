@@ -45,11 +45,11 @@ unrecoverable error, so the weakest predicate stands: ``unreadable`` accepts.
 Corroboration itself is deliberately the weakest predicate that still catches a
 group the roster knows nothing about: ONE identity in common with members or live
 invitees is enough. The tree of an honest group routinely holds leaves no roster
-read accounts for — an orphan from a self-leave or a lapsed invitation, a member
-who rotated its signing key since it joined, a revoked agent ``GET /agents/keys``
-no longer publishes — so requiring every leaf to be on the roster would refuse
-ordinary joins into ordinary groups. Those three populations are the same ones
-leaf reclamation declines on (:mod:`rine._mls.orphans`), for the same reason.
+read accounts for — an orphan from a self-leave or a lapsed invitation, a revoked
+agent ``GET /agents/keys`` no longer publishes — so requiring every leaf to be on
+the roster would refuse ordinary joins into ordinary groups. Those populations
+are the same ones leaf reclamation declines on (:mod:`rine._mls.orphans`), for
+the same reason.
 
 A refusal is not a verdict for all time. Every reason a later attempt could clear
 keeps the Welcome bytes on the spool — see :func:`refusal_is_retryable` and
@@ -81,15 +81,15 @@ if TYPE_CHECKING:
 def refusal_is_retryable(reason: WelcomeRefusalReason) -> bool:
     """Whether the Welcome bytes are kept for a later attempt, or dropped.
 
-    ``group_id_mismatch`` is deterministic — the Welcome joins one group and was
-    filed under another, and no later attempt changes either — so it is the one
-    refusal that discards. The other two turn on facts that move: a roster read
-    can fail transiently, an invitation can be accepted, a stale leaf can be
-    re-seated. ``GET /agents/{id}/mls/welcomes`` consumes what it serves and no
-    peer can mint a replacement without noticing the first went unused, so a
-    refusal that dropped those bytes would be permanent by accident.
+    ``group_id_mismatch`` and ``peer_not_admitted`` are deterministic — the Welcome
+    joins one group and was filed under another, or its tree never verifies — so those
+    two discard, and a join after a reclaim needs no copy of the bytes. The other two
+    turn on facts that move: a roster read can fail transiently, an invitation can be
+    accepted, a stale leaf can be re-seated. ``GET /agents/{id}/mls/welcomes`` consumes
+    what it serves and no peer can mint a replacement without noticing the first went
+    unused, so a refusal that dropped those bytes would be permanent by accident.
     """
-    return reason != "group_id_mismatch"
+    return reason not in ("group_id_mismatch", "peer_not_admitted")
 
 
 def _corroborate_roster(
@@ -175,10 +175,7 @@ def welcome_refusal(
             f"Refusing the MLS welcome for group {group_id}: the group's roster names no "
             "member and no outstanding invitation holding a leaf in the ratchet tree this "
             "welcome seats the agent in, so the group it joins is not the group it names. "
-            "The welcome is kept and retried. If the group is honest, this is what a "
-            "member that rotated its signing key after joining looks like — its leaf "
-            "still carries the old identity, so it has to re-seat it with `rine group "
-            "sync` or be re-invited before a welcome into this group can be corroborated.",
+            "The welcome is kept and retried.",
         )
     if load_mls_group(mls, group_id) is None:
         return None

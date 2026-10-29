@@ -20,6 +20,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
 from rine._mls.binding import (
+    CommitPendingError,
     EpochConflictError,
     GroupInactiveError,
     MlsCoreError,
@@ -79,7 +80,7 @@ def is_epoch_conflict(err: BaseException) -> bool:
 
 @contextmanager
 def group_failures(group_id: str) -> Iterator[None]:
-    """Re-word the one core failure that is really a membership fact.
+    """Re-word the two core failures that are really facts about the group.
 
     ``RINE_MLS_GROUP_INACTIVE`` is raised for exactly one reason — a Remove
     commit evicted this member's leaf — and the core's own message names no
@@ -88,7 +89,12 @@ def group_failures(group_id: str) -> Iterator[None]:
     :class:`~rine.errors.GroupEvictedError`, which says what happened and how to
     come back.
 
-    Only that one failure is translated. A store failure and an epoch conflict
+    ``RINE_MLS_COMMIT_PENDING`` is raised when a key update this agent built is
+    still waiting for a member to acknowledge it; the core's message names no
+    group and no wait, so it becomes an :class:`~rine.errors.MlsError` that
+    carries the same code and says both.
+
+    Only those two failures are translated. A store failure and an epoch conflict
     are this process's problems and must never be reported to an agent as an
     eviction it can do nothing about. The TypeScript twin is ``asGroupFailure``
     (``rine-ts-sdk/src/resources/groups-mls-context.ts``).
@@ -107,6 +113,12 @@ def group_failures(group_id: str) -> Iterator[None]:
         yield
     except GroupInactiveError as err:
         raise GroupEvictedError(group_id) from err
+    except CommitPendingError as err:
+        raise MlsError(
+            err.code,
+            f"This agent's key update in group {group_id} is awaiting a member's "
+            "acknowledgement; retry after it settles, at most 15 minutes.",
+        ) from err
 
 
 _P = ParamSpec("_P")

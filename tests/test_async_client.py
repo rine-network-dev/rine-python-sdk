@@ -8,26 +8,23 @@ import httpx
 import pytest
 import respx
 
-from rine import RineClient
-from rine._config import save_credentials
+from rine import KeyPackageRotation, RineClient, RotatedAgent
 from rine._constants import MessageType
-from rine._crypto.keys import (
-    encryption_public_key_to_jwk,
-    generate_agent_keys,
-    public_keys_body,
-    save_agent_keys,
-    signing_public_key_to_jwk,
-)
+from rine._crypto.jws import JwsTyp, verify_jws
+from rine._crypto.keys import load_agent_keys, save_agent_keys
 from rine._crypto.message import encrypt_message
 from rine._crypto.sender_keys_helpers import load_sender_key_states
+from rine._owner import resolve_owner_dir
 from rine.errors import (
     AuthorizationError,
     ConfigError,
     ConflictError,
     NotFoundError,
+    OrgMismatchError,
     RateLimitError,
     ValidationError,
 )
+from rine.testing import WORLD, write_agent_identity, write_owner
 from rine.types import (
     AgentCardRead,
     AgentProfile,
@@ -48,6 +45,7 @@ from rine.types import (
     WebhookJobSummary,
     WebhookRead,
     WhoAmI,
+    WhoAmIKind,
 )
 from tests.conftest import recipient_view, signing_fingerprint
 
@@ -66,7 +64,7 @@ _AGENT_PAYLOAD = {
 }
 
 _ORG_PAYLOAD = {
-    "id": "11111111-2222-3333-4444-555555555555",
+    "id": WORLD.org_id,
     "name": "My Org",
     "slug": "myorg",
     "contact_email": "admin@example.com",
@@ -74,6 +72,12 @@ _ORG_PAYLOAD = {
     "trust_tier": 1,
     "agent_count": 1,
     "created_at": "2024-01-01T00:00:00Z",
+}
+
+_WHOAMI_PAYLOAD = {
+    "org": _ORG_PAYLOAD,
+    "principal": {"kind": "agent", "branch": "main", "agent_id": AGENT_ID},
+    "agents": [_AGENT_PAYLOAD],
 }
 
 _TOKEN_RESPONSE = {"access_token": "test-token", "expires_in": 900}
@@ -85,8 +89,8 @@ _MESSAGE_PAYLOAD = {
     "to_agent_id": OTHER_AGENT_ID,
     "type": MessageType.TASK_REQUEST,
     "encrypted_payload": "dGVzdA==",
-    "encryption_version": "hpke-v1",
-    "sender_signing_kid": f"rine:{AGENT_ID}",
+    "encryption_version": "hpke-hybrid-v2",
+    "sender_signing_kid": f"rine:{AGENT_ID}#0",
     "created_at": "2024-01-01T00:00:00Z",
 }
 
@@ -105,31 +109,66 @@ def _mock_agents() -> None:
 
 class TestWhoami:
     @respx.mock
-    async def test_whoami_returns_org_and_agents(self, async_client):
+    async def test_whoami_returns_org_principal_and_agents(self, async_client):
         _mock_token()
-        _mock_agents()
-        respx.get("https://rine.network/org").mock(
-            return_value=httpx.Response(200, json=_ORG_PAYLOAD)
+        respx.get("https://rine.network/whoami").mock(
+            return_value=httpx.Response(200, json=_WHOAMI_PAYLOAD)
         )
 
         result = await async_client.whoami()
 
         assert isinstance(result, WhoAmI)
         assert result.org.name == "My Org"
+        assert result.principal.kind is WhoAmIKind.AGENT
+        assert result.principal.branch == "main"
+        assert str(result.principal.agent_id) == AGENT_ID
         assert len(result.agents) == 1
         assert result.agents[0].name == "test-agent"
         assert result.trust_tier == 1
         await async_client.close()
 
     @respx.mock
-    async def test_whoami_raises_when_no_agents(self, async_client):
+    async def test_whoami_when_a_narrow_principal_sees_no_agent_then_returns_an_empty_list(
+        self, async_client
+    ):
         _mock_token()
-        respx.get("https://rine.network/agents").mock(
-            return_value=httpx.Response(200, json={"items": []})
+        respx.get("https://rine.network/whoami").mock(
+            return_value=httpx.Response(200, json={**_WHOAMI_PAYLOAD, "agents": []})
+        )
+
+        result = await async_client.whoami()
+
+        assert result.principal.kind is WhoAmIKind.AGENT
+        assert result.agents == []
+        await async_client.close()
+
+    @respx.mock
+    async def test_whoami_when_the_org_has_no_agent_then_raises(self, async_client):
+        _mock_token()
+        payload = {**_WHOAMI_PAYLOAD, "principal": {"kind": "org"}, "agents": []}
+        respx.get("https://rine.network/whoami").mock(
+            return_value=httpx.Response(200, json=payload)
         )
 
         with pytest.raises(ConfigError, match="No agents found"):
             await async_client.whoami()
+        await async_client.close()
+
+    @respx.mock
+    async def test_whoami_when_the_server_names_another_org_then_raises_and_changes_nothing(
+        self, async_client
+    ):
+        _mock_token()
+        other = {**_ORG_PAYLOAD, "id": "99999999-8888-7777-6666-555555555555"}
+        respx.get("https://rine.network/whoami").mock(
+            return_value=httpx.Response(200, json={**_WHOAMI_PAYLOAD, "org": other})
+        )
+
+        with pytest.raises(OrgMismatchError) as caught:
+            await async_client.whoami()
+
+        assert caught.value.local_org_id == WORLD.org_id
+        assert caught.value.server_org_id == "99999999-8888-7777-6666-555555555555"
         await async_client.close()
 
 
@@ -238,15 +277,8 @@ class TestInspect:
 class TestPoll:
     @respx.mock
     async def test_poll_returns_count(self, tmp_config_dir, saved_agent_keys, agent_id):
-        save_credentials(
-            tmp_config_dir,
-            {
-                "default": {
-                    "client_id": "cid",
-                    "client_secret": "csecret",
-                    "poll_url": "https://rine.network/poll/async-token",
-                }
-            },
+        write_agent_identity(
+            tmp_config_dir, agent_id, poll_url="https://rine.network/poll/async-token"
         )
 
         respx.get("https://rine.network/poll/async-token").mock(
@@ -426,10 +458,10 @@ class TestResolveGroupAsync:
 
 class TestContextManager:
     @respx.mock
-    async def test_async_client_async_context_manager(self, tmp_config_dir, saved_agent_keys):
-        save_credentials(
-            tmp_config_dir, {"default": {"client_id": "cid", "client_secret": "csecret"}}
-        )
+    async def test_async_client_async_context_manager(
+        self, tmp_config_dir, saved_agent_keys, agent_id
+    ):
+        write_agent_identity(tmp_config_dir, agent_id)
 
         async with RineClient(config_dir=tmp_config_dir, api_url="https://rine.network") as client:
             assert client is not None
@@ -1243,10 +1275,19 @@ class TestWebhookDelete:
 # --- P1: Key Rotation ---
 
 
+def _mock_current_keys(key_gen: int = 2) -> None:
+    """``GET /agents/{id}/keys`` — the chain-verified read rotate starts from."""
+    respx.get(f"https://rine.network/agents/{AGENT_ID}/keys").mock(
+        return_value=httpx.Response(200, json=WORLD.keys_response(AGENT_ID, key_gen))
+    )
+
+
 class TestRotateKeys:
     @respx.mock
-    async def test_rotate_keys_success(self, async_client):
+    async def test_rotate_keys_success(self, async_client, tmp_config_dir):
+        write_owner(resolve_owner_dir())
         _mock_token()
+        _mock_current_keys()
         route = respx.post(f"https://rine.network/agents/{AGENT_ID}/keys").mock(
             return_value=httpx.Response(
                 200,
@@ -1262,16 +1303,40 @@ class TestRotateKeys:
         assert isinstance(result, AgentRead)
         assert result.verification_words == "alpha bravo charlie"
         parsed = json.loads(route.calls[0].request.content)
-        assert "signing_public_key" in parsed
-        assert "encryption_public_key" in parsed
+        assert parsed["key_gen"] == 3
+        assert parsed["branch"] == "main"
         assert parsed["signing_public_key"]["kty"] == "OKP"
         assert parsed["signing_public_key"]["crv"] == "Ed25519"
         assert parsed["encryption_public_key"]["crv"] == "X25519"
+        claims = verify_jws(parsed["agent_certificate"], WORLD.branch.ed_pk, JwsTyp.AGENT_CERT)
+        assert claims["agent"] == AGENT_ID
+        assert claims["branch"] == "main"
+        assert claims["gen"] == 3
         await async_client.close()
 
     @respx.mock
-    async def test_rotate_keys_saves_to_disk(self, async_client, tmp_config_dir):
+    async def test_rotate_keys_when_the_host_holds_no_mls_state_then_it_reports_not_held(
+        self, async_client, tmp_config_dir
+    ):
+        """A host with no group state still rotates: the report says nothing was held."""
+        write_owner(resolve_owner_dir())
         _mock_token()
+        _mock_current_keys()
+        respx.post(f"https://rine.network/agents/{AGENT_ID}/keys").mock(
+            return_value=httpx.Response(200, json=_AGENT_PAYLOAD)
+        )
+
+        result = await async_client.rotate_keys(AGENT_ID)
+
+        assert isinstance(result, RotatedAgent)
+        assert result.key_packages is KeyPackageRotation.NOT_HELD
+        assert result.group_seats == []
+
+    @respx.mock
+    async def test_rotate_keys_saves_to_disk(self, async_client, tmp_config_dir):
+        write_owner(resolve_owner_dir())
+        _mock_token()
+        _mock_current_keys()
         respx.post(f"https://rine.network/agents/{AGENT_ID}/keys").mock(
             return_value=httpx.Response(200, json=_AGENT_PAYLOAD)
         )
@@ -1279,16 +1344,16 @@ class TestRotateKeys:
         assert async_client._config_dir == tmp_config_dir  # guard against fixture drift
         await async_client.rotate_keys(AGENT_ID)
 
-        import os
-
-        key_dir = os.path.join(tmp_config_dir, "keys", AGENT_ID)
-        assert os.path.isfile(os.path.join(key_dir, "signing.key"))
-        assert os.path.isfile(os.path.join(key_dir, "encryption.key"))
+        keys = load_agent_keys(tmp_config_dir, AGENT_ID)
+        assert keys.key_gen == 3
+        assert keys.signing.private_key == WORLD.keys(AGENT_ID, gen=3).signing.private_key
         await async_client.close()
 
     @respx.mock
     async def test_rotate_keys_revoked_raises_conflict(self, async_client):
+        write_owner(resolve_owner_dir())
         _mock_token()
+        _mock_current_keys()
         respx.post(f"https://rine.network/agents/{AGENT_ID}/keys").mock(
             return_value=httpx.Response(409, json={"detail": "Agent is revoked"})
         )
@@ -1299,12 +1364,24 @@ class TestRotateKeys:
 
     @respx.mock
     async def test_rotate_keys_not_found(self, async_client):
+        write_owner(resolve_owner_dir())
         _mock_token()
+        _mock_current_keys()
         respx.post(f"https://rine.network/agents/{AGENT_ID}/keys").mock(
             return_value=httpx.Response(404, json={"detail": "Not found"})
         )
 
         with pytest.raises(NotFoundError):
+            await async_client.rotate_keys(AGENT_ID)
+        await async_client.close()
+
+    @respx.mock
+    async def test_rotate_keys_when_no_key_material_then_config_error(self, async_client):
+        """No ``root.key`` and no delegate files: a clean, specific refusal."""
+        _mock_token()
+        _mock_current_keys()
+
+        with pytest.raises(ConfigError, match="No key material"):
             await async_client.rotate_keys(AGENT_ID)
         await async_client.close()
 
@@ -2065,8 +2142,8 @@ class TestGroupSendActingAgent:
         store, no signature under its key. A split store would also strand the
         ratchet at index 0 and make every message after the first unopenable.
         """
-        save_agent_keys(tmp_config_dir, OTHER_AGENT_ID, generate_agent_keys())
-        member_keys = generate_agent_keys()
+        save_agent_keys(tmp_config_dir, OTHER_AGENT_ID, WORLD.keys(OTHER_AGENT_ID))
+        save_agent_keys(tmp_config_dir, MEMBER_AGENT_ID, WORLD.keys(MEMBER_AGENT_ID))
 
         _mock_token()
         # Two active agents: an argument-less resolve here is ambiguous.
@@ -2091,18 +2168,7 @@ class TestGroupSendActingAgent:
             )
         )
         respx.get(f"https://rine.network/agents/{MEMBER_AGENT_ID}/keys").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "agent_id": MEMBER_AGENT_ID,
-                    "encryption_public_key": encryption_public_key_to_jwk(
-                        member_keys.encryption.public_key
-                    ),
-                    "signing_public_key": signing_public_key_to_jwk(
-                        member_keys.signing.public_key
-                    ),
-                },
-            )
+            return_value=httpx.Response(200, json=WORLD.keys_response(MEMBER_AGENT_ID))
         )
         msg_route = respx.post("https://rine.network/messages").mock(
             return_value=httpx.Response(200, json=_MESSAGE_PAYLOAD)
@@ -2119,7 +2185,7 @@ class TestGroupSendActingAgent:
         assert load_sender_key_states(tmp_config_dir, AGENT_ID, GROUP_ID) == []
 
         body = json.loads(msg_route.calls[-1].request.content)
-        assert body["sender_signing_kid"] == f"rine:{OTHER_AGENT_ID}"
+        assert body["sender_signing_kid"] == f"rine:{OTHER_AGENT_ID}#0"
         await async_client.close()
 
 
@@ -2132,11 +2198,14 @@ class TestRotatedSenderSurfacesKeyChange:
     ):
         _mock_token()
         _mock_agents()
-        sender_keys = generate_agent_keys()
-        rotated_away = generate_agent_keys()
+        sender_keys = WORLD.keys(OTHER_AGENT_ID, gen=1)
+        rotated_away = WORLD.keys(OTHER_AGENT_ID, gen=0)
         save_agent_keys(tmp_config_dir, OTHER_AGENT_ID, sender_keys)
         sealed = encrypt_message(
-            tmp_config_dir, OTHER_AGENT_ID, recipient_view(saved_agent_keys), {"text": "hi"}
+            tmp_config_dir,
+            OTHER_AGENT_ID,
+            recipient_view(saved_agent_keys, AGENT_ID),
+            {"text": "hi"},
         )
         respx.get(f"https://rine.network/messages/{_MESSAGE_PAYLOAD['id']}").mock(
             return_value=httpx.Response(
@@ -2152,10 +2221,10 @@ class TestRotatedSenderSurfacesKeyChange:
             )
         )
         respx.get(f"https://rine.network/agents/{OTHER_AGENT_ID}/keys").mock(
-            return_value=httpx.Response(200, json=public_keys_body(sender_keys))
+            return_value=httpx.Response(200, json=WORLD.keys_response(OTHER_AGENT_ID, 1))
         )
         # The client last saw this peer under a key it has since rotated away from.
-        async_client._http._keys_cache.set(OTHER_AGENT_ID, public_keys_body(rotated_away))
+        async_client._http._keys_cache.set(OTHER_AGENT_ID, WORLD.verified(OTHER_AGENT_ID, 0))
 
         msg = await async_client.read(_MESSAGE_PAYLOAD["id"])
 
@@ -2173,10 +2242,13 @@ class TestRotatedSenderSurfacesKeyChange:
     ):
         _mock_token()
         _mock_agents()
-        sender_keys = generate_agent_keys()
+        sender_keys = WORLD.keys(OTHER_AGENT_ID)
         save_agent_keys(tmp_config_dir, OTHER_AGENT_ID, sender_keys)
         sealed = encrypt_message(
-            tmp_config_dir, OTHER_AGENT_ID, recipient_view(saved_agent_keys), {"text": "hi"}
+            tmp_config_dir,
+            OTHER_AGENT_ID,
+            recipient_view(saved_agent_keys, AGENT_ID),
+            {"text": "hi"},
         )
         respx.get(f"https://rine.network/messages/{_MESSAGE_PAYLOAD['id']}").mock(
             return_value=httpx.Response(
@@ -2192,7 +2264,7 @@ class TestRotatedSenderSurfacesKeyChange:
             )
         )
         respx.get(f"https://rine.network/agents/{OTHER_AGENT_ID}/keys").mock(
-            return_value=httpx.Response(200, json=public_keys_body(sender_keys))
+            return_value=httpx.Response(200, json=WORLD.keys_response(OTHER_AGENT_ID))
         )
 
         msg = await async_client.read(_MESSAGE_PAYLOAD["id"])

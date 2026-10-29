@@ -6,8 +6,11 @@ import httpx
 import pytest
 import respx
 
+from rine._owner import resolve_owner_dir
 from rine.errors import SpiffeVerificationError, ValidationError
+from rine.testing import write_owner
 from rine.types import VerifyIdentityResult
+from tests.identity import echo_created_agent
 
 AGENT_ID = "00000000-1111-2222-3333-444444444444"
 API_URL = "https://rine.network"
@@ -16,6 +19,8 @@ _SVID = "eyJhbGciOiJFUzI1NiJ9.eyJhdWQiOiJ4In0.sig"
 
 _TOKEN_RESPONSE = {"access_token": "test-token", "expires_in": 900}
 _CHALLENGE_RESPONSE = {"audience": _AUDIENCE, "expires_in": 300}
+_ANY_AGENT_VERIFY = rf"{API_URL}/agents/[0-9a-f-]{{36}}/verify-svid$"
+_ANY_AGENT_CHALLENGE = rf"{API_URL}/agents/[0-9a-f-]{{36}}/verify-svid/challenge$"
 _VERIFY_RESPONSE = {
     "agent_id": AGENT_ID,
     "spiffe_id": "spiffe://example.org/workload/api",
@@ -141,12 +146,16 @@ class TestVerifyIdentityAsync:
 
 
 class TestCreateAgentAutoVerifyHook:
+    @pytest.fixture(autouse=True)
+    def _owner(self):
+        write_owner(resolve_owner_dir())
+
     @respx.mock
     def test_create_agent_with_svid_runs_verify_and_attaches_identity(self, sync_client):
         _mock_token()
         _mock_create_agent()
-        _mock_challenge()
-        respx.post(f"{API_URL}/agents/{AGENT_ID}/verify-svid").mock(
+        _mock_any_challenge()
+        respx.post(url__regex=_ANY_AGENT_VERIFY).mock(
             return_value=httpx.Response(200, json=_VERIFY_RESPONSE)
         )
 
@@ -161,8 +170,8 @@ class TestCreateAgentAutoVerifyHook:
         """A verify failure is captured in identity_error; the agent still returns."""
         _mock_token()
         _mock_create_agent()
-        _mock_challenge()
-        respx.post(f"{API_URL}/agents/{AGENT_ID}/verify-svid").mock(
+        _mock_any_challenge()
+        respx.post(url__regex=_ANY_AGENT_VERIFY).mock(
             return_value=httpx.Response(422, json={"detail": "bad svid"})
         )
 
@@ -197,17 +206,11 @@ def json_body(route: respx.Route) -> object:
 
 
 def _mock_create_agent() -> None:
-    respx.post(f"{API_URL}/agents").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "id": AGENT_ID,
-                "name": "test-agent",
-                "handle": "test-agent@myorg.rine.network",
-                "human_oversight": True,
-                "incoming_policy": "accept_all",
-                "outgoing_policy": "send_all",
-                "created_at": "2024-01-01T00:00:00Z",
-            },
-        )
+    respx.post(f"{API_URL}/agents").mock(side_effect=echo_created_agent)
+
+
+def _mock_any_challenge() -> respx.Route:
+    """The challenge route of whichever agent id the client minted."""
+    return respx.post(url__regex=_ANY_AGENT_CHALLENGE).mock(
+        return_value=httpx.Response(200, json=_CHALLENGE_RESPONSE)
     )

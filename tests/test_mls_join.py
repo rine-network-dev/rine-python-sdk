@@ -11,12 +11,13 @@ import base64
 import json
 import os
 import time
+from typing import TYPE_CHECKING
 
 import httpx
 import pytest
 import respx
 
-from rine._crypto.keys import generate_agent_keys, save_agent_keys
+from rine._crypto.keys import save_agent_keys
 from rine._mls import (
     DEFAULT_CIPHER_SUITE,
     KEY_PACKAGE_TARGET,
@@ -30,6 +31,8 @@ from rine._mls import (
 )
 from rine._mls import external_join as external_join_module
 from rine._mls.api import MlsWelcomeDelivery
+from rine._mls.binding import EpochConflictError
+from rine._mls.escrow_store import list_pending
 from rine._mls.welcome_guard import MlsWelcomeRefusedError
 from rine._mls.welcome_spool import (
     SPOOL_MAX_ENTRIES,
@@ -38,7 +41,14 @@ from rine._mls.welcome_spool import (
     welcome_spool_dir,
 )
 from rine.errors import CryptoError, RineApiError
+from rine.testing import WORLD
 from rine.types import JoinedResult, PendingJoinResult
+from tests.escrow_outcomes import DEFERRED, DEFERRED_REPORT
+
+if TYPE_CHECKING:
+    from rine._mls.external_join import ExternalJoinResult
+
+pytestmark = pytest.mark.usefixtures("mls_escrow_stub")
 
 API = "https://rine.network"
 GROUP_ID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
@@ -63,6 +73,10 @@ _MEMBER_PAYLOAD = {
     "role": "member",
     "joined_at": "2024-01-01T00:00:00Z",
 }
+
+
+def _ignore(_welcome: bytes) -> None:
+    """A release for a test that is not about it."""
 
 
 def _mock_token() -> None:
@@ -117,9 +131,10 @@ def _mock_welcomes(agent_id: str, *welcomes: tuple[str, str, bytes]) -> respx.Ro
     )
 
 
-def _peer_client(tmp_path, other_agent_id: str):
+def _peer_client(tmp_path, agent_id: str, other_agent_id: str):
     peer_dir = str(tmp_path / "peer")
-    save_agent_keys(peer_dir, other_agent_id, generate_agent_keys())
+    save_agent_keys(peer_dir, other_agent_id, WORLD.keys(other_agent_id))
+    save_agent_keys(peer_dir, agent_id, WORLD.keys(agent_id))
     return open_mls_client(peer_dir, other_agent_id)
 
 
@@ -133,7 +148,8 @@ def _found_group(
     our_key_package = base64.b64decode(
         json.loads(route.calls[0].request.content)["packages"][0], validate=True
     )
-    peer = _peer_client(tmp_path, other_agent_id)
+    peer = _peer_client(tmp_path, agent_id, other_agent_id)
+    save_agent_keys(tmp_config_dir, other_agent_id, WORLD.keys(other_agent_id))
     group = peer.create_group_with_members(
         mls_group_id_bytes(GROUP_ID), [our_key_package] if with_us else []
     )
@@ -148,7 +164,14 @@ def _local_group(tmp_config_dir, agent_id, group_id: str = GROUP_ID):
 class TestWelcomeInstall:
     @respx.mock
     def test_a_welcome_installs_state_keyed_by_the_rine_group_id(
-        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+        self,
+        sync_client,
+        tmp_config_dir,
+        agent_id,
+        other_agent_id,
+        tmp_path,
+        mls_escrow_stub,
+        escrow_calls,
     ):
         group = _found_group(sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path)
         welcome = group.last_commit().welcomes[0]
@@ -162,6 +185,8 @@ class TestWelcomeInstall:
         assert joined is not None
         assert joined.epoch() == group.epoch()
         assert joined.cipher_suite() == DEFAULT_CIPHER_SUITE
+        assert mls_escrow_stub == [(GROUP_ID, group.epoch())]
+        assert escrow_calls == [("settle", GROUP_ID), ("drain", GROUP_ID)]
 
     @respx.mock
     def test_a_welcome_survives_a_crash_before_it_is_processed(
@@ -295,7 +320,7 @@ def _mock_group_info(group, *, epoch: int = 1) -> respx.Route:
     )
 
 
-def _external_join(sync_client, tmp_config_dir, agent_id) -> int:
+def _external_join(sync_client, tmp_config_dir, agent_id) -> ExternalJoinResult:
     return external_join_mls_group(
         ExternalJoin(
             client=sync_client._http,
@@ -319,7 +344,7 @@ class TestTheNameAWelcomeIsFiledUnder:
     ``../../../../elsewhere/poison`` wrote outside the spool dir entirely, and
     on this stack it did not even raise — ``_write_atomic`` calls ``_ensure_dir``,
     so it creates the traversed directories on the way. The TypeScript twin
-    overwrote ``<configDir>/credentials.json``, which is both the OAuth store
+    overwrote ``<configDir>/profiles.json``, which is both the profile store
     and the file the config dir is located by.
     """
 
@@ -407,7 +432,7 @@ class TestWhatTheSpoolKeeps:
         names = [f"w{index:03d}" for index in range(SPOOL_MAX_ENTRIES + 4)]
         self._fill(tmp_config_dir, agent_id, names)
 
-        assert WelcomeSpool(tmp_config_dir, agent_id).prune() == 4
+        assert WelcomeSpool(tmp_config_dir, agent_id).prune(_ignore) == 4
 
         # The newest survive: their refusal is the one most likely still to clear.
         kept = [d.id for _p, d in WelcomeSpool(tmp_config_dir, agent_id).pending()]
@@ -417,13 +442,13 @@ class TestWhatTheSpoolKeeps:
         self._fill(tmp_config_dir, agent_id, ["old-0", "old-1"], age_seconds=8 * 24 * 60 * 60)
         self._fill(tmp_config_dir, agent_id, ["new-0"])
 
-        assert WelcomeSpool(tmp_config_dir, agent_id).prune() == 2
+        assert WelcomeSpool(tmp_config_dir, agent_id).prune(_ignore) == 2
         assert len(WelcomeSpool(tmp_config_dir, agent_id).pending()) == 1
 
     def test_nothing_past_the_bound_keeps_everything(self, tmp_config_dir, agent_id):
         self._fill(tmp_config_dir, agent_id, [f"w{index}" for index in range(5)])
 
-        assert WelcomeSpool(tmp_config_dir, agent_id).prune() == 0
+        assert WelcomeSpool(tmp_config_dir, agent_id).prune(_ignore) == 0
         assert len(WelcomeSpool(tmp_config_dir, agent_id).pending()) == 5
 
     def test_the_queue_is_ordered_by_write_time_not_by_the_servers_names(
@@ -445,7 +470,14 @@ class TestWhatTheSpoolKeeps:
 class TestExternalJoin:
     @respx.mock
     def test_self_join_commits_at_the_next_epoch_and_keeps_the_state(
-        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+        self,
+        sync_client,
+        tmp_config_dir,
+        agent_id,
+        other_agent_id,
+        tmp_path,
+        mls_escrow_stub,
+        escrow_calls,
     ):
         group = _found_group(
             sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path, with_us=False
@@ -455,7 +487,7 @@ class TestExternalJoin:
             return_value=httpx.Response(200, json={"epoch": 2, "delivered_to": 1})
         )
 
-        epoch = _external_join(sync_client, tmp_config_dir, agent_id)
+        epoch = _external_join(sync_client, tmp_config_dir, agent_id).epoch
 
         body = json.loads(commit.calls[0].request.content)
         assert epoch == 2
@@ -466,6 +498,33 @@ class TestExternalJoin:
         joined = _local_group(tmp_config_dir, agent_id)
         assert joined is not None
         assert joined.epoch() == 2
+        assert mls_escrow_stub == [(GROUP_ID, 2)]
+        assert escrow_calls == [("settle", GROUP_ID), ("drain", GROUP_ID)]
+
+    @respx.mock
+    def test_self_join_when_the_escrow_drain_defers_then_the_result_carries_the_report(
+        self,
+        sync_client,
+        tmp_config_dir,
+        agent_id,
+        other_agent_id,
+        tmp_path,
+        mls_escrow_stub,
+        monkeypatch,
+    ):
+        group = _found_group(
+            sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path, with_us=False
+        )
+        _mock_group_info(group)
+        respx.post(f"{API}/groups/{GROUP_ID}/mls/commit").mock(
+            return_value=httpx.Response(200, json={"epoch": 2, "delivered_to": 1})
+        )
+        monkeypatch.setattr(external_join_module, "drain_escrow", lambda *_a, **_k: DEFERRED)
+
+        result = _external_join(sync_client, tmp_config_dir, agent_id)
+
+        assert result.epoch == 2
+        assert result.escrow == DEFERRED_REPORT
 
     @respx.mock
     def test_a_competing_joiner_costs_one_rebuild_not_a_loop(
@@ -488,7 +547,7 @@ class TestExternalJoin:
             ]
         )
 
-        epoch = _external_join(sync_client, tmp_config_dir, agent_id)
+        epoch = _external_join(sync_client, tmp_config_dir, agent_id).epoch
 
         assert epoch == 3
         assert commit.call_count == 2
@@ -496,8 +555,35 @@ class TestExternalJoin:
         assert info.call_count == 2
 
     @respx.mock
+    def test_a_local_epoch_conflict_costs_one_rebuild_like_the_servers(
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path, monkeypatch
+    ):
+        """The core's own epoch conflict is the same answer as the server's 409."""
+        group = _found_group(
+            sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path, with_us=False
+        )
+        info = _mock_group_info(group)
+        respx.post(f"{API}/groups/{GROUP_ID}/mls/commit").mock(
+            return_value=httpx.Response(200, json={"epoch": 2, "delivered_to": 1})
+        )
+        real_post = external_join_module.post_mls_commit
+        posts = iter([EpochConflictError("built against a superseded epoch")])
+
+        def post_once_stale(*args, **kwargs):
+            for err in posts:
+                raise err
+            return real_post(*args, **kwargs)
+
+        monkeypatch.setattr(external_join_module, "post_mls_commit", post_once_stale)
+
+        epoch = _external_join(sync_client, tmp_config_dir, agent_id).epoch
+
+        assert epoch == 2
+        assert info.call_count == 2
+
+    @respx.mock
     def test_a_second_epoch_conflict_stops_and_leaves_no_state(
-        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path
+        self, sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path, mls_escrow_stub
     ):
         group = _found_group(
             sync_client, tmp_config_dir, agent_id, other_agent_id, tmp_path, with_us=False
@@ -512,6 +598,9 @@ class TestExternalJoin:
 
         assert commit.call_count == 2
         assert _local_group(tmp_config_dir, agent_id) is None
+        # A commit the server refused escrows nothing.
+        assert list_pending(tmp_config_dir, agent_id, GROUP_ID) == []
+        assert mls_escrow_stub == []
 
     @respx.mock
     def test_a_refusal_that_is_not_an_epoch_conflict_is_not_retried(
@@ -555,7 +644,7 @@ class TestExternalJoin:
             return_value=httpx.Response(200, json={"epoch": 2, "delivered_to": 1})
         )
 
-        assert _external_join(sync_client, tmp_config_dir, agent_id) == 2
+        assert _external_join(sync_client, tmp_config_dir, agent_id).epoch == 2
         assert info.call_count == 2
 
     @respx.mock

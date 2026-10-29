@@ -67,11 +67,13 @@ class SenderKeyStateDict(TypedDict):
     createdAt: NotRequired[int]
 
 
-class CredentialEntry(TypedDict):
-    """A single credential entry from credentials.json."""
+class Profile(TypedDict):
+    """One principal's entry in ``profiles.json``. It holds no secret."""
 
-    client_id: str
-    client_secret: str
+    org_id: str
+    principal: str
+    branch: NotRequired[str]
+    agent_id: NotRequired[str]
     poll_url: NotRequired[str]
 
 

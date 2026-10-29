@@ -22,8 +22,15 @@ from rine._mls.admission import (
     MlsAdmissionSkipReason,
 )
 from rine._mls.api import MlsCommit, MlsWelcome
-from rine._mls.binding import MlsGroup, UnreadableKeyPackageError, open_mls_client
+from rine._mls.binding import (
+    DEFAULT_CIPHER_SUITE,
+    MlsGroup,
+    UnreadableKeyPackageError,
+    open_mls_client,
+)
 from rine._mls.commit import post_mls_commit
+from rine._mls.escrow_drain import drain_escrow
+from rine._mls.escrow_report import EscrowReport
 from rine._mls.group_access import (
     mls_group_id_bytes,
     note_mls_state_changed,
@@ -49,7 +56,6 @@ class Admission:
     agent_id: str
     group_id: str
     extra_headers: dict[str, str]
-    cipher_suite: int | None = None
 
     group: MlsGroup | None = None
     """``None`` until the founding commit creates it; the group thereafter."""
@@ -65,6 +71,9 @@ class Admission:
 
     epoch: int = 0
     commits: int = 0
+    escrow: EscrowReport = field(default_factory=EscrowReport)
+    """The merged report of every batch's escrow drain."""
+
     outcomes: list[MlsAdmissionOutcome] = field(default_factory=list)
 
     order: list[str] = field(default_factory=list)
@@ -75,6 +84,11 @@ class Admission:
     report promises one outcome per requested id **in request order**, so the
     order is kept here and applied once, at the end.
     """
+
+    @property
+    def actor(self) -> MlsActor:
+        """The agent this admission acts as, and the client it acts through."""
+        return MlsActor(client=self.client, config_dir=self.config_dir, agent_id=self.agent_id)
 
     def skip(self, agent_id: str, reason: MlsAdmissionSkipReason) -> None:
         """Record a requested agent that did not get a leaf, and why."""
@@ -91,11 +105,22 @@ class Admission:
             commits=self.commits,
             added=sum(1 for o in ordered if o.status == "added"),
             outcomes=tuple(ordered),
+            escrow=self.escrow,
         )
 
 
 def commit_batch(admission: Admission, joiners: list[str], key_packages: list[bytes]) -> None:
     """Build one commit, publish it, and only then persist the local advance."""
+    install_batch(admission, publish_batch(admission, joiners, key_packages))
+
+
+def publish_batch(admission: Admission, joiners: list[str], key_packages: list[bytes]) -> MlsGroup:
+    """Build one commit and post it; the group it advanced is returned, not yet installed.
+
+    A failure here is the server refusing the batch (or never receiving it), so
+    nothing local has changed. :func:`install_batch` is the other half: an error
+    there comes after the server seated the joiners, which is not a refusal.
+    """
     group = admission.group
     try:
         if group is None:
@@ -110,18 +135,15 @@ def commit_batch(admission: Admission, joiners: list[str], key_packages: list[by
     except UnreadableKeyPackageError as exc:
         raise CryptoError(_UNREADABLE_KEY_PACKAGE.format(named=", ".join(joiners))) from exc
 
+    actor = admission.actor
     admission.epoch = post_mls_commit(
-        MlsActor(
-            client=admission.client,
-            config_dir=admission.config_dir,
-            agent_id=admission.agent_id,
-        ),
+        actor,
         admission.group_id,
         MlsCommit(
             commit=bundle.commit,
             group_info=bundle.group_info,
             epoch=bundle.epoch,
-            cipher_suite=group.cipher_suite(),
+            cipher_suite=DEFAULT_CIPHER_SUITE,
             welcomes=tuple(
                 MlsWelcome(agent_id=a, welcome=w)
                 for a, w in zip(joiners, bundle.welcomes, strict=True)
@@ -129,9 +151,17 @@ def commit_batch(admission: Admission, joiners: list[str], key_packages: list[by
         ),
         admission.extra_headers,
     )
+    return group
+
+
+def install_batch(admission: Admission, group: MlsGroup) -> None:
+    """Persist the advance of a commit the server accepted, escrow first."""
+    actor = admission.actor
     # Only now: a commit the server refused must leave no local state, so the
     # retry starts from the same place this attempt did.
-    group.save()
+    admission.escrow = admission.escrow.advance(
+        drain_escrow(actor, admission.group_id, group, carry_unreported=True).report()
+    )
     admission.group = group
     admission.saved = True
     admission.commits += 1
@@ -152,7 +182,6 @@ def discard_uncommitted(admission: Admission) -> None:
             admission.config_dir,
             admission.agent_id,
             admission.group_id,
-            cipher_suite=admission.cipher_suite,
         )
         if admission.saved
         else None

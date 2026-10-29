@@ -25,6 +25,7 @@ from rine._crypto.sender_keys_helpers import (
     unretire_sender_keys,
 )
 from rine._sender_key_ops import delete_sender_key
+from rine.testing import write_agent_identity
 
 AGENT_ID = "00000000-1111-2222-3333-444444444444"
 PEER_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -91,12 +92,8 @@ def _mock_group_for_send(config_dir: str, member_ids: list[str]) -> None:
     """Register the reads ``get_or_create_sender_key_sync`` makes for one group."""
     import httpx
 
-    from rine._crypto.keys import (
-        encryption_public_key_to_jwk,
-        generate_agent_keys,
-        save_agent_keys,
-        signing_public_key_to_jwk,
-    )
+    from rine._crypto.keys import save_agent_keys
+    from rine.testing import WORLD
 
     respx.post("https://rine.network/oauth/token").mock(
         return_value=httpx.Response(200, json={"access_token": "t", "expires_in": 900})
@@ -107,19 +104,9 @@ def _mock_group_for_send(config_dir: str, member_ids: list[str]) -> None:
         )
     )
     for mid in member_ids:
-        keys = generate_agent_keys()
-        save_agent_keys(config_dir, mid, keys)
+        save_agent_keys(config_dir, mid, WORLD.keys(mid))
         respx.get(f"https://rine.network/agents/{mid}/keys").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "agent_id": mid,
-                    "encryption_public_key": encryption_public_key_to_jwk(
-                        keys.encryption.public_key
-                    ),
-                    "signing_public_key": signing_public_key_to_jwk(keys.signing.public_key),
-                },
-            )
+            return_value=httpx.Response(200, json=WORLD.keys_response(mid))
         )
     respx.post("https://rine.network/messages").mock(
         return_value=httpx.Response(200, json={"id": "ignored"})
@@ -133,11 +120,10 @@ class TestRejoiningLiftsTheRetirement:
     def test_send_when_the_server_names_this_agent_a_member_then_the_retirement_is_lifted(
         self, tmp_config_dir, saved_agent_keys
     ):
-        from rine._config import save_credentials
         from rine._http import SyncHttpClient
         from rine._sender_key_ops import get_or_create_sender_key_sync
 
-        save_credentials(tmp_config_dir, {"default": {"client_id": "c", "client_secret": "s"}})
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         _mock_group_for_send(tmp_config_dir, [AGENT_ID, PEER_ID])
         mark_sender_keys_retired(tmp_config_dir, AGENT_ID, GROUP_ID)
 
@@ -156,11 +142,10 @@ class TestRejoiningLiftsTheRetirement:
         # The membership test is what keeps the retirement permanent for the
         # agent it exists for: a departed agent attempting a send must not lift
         # its own marker on the way to being refused by the server.
-        from rine._config import save_credentials
         from rine._http import SyncHttpClient
         from rine._sender_key_ops import get_or_create_sender_key_sync
 
-        save_credentials(tmp_config_dir, {"default": {"client_id": "c", "client_secret": "s"}})
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         _mock_group_for_send(tmp_config_dir, [PEER_ID])
         mark_sender_keys_retired(tmp_config_dir, AGENT_ID, GROUP_ID)
 

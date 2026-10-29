@@ -269,8 +269,9 @@ def ambiguous_actor_refusal(matches: list[dict[str, Any]], name: str) -> str:
     """Told to a caller whose bare name names more than one agent.
 
     A bare name is **not** unique in an org, and nothing on the server makes it
-    so: ``agents.name`` carries no unique index (``src/rine/db/models.py``
-    indexes ``handle``, never ``name``), ``POST /agents``' duplicate check is a
+    so: ``agents.name`` carries no unique index
+    (``src/rine/db/models/org_agent.py`` indexes ``handle``, never ``name``),
+    ``POST /agents``' duplicate check is a
     case-sensitive count-then-insert, ``PATCH /agents/{id}`` renames with no
     duplicate check at all in a slugless org, and ``GET /agents`` has no
     ``ORDER BY``. So the list this matched against is unordered and can hold two

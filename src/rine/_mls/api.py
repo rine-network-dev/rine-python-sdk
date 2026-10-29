@@ -10,9 +10,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from rine._actor import AGENT_HEADER
-from rine._mls.wire import mls_from_base64, mls_to_base64
+from rine._mls.key_not_current import MLS_ERR_KEY_NOT_CURRENT, MlsKeyNotCurrentError
+from rine._mls.wire import api_error_code, mls_from_base64, mls_to_base64
 from rine._recipient_reads import refuse_a_substituted_group
-from rine.errors import ConflictError
+from rine.errors import ConflictError, RineApiError
 from rine.types import GroupRead
 
 
@@ -45,12 +46,15 @@ class MlsWelcomeDelivery:
 class MlsGroupInfo:
     """The group's published external-join capability, and the epoch it is for.
 
-    The epoch is the group's last *confirmed* one, which is what makes it the
-    signal a member compares its own local epoch against.
+    ``epoch`` is the served GroupInfo's, which is the group's last *confirmed*
+    one. ``confirmed_epoch`` is the group row's join-token pointer, ``None`` from
+    a server that predates it. The server also sends the compare-and-swap latch;
+    no client reads it.
     """
 
     blob: bytes | None
     epoch: int | None
+    confirmed_epoch: int | None = None
 
 
 @dataclass(frozen=True)
@@ -78,10 +82,7 @@ class MlsCommit:
 def read_group(client: Any, agent_id: str, group_id: str) -> GroupRead:
     """Read a group as one of its members.
 
-    Every MLS flow that starts from a bare group id comes through here: the
-    group's own ``mls_cipher_suite`` decides which suite the MLS client is opened
-    on, and a group created on the classical suite is unreadable through a client
-    opened on the default one.
+    Every MLS flow that starts from a bare group id comes through here.
 
     🔴 Because every such flow comes through here, the identity check is
     load-bearing. :func:`rine._mls.join.install_mls_state` scopes its Welcome
@@ -118,11 +119,20 @@ def upload_key_packages(client: Any, agent_id: str, packages: list[bytes]) -> in
 
     Returns:
         How many the server stored.
+
+    Raises:
+        MlsKeyNotCurrentError: When the server refuses the packages because this device
+            holds an earlier key generation than the agent's current one.
     """
-    data = client.post(
-        f"/agents/{agent_id}/mls/key-packages",
-        json_body={"packages": [mls_to_base64(p) for p in packages]},
-    )
+    try:
+        data = client.post(
+            f"/agents/{agent_id}/mls/key-packages",
+            json_body={"packages": [mls_to_base64(p) for p in packages]},
+        )
+    except RineApiError as err:
+        if api_error_code(err) == MLS_ERR_KEY_NOT_CURRENT:
+            raise MlsKeyNotCurrentError from err
+        raise
     stored: int = data["stored"]
     return stored
 
@@ -199,16 +209,20 @@ def fetch_group_info(client: Any, group_id: str, extra_headers: dict[str, str]) 
     code instead, which is a retry rather than a refusal.
 
     Returns:
-        The blob and its epoch; ``blob`` is ``None`` when the group has published
-        none.
+        The blob, its epoch and the group's confirmed epoch; ``blob`` is ``None`` when
+        the group has published none.
     """
     data = client.get(f"/groups/{group_id}/mls/group-info", extra_headers=extra_headers)
     blob = data.get("group_info")
-    epoch = data.get("epoch")
     return MlsGroupInfo(
         blob=mls_from_base64(blob) if blob else None,
-        epoch=None if epoch is None else int(epoch),
+        epoch=_epoch_or_none(data.get("epoch")),
+        confirmed_epoch=_epoch_or_none(data.get("confirmed_epoch")),
     )
+
+
+def _epoch_or_none(raw: Any) -> int | None:
+    return None if raw is None else int(raw)
 
 
 def mls_init(client: Any, group_id: str, extra_headers: dict[str, str]) -> list[MlsMemberStatus]:
@@ -225,28 +239,3 @@ def mls_init(client: Any, group_id: str, extra_headers: dict[str, str]) -> list[
         MlsMemberStatus(agent_id=str(m["agent_id"]), has_key_package=bool(m["has_key_package"]))
         for m in data.get("members", [])
     ]
-
-
-def mls_commit(
-    client: Any, group_id: str, commit: MlsCommit, extra_headers: dict[str, str]
-) -> int:
-    """Publish a commit, its Welcomes and the epoch's fresh GroupInfo.
-
-    Returns:
-        The epoch the server committed to.
-    """
-    body: dict[str, Any] = {
-        "commit": mls_to_base64(commit.commit),
-        "group_info": mls_to_base64(commit.group_info),
-        "cipher_suite": commit.cipher_suite,
-        "epoch": commit.epoch,
-        "welcomes": [
-            {"agent_id": w.agent_id, "welcome": mls_to_base64(w.welcome)} for w in commit.welcomes
-        ],
-        "removes": list(commit.removes),
-    }
-    data = client.post(
-        f"/groups/{group_id}/mls/commit", json_body=body, extra_headers=extra_headers
-    )
-    epoch = data.get("epoch")
-    return commit.epoch if epoch is None else int(epoch)

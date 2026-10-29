@@ -42,8 +42,8 @@ ARM_NO_SIBLING = (
 )
 
 #: Two other server sentences that carry the clause and are not this refusal.
-#: ``POST /messages`` refuses the sending **org** (``api/messages.py``), and the
-#: Welcome-recipient 422 (``api/mls_schemas.py`` via ``api/mls_helpers.py``)
+#: ``POST /messages`` refuses the sending **org** (``api/messages_send_group.py``), and the
+#: Welcome-recipient 422 (``api/mls_schemas.py`` via ``api/mls_welcome_validation.py``)
 #: describes somebody the caller was trying to add.
 SENDER_REFUSAL = f"Sender {NOT_A_MEMBER_CLAUSE}"
 WELCOME_REFUSAL = (

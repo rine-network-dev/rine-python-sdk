@@ -1,0 +1,9 @@
+{
+  "body": {
+    "handshakes": [],
+    "pending_commit": "absent"
+  },
+  "endpoint": "GET /groups/{group_id}/mls/handshakes",
+  "scenario": "nobody posted at the epoch",
+  "status": 200
+}

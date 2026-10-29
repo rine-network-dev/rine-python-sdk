@@ -32,11 +32,15 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from rine._config import _write_atomic
 from rine._crypto.keys import _validate_path_id
 from rine._mls.api import MlsWelcomeDelivery
 from rine._mls.wire import mls_from_base64, mls_to_base64
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 SPOOL_SUFFIX = ".json"
 
@@ -126,7 +130,10 @@ class WelcomeSpool:
         )
 
     def mark_refused(self, path: str) -> None:
-        """Record that a pass tried this Welcome and refused it retryably.
+        """Record that a pass kept this Welcome without opening it.
+
+        That is a refusal a later attempt could clear, or an invitation the agent
+        has not accepted yet.
 
         What moves an entry into the population :meth:`prune`'s count bound
         holds. A no-op once the flag is set, so the entry is rewritten at most
@@ -138,8 +145,11 @@ class WelcomeSpool:
             return
         _write_atomic(path, _serialize(entry.delivery, refused=True))
 
-    def prune(self) -> int:
+    def prune(self, release: Callable[[bytes], None]) -> int:
         """Drop the retained Welcomes past the bound, oldest first. Returns how many.
+
+        Each one's private key package half goes through ``release`` first
+        (:mod:`rine._mls.welcome_release`): it was never opened, so nothing else frees it.
 
         Call it BEFORE storing a fetch, so nothing it reaches is a Welcome this
         pass is about to process.
@@ -160,7 +170,7 @@ class WelcomeSpool:
         for path, mtime in files:
             if path not in evicted and mtime >= cutoff:
                 continue
-            self.discard(path)
+            self.drop(path, release)
             dropped += 1
         return dropped
 
@@ -179,8 +189,18 @@ class WelcomeSpool:
                 entries.append((path, entry.delivery))
         return entries
 
+    def drop(self, path: str, release: Callable[[bytes], None]) -> None:
+        """Drop a spooled Welcome that was never opened, releasing its key package half.
+
+        An entry too torn to read has no Welcome to release and is only discarded.
+        """
+        entry = _read(path)
+        if entry is not None:
+            release(entry.delivery.welcome)
+        self.discard(path)
+
     def discard(self, path: str) -> None:
-        """Drop a spooled Welcome whose join has a final outcome."""
+        """Drop a spooled Welcome whose private half is already spent or unknowable."""
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
 

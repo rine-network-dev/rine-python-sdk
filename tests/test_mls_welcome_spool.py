@@ -24,6 +24,7 @@ import time
 
 import pytest
 
+from rine._mls import welcome_install as install_module
 from rine._mls import welcomes as welcomes_module
 from rine._mls.api import MlsWelcomeDelivery
 from rine._mls.welcome_spool import (
@@ -32,9 +33,16 @@ from rine._mls.welcome_spool import (
     welcome_spool_dir,
 )
 from rine.errors import CryptoError
+from tests.escrow_outcomes import DEFERRED, DEFERRED_REPORT
+
+pytestmark = pytest.mark.usefixtures("mls_escrow_stub")
 
 GROUP_ID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 DAY_SECONDS = 24 * 60 * 60
+
+
+def _ignore(_welcome: bytes) -> None:
+    """A release for a test that is not about it."""
 
 
 def _path(tmp_config_dir: str, agent_id: str, spool_id: str) -> str:
@@ -79,7 +87,7 @@ class TestTheCountBoundsPopulation:
             refused=False,
         )
 
-        assert WelcomeSpool(tmp_config_dir, agent_id).prune() == 0
+        assert WelcomeSpool(tmp_config_dir, agent_id).prune(_ignore) == 0
 
         kept = [d.id for _p, d in WelcomeSpool(tmp_config_dir, agent_id).pending()]
         assert kept == ids
@@ -99,7 +107,7 @@ class TestTheCountBoundsPopulation:
 
         # 33 refusals over a cap of 32 costs exactly one eviction, and the 20
         # entries waiting for their first attempt are not in the count at all.
-        assert WelcomeSpool(tmp_config_dir, agent_id).prune() == 1
+        assert WelcomeSpool(tmp_config_dir, agent_id).prune(_ignore) == 1
 
         kept = [d.id for _p, d in WelcomeSpool(tmp_config_dir, agent_id).pending()]
         assert len(kept) == SPOOL_MAX_ENTRIES + 20
@@ -113,7 +121,7 @@ class TestTheCountBoundsPopulation:
         # would corroborate the Welcome, tried or not.
         _fill(tmp_config_dir, agent_id, ["stale"], age_seconds=8 * DAY_SECONDS, refused=False)
 
-        assert WelcomeSpool(tmp_config_dir, agent_id).prune() == 1
+        assert WelcomeSpool(tmp_config_dir, agent_id).prune(_ignore) == 1
         assert WelcomeSpool(tmp_config_dir, agent_id).pending() == []
 
     def test_marking_a_refusal_twice_rewrites_the_entry_once(self, tmp_config_dir, agent_id):
@@ -140,7 +148,60 @@ class TestTheCountBoundsPopulation:
             json.dump({"id": "legacy", "group_id": GROUP_ID, "welcome": "AQ=="}, handle)
 
         assert [d.id for _p, d in spool.pending()] == ["legacy"]
-        assert spool.prune() == 0
+        assert spool.prune(_ignore) == 0
+
+
+class TestWhatLeavesTheSpoolIsReleased:
+    """A Welcome dropped unopened gives its key package half back, once."""
+
+    def test_prune_when_entries_age_out_then_each_blob_is_released(self, tmp_config_dir, agent_id):
+        """Every Welcome the age bound drops is released."""
+        _fill(tmp_config_dir, agent_id, ["a", "b"], age_seconds=8 * DAY_SECONDS, refused=True)
+        released: list[bytes] = []
+
+        assert WelcomeSpool(tmp_config_dir, agent_id).prune(released.append) == 2
+
+        assert released == [b"\x01", b"\x01"]
+
+    def test_prune_when_nothing_is_past_the_bound_then_nothing_is_released(
+        self, tmp_config_dir, agent_id
+    ):
+        """A Welcome that stays keeps its half."""
+        _fill(tmp_config_dir, agent_id, ["a", "b"], refused=True)
+        released: list[bytes] = []
+
+        assert WelcomeSpool(tmp_config_dir, agent_id).prune(released.append) == 0
+
+        assert released == []
+
+    def test_drop_when_an_entry_is_dropped_then_it_is_released_and_removed(
+        self, tmp_config_dir, agent_id
+    ):
+        """A dropped entry is released once and removed."""
+        spool = WelcomeSpool(tmp_config_dir, agent_id)
+        spool.store(MlsWelcomeDelivery(id="one", group_id=GROUP_ID, welcome=b"\x07"))
+        released: list[bytes] = []
+
+        spool.drop(_path(tmp_config_dir, agent_id, "one"), released.append)
+
+        assert released == [b"\x07"]
+        assert spool.pending() == []
+
+    def test_drop_when_the_entry_is_torn_then_it_is_removed_without_a_release(
+        self, tmp_config_dir, agent_id
+    ):
+        """A torn entry has no Welcome to release."""
+        spool = WelcomeSpool(tmp_config_dir, agent_id)
+        spool.store(MlsWelcomeDelivery(id="torn", group_id=GROUP_ID, welcome=b"\x07"))
+        path = _path(tmp_config_dir, agent_id, "torn")
+        with open(path, "w") as handle:
+            handle.write("{")
+        released: list[bytes] = []
+
+        spool.drop(path, released.append)
+
+        assert released == []
+        assert not os.path.exists(path)
 
 
 class TestTheDirectoryTheSpoolLivesIn:
@@ -183,6 +244,7 @@ class TestThePassCallsTheBound:
             raise AssertionError("the pass reached the MLS core with a pruned spool")
 
         monkeypatch.setattr(welcomes_module, "open_mls_client", _refuse_to_open)
+        monkeypatch.setattr(welcomes_module, "welcome_releaser", lambda _client: _ignore)
 
         outcome = welcomes_module.process_mls_welcomes(None, tmp_config_dir, agent_id)
 
@@ -211,8 +273,9 @@ class TestThePassCallsTheBound:
             return served.pop(0) if served else []
 
         monkeypatch.setattr(welcomes_module, "fetch_welcomes", _fetch)
-        monkeypatch.setattr(welcomes_module, "welcome_refusal", lambda *_a, **_k: None)
+        monkeypatch.setattr(install_module, "welcome_refusal", lambda *_a, **_k: None)
         monkeypatch.setattr(welcomes_module, "mls_heartbeat", lambda *_a, **_k: None)
+        monkeypatch.setattr(install_module, "drain_escrow", lambda *_a, **_k: DEFERRED)
         monkeypatch.setattr(
             welcomes_module,
             "open_mls_client",
@@ -228,7 +291,31 @@ class TestThePassCallsTheBound:
 
         assert outcome.group_ids == tuple(delivery.group_id for delivery in batch)
         assert outcome.discarded == 0
+        assert outcome.escrow.gaps == DEFERRED_REPORT.gaps * len(batch)
+        assert outcome.escrow.deferral == DEFERRED_REPORT.deferral
         assert WelcomeSpool(tmp_config_dir, agent_id).pending() == []
+
+    def test_a_welcome_whose_peers_cannot_be_admitted_stays_spooled_and_is_not_installed(
+        self, tmp_config_dir, agent_id, monkeypatch
+    ):
+        # The core refuses a leaf outside the allowed set, so a failed peer read
+        # must neither install the Welcome nor discard bytes the server will not
+        # serve again.
+        delivery = MlsWelcomeDelivery(id="w000", group_id=GROUP_ID, welcome=b"\x01")
+        monkeypatch.setattr(welcomes_module, "fetch_welcomes", lambda *_a, **_k: [delivery])
+        monkeypatch.setattr(install_module, "welcome_refusal", lambda *_a, **_k: None)
+        monkeypatch.setattr(welcomes_module, "mls_heartbeat", lambda *_a, **_k: None)
+        monkeypatch.setattr(welcomes_module, "open_mls_client", lambda *_a, **_k: _StubClient())
+
+        monkeypatch.setattr(
+            welcomes_module, "admit_welcome_peers", lambda *_a, **_k: "unreachable"
+        )
+
+        outcome = welcomes_module.process_mls_welcomes(None, tmp_config_dir, agent_id)
+
+        assert outcome.group_ids == ()
+        assert outcome.discarded == 0
+        assert [d.id for _, d in WelcomeSpool(tmp_config_dir, agent_id).pending()] == ["w000"]
 
     def test_a_retryable_refusal_joins_the_counted_set(
         self, tmp_config_dir, agent_id, monkeypatch
@@ -243,7 +330,7 @@ class TestThePassCallsTheBound:
         monkeypatch.setattr(welcomes_module, "open_mls_client", lambda *_a, **_k: _StubClient())
         monkeypatch.setattr(welcomes_module, "mls_heartbeat", lambda *_a, **_k: None)
         monkeypatch.setattr(
-            welcomes_module,
+            install_module,
             "welcome_refusal",
             lambda *_a, **_k: MlsWelcomeRefusedError(GROUP_ID, "roster_uncorroborated", "no"),
         )

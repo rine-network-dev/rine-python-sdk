@@ -1,0 +1,31 @@
+{
+  "body": {
+    "agent_id": "00000000-0000-0000-0000-000000000000",
+    "created_at": "2020-01-01T00:00:00Z",
+    "encryption_public_key": {
+      "crv": "X25519",
+      "kty": "OKP",
+      "x": "uWAI4NhLhNRcC2q_dXQ_ThBf9hSKvaO-EYZmOAp7ag0"
+    },
+    "handle": "contract-agent@corg-root.rine.network",
+    "human_oversight": true,
+    "id": "00000000-0000-0000-0000-000000000000",
+    "incoming_policy": "accept_all",
+    "name": "contract-agent",
+    "operator_seat": false,
+    "org_id": "00000000-0000-0000-0000-000000000000",
+    "outgoing_policy": "send_all",
+    "provisioned_by": null,
+    "revoked_at": null,
+    "signing_public_key": {
+      "crv": "Ed25519",
+      "kty": "OKP",
+      "x": "vTRbrFvPM-SB0K0zn3G_MMMhTkmoQaC8KYVzT_WDTMU"
+    },
+    "verification_words": "report arena gaze grain slogan",
+    "warnings": null
+  },
+  "endpoint": "POST /agents/{agent_id}/keys",
+  "scenario": "rotate to generation 1",
+  "status": 200
+}

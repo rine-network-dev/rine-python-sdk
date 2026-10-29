@@ -23,18 +23,25 @@ not load has no resync at all. The TypeScript twin is
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
 from rine._actor import AGENT_HEADER
 from rine._logging import logger
+from rine._mls.allowed import admit_group_peers
 from rine._mls.api import MlsCommit, fetch_group_info
-from rine._mls.binding import GroupInactiveError, open_mls_client
+from rine._mls.binding import DEFAULT_CIPHER_SUITE, GroupInactiveError, open_mls_client
 from rine._mls.commit import post_mls_commit
+from rine._mls.escrow_drain import drain_escrow
+from rine._mls.escrow_report import EscrowReport
+from rine._mls.escrow_settle import settle_escrow
 from rine._mls.failures import group_failures, is_epoch_conflict, is_unprocessable_commit
 from rine._mls.group_access import load_mls_group, note_mls_state_changed
 from rine._mls.heartbeat import MlsActor
+from rine._mls.rotated_leaf import MlsRotatedLeafError, admit_refused_peers_for_resync
 from rine._mls.sync import sync_mls_group
+from rine._mls.sync_api import fetch_group_epochs
 from rine._mls.wire import api_error_code
 from rine.errors import CryptoError, MlsResyncUnavailableError
 
@@ -45,6 +52,7 @@ if TYPE_CHECKING:
     # at run time. Safe because the dataclass below never has its hints read
     # back — no ``get_type_hints`` call exists anywhere in this package.
     from rine._group_recovery import KeyPackageTopUp
+    from rine._seat_update import SeatUpdate
 
 #: The server's ``error`` key when a replay cannot carry this agent to the group:
 #: it holds no deliverable commit for the gap. The ladder's escalation signal —
@@ -143,14 +151,19 @@ class MlsRecoveryResult:
     rather than emitting a null, the ``mls_never_founded_note`` rule. The
     TypeScript twin is ``keyPackages`` (``rine-core/src/mls-ops-resync.ts``)."""
 
+    escrow: EscrowReport = field(default_factory=EscrowReport)
+    """What the escrow drains of this recovery (the replayed commits, or the resync
+    and the state it replaced) could not do."""
+
+    seat: SeatUpdate | None = None
+    """Where moving the agent's leaf to its current key ended; set by ``sync_group_state``."""
+
 
 def recover_mls_group(
     client: Any,
     config_dir: str,
     agent_id: str,
     group_id: str,
-    *,
-    cipher_suite: int | None = None,
 ) -> MlsRecoveryResult:
     """Catch this agent's MLS state up with its group, on the cheapest rung that works.
 
@@ -167,7 +180,6 @@ def recover_mls_group(
         config_dir: Config directory path.
         agent_id: The recovering agent's UUID.
         group_id: The rine group UUID.
-        cipher_suite: The group's own suite, when it is not the current default.
 
     Returns:
         Which rung ran, how far behind this agent was, and where it ended up.
@@ -175,18 +187,17 @@ def recover_mls_group(
     Raises:
         MlsResyncUnavailableError: This agent's local state will not load at all.
         GroupEvictedError: This agent's leaf is gone from the group's tree.
+        MlsRotatedLeafError: This agent rotated its key after it was seated, so its
+            old leaf cannot resync.
         CryptoError: The group publishes no GroupInfo to commit against, or a
             competing commit keeps winning the epoch.
     """
     headers = {AGENT_HEADER: agent_id}
     with group_failures(group_id):
-        stale = load_mls_group(
-            open_mls_client(config_dir, agent_id, cipher_suite=cipher_suite), group_id
-        )
+        stale = load_mls_group(open_mls_client(config_dir, agent_id), group_id)
         if stale is None:
             raise MlsResyncUnavailableError(group_id)
         from_epoch = stale.epoch()
-        suite = stale.cipher_suite()
         # The ONLY source of the stale leaf. Never ``GET /groups/{id}/members``,
         # never a server-supplied index — the server does not know leaf indices.
         stale_leaf = stale.current_member_index()
@@ -194,12 +205,14 @@ def recover_mls_group(
         target = _confirmed_epoch(client, group_id, headers)
         behind = None if target is None else max(0, target - from_epoch)
         processed = 0
+        replay_escrow = EscrowReport()
 
         try:
             replayed = sync_mls_group(
-                client, config_dir, agent_id, group_id, cipher_suite=cipher_suite
+                client, config_dir, agent_id, group_id, carry_unreported=True
             )
             processed = replayed.processed
+            replay_escrow = replayed.escrow
             # An eviction is a settled answer, not a gap: this agent has no leaf
             # to re-seat, so a resync would commit about a leaf that is gone.
             if replayed.evicted or target is None or replayed.epoch >= target:
@@ -211,14 +224,14 @@ def recover_mls_group(
                     behind=behind,
                     processed=processed,
                     evicted=replayed.evicted,
+                    escrow=replay_escrow,
                 )
         except Exception as err:
             if not _replay_exhausted(err):
                 raise
 
-        epoch, resync_target = _resync_with_retry(
-            client, config_dir, agent_id, group_id, suite, stale_leaf, headers
-        )
+        resynced = _resync_with_retry(client, config_dir, agent_id, group_id, stale_leaf, headers)
+        resync_target = resynced.target
         # The up-front measurement is the honest one; this only fills a distance
         # that was unmeasurable before the resync's own GroupInfo read answered it.
         if behind is None and resync_target is not None:
@@ -227,10 +240,11 @@ def recover_mls_group(
             regime="mls",
             rung="resync",
             from_epoch=from_epoch,
-            epoch=epoch,
+            epoch=resynced.epoch,
             behind=behind,
             processed=processed,
             evicted=False,
+            escrow=replay_escrow.merge(resynced.escrow),
         )
 
 
@@ -243,7 +257,7 @@ def _confirmed_epoch(client: Any, group_id: str, headers: dict[str, str]) -> int
     read. It still escalates on the server's explicit refusal.
     """
     try:
-        return fetch_group_info(client, group_id, headers).epoch
+        return fetch_group_epochs(client, group_id, headers).confirmed
     except Exception:
         logger.debug("MLS group-info read failed for group %s", group_id, exc_info=True)
         return None
@@ -254,10 +268,9 @@ def _resync_with_retry(
     config_dir: str,
     agent_id: str,
     group_id: str,
-    cipher_suite: int,
     stale_leaf: int,
     headers: dict[str, str],
-) -> tuple[int, int | None]:
+) -> _Resynced:
     """Resync, with the single rebuild every commit-posting path in rine gets.
 
     A resync is an O(N) commit against a group free to move while it is in
@@ -271,23 +284,20 @@ def _resync_with_retry(
     does not move it.
     """
     try:
-        return _resync_once(
-            client, config_dir, agent_id, group_id, cipher_suite, stale_leaf, headers
-        )
+        return _resync_once(client, config_dir, agent_id, group_id, stale_leaf, headers)
     except Exception as err:
         # Not a lost CAS: the resync itself was refused, and that refusal is the
         # operator's answer rather than a race to rebuild against, so it gets
         # rine's words instead of the core's. An eviction keeps its own
-        # vocabulary — ``group_failures`` turns it into a membership fact.
+        # vocabulary — ``group_failures`` turns it into a membership fact — and so
+        # does a rotated agent's seat.
         if not is_epoch_conflict(err):
-            if isinstance(err, GroupInactiveError):
+            if isinstance(err, GroupInactiveError | MlsRotatedLeafError):
                 raise
             raise _resync_failure(group_id, err) from err
         first_error = err
     try:
-        return _resync_once(
-            client, config_dir, agent_id, group_id, cipher_suite, stale_leaf, headers
-        )
+        return _resync_once(client, config_dir, agent_id, group_id, stale_leaf, headers)
     except Exception as retry_error:
         raise CryptoError(
             f"Resyncing MLS group {group_id} failed after one retry — a peer's commit "
@@ -295,15 +305,25 @@ def _resync_with_retry(
         ) from first_error
 
 
+@dataclass(frozen=True)
+class _Resynced:
+    """What one posted resync commit achieved."""
+
+    epoch: int
+    target: int | None
+    """The epoch the group's GroupInfo named, when it named one."""
+
+    escrow: EscrowReport
+
+
 def _resync_once(
     client: Any,
     config_dir: str,
     agent_id: str,
     group_id: str,
-    cipher_suite: int,
     stale_leaf: int,
     headers: dict[str, str],
-) -> tuple[int, int | None]:
+) -> _Resynced:
     """One resync attempt: fetch the current GroupInfo, build the commit, post it.
 
     The GroupInfo is fetched here rather than reused from the distance
@@ -320,25 +340,32 @@ def _resync_once(
             f"Cannot resync MLS group {group_id}: it has published no GroupInfo to commit "
             "against. An existing member must publish one first."
         )
-    mls = open_mls_client(config_dir, agent_id, cipher_suite=cipher_suite)
-    group = mls.resync_by_external_commit(info.blob, stale_leaf)
+    actor = MlsActor(client=client, config_dir=config_dir, agent_id=agent_id)
+    # The external commit meets every current leaf, so the chain-verified peers
+    # must be admitted before it is built.
+    admit_group_peers(actor, group_id)
+    mls = open_mls_client(config_dir, agent_id)
+    group = admit_refused_peers_for_resync(
+        actor, mls, partial(mls.resync_by_external_commit, info.blob, stale_leaf), group_id
+    )
     bundle = group.last_commit()
     if bundle is None:  # pragma: no cover - a resync always commits
         raise CryptoError(f"MLS resync for group {group_id} produced no commit")
     epoch = post_mls_commit(
-        MlsActor(client=client, config_dir=config_dir, agent_id=agent_id),
+        actor,
         group_id,
         MlsCommit(
             commit=bundle.commit,
             group_info=bundle.group_info,
             epoch=bundle.epoch,
-            cipher_suite=group.cipher_suite(),
+            cipher_suite=DEFAULT_CIPHER_SUITE,
         ),
         headers,
     )
-    group.save()
+    settled = settle_escrow(actor, group_id)
+    drained = drain_escrow(actor, group_id, group, carry_unreported=True)
     note_mls_state_changed(config_dir, agent_id, group_id)
-    return epoch, info.epoch
+    return _Resynced(epoch, info.epoch, settled.merge(drained.report()))
 
 
 __all__ = [

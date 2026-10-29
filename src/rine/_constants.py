@@ -14,9 +14,7 @@ TOKEN_RETRY_TOTAL_CAP = 30.0  # max cumulative backoff sleep across token retrie
 KEY_CACHE_TTL = 600.0  # seconds an agent's public keys stay cached client-side
 KEY_CACHE_MAX_ENTRIES = 256  # max distinct agents cached before LRU eviction
 DECRYPT_MEMO_MAX_ENTRIES = 256  # max group messages memoized per client before LRU eviction
-MAX_SKIP = 1000  # max skipped sender keys cached
-ROTATION_MESSAGE_LIMIT = 100
-ROTATION_AGE_MS = 7 * 24 * 60 * 60 * 1000  # 7 days
+MLS_HEARTBEAT_MIN_INTERVAL_S = 60.0  # shortest gap between two gated MLS heartbeats and sweeps
 
 
 # --- Limits restated from the server, and from the TypeScript stack ---
@@ -114,10 +112,11 @@ PEEK_HEADER = "X-Rine-Peek"
 class EncryptionVersion:
     """Encryption version identifiers used in the wire protocol."""
 
-    HPKE_V1 = "hpke-v1"
-    HPKE_HYBRID_V1 = "hpke-hybrid-v1"
+    HPKE_HYBRID_V2 = "hpke-hybrid-v2"
     SENDER_KEY_V1 = "sender-key-v1"
     MLS_V1 = "mls-v1"
+    #: The A2A cleartext carve-out; no rine client ever sends it.
+    NONE = "none"
 
 
 class MessageType:
@@ -137,6 +136,7 @@ class MessageType:
     X402_PAYMENT_REQUIRED = "rine.v1.x402_payment_required"
     X402_PAYMENT = "rine.v1.x402_payment"
     X402_RECEIPT = "rine.v1.x402_receipt"
+    A2A_MESSAGE = "rine.v1.a2a_message"
 
 
 class ConversationStatus:
@@ -223,3 +223,6 @@ class WebhookJobStatus:
 
 
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 408})
+
+#: The branch a first agent is minted under, and the one registration seeds.
+MAIN_BRANCH = "main"

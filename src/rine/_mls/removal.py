@@ -22,18 +22,22 @@ would land, and is spendable exactly once.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from rine._actor import AGENT_HEADER
-from rine._logging import logger
-from rine._mls.api import MlsCommit, read_group
+from rine._mls.allowed import admit_group_peers
+from rine._mls.api import MlsCommit
+from rine._mls.binding import DEFAULT_CIPHER_SUITE, credential_identity
 from rine._mls.commit import post_mls_commit
+from rine._mls.commit_admission import admit_refused_peers
+from rine._mls.escrow_drain import drain_escrow
+from rine._mls.escrow_report import EscrowReport
 from rine._mls.failures import group_failures, is_epoch_conflict
 from rine._mls.group_access import note_mls_state_changed, open_mls_group
 from rine._mls.heartbeat import MlsActor
 from rine._mls.sync import sync_mls_group
-from rine._mls.tree import fetch_agent_identities, leaf_index
+from rine._mls.tree import leaf_index
 
 
 @dataclass(frozen=True)
@@ -47,16 +51,16 @@ class MlsRemovalCommit:
     removed_leaf: bool
     """Whether a leaf actually left the ratchet tree.
 
-    ``False`` when no leaf carried the target's **currently published** signing
-    key and the commit only **declared** the removal. Every surface that
-    describes a removal must branch on this: saying a leaf was evicted when none
-    was is the class of false report the removal sentences exist to prevent.
-
-    🔴 ``False`` is not the same fact as "they hold no leaf". It is "no leaf
-    matches the key they publish now", and the two come apart when the target
-    rotated its signing key — see :func:`_post_removal`. Surfaces say the
-    narrower thing.
+    ``False`` when no leaf carried the target's agent id and the commit only
+    **declared** the removal: the leaf was already gone, or was never seated.
+    Every surface that describes a removal must branch on this: saying a leaf was
+    evicted when none was is the class of false report the removal sentences
+    exist to prevent.
     """
+
+    escrow: EscrowReport = field(default_factory=EscrowReport)
+    """What the escrow drain of this commit could not do: epochs with no escrow, a
+    deferral, and what waits queued."""
 
 
 def remove_mls_group_member(
@@ -71,8 +75,11 @@ def remove_mls_group_member(
 
     The target is named by its **agent id**, which is both what the commit
     declares and what the ratchet-tree leaf is resolved from — the agent's MLS
-    basic-credential identity is read here, so the leaf that is taken and the
-    name that is declared can never be two different members.
+    basic-credential identity is that id, so the leaf that is taken and the name
+    that is declared can never be two different members. No key read stands
+    between the id and the leaf, so an agent the server publishes no key for (a
+    revoked agent, or one on a revoked branch) and an agent that rotated its key
+    are removed like any other member.
 
     Retries **once** past a lost epoch CAS: an admin's Remove commit races every
     other commit in the group, and losing that race is ordinary rather than
@@ -96,14 +103,7 @@ def remove_mls_group_member(
         RineApiError: The server refused the commit. The member row is untouched.
     """
     headers = dict(extra_headers or {AGENT_HEADER: agent_id})
-    identity = fetch_agent_identities(client, [member_agent_id]).get(member_agent_id.lower())
-    if identity is None:
-        # No published signing key means no basic-credential identity, so no
-        # leaf can be resolved for them — a revoked or erased agent. There is
-        # nothing to evict, but there is still something to declare, so the
-        # rescue below applies and such an agent stops being unremovable.
-        logger.warning("No published signing key for %s — no MLS leaf to remove", member_agent_id)
-
+    identity = credential_identity(member_agent_id.lower())
     # An admin whose own leaf is gone is told that, rather than being handed the
     # core's ratchet-tree invariant or — worse — the "nothing to remove here"
     # answer a swallowed eviction would look like.
@@ -131,7 +131,7 @@ def _post_removal(
     agent_id: str,
     group_id: str,
     member_agent_id: str,
-    identity: bytes | None,
+    identity: bytes,
     headers: dict[str, str],
 ) -> MlsRemovalCommit:
     """Build and publish one commit declaring ``member_agent_id``.
@@ -142,7 +142,7 @@ def _post_removal(
     must not rebuild from the handle whose commit was refused — and a leaf index
     read before another commit landed is not the leaf index after it.
 
-    🔴 **A target holding no leaf gets a path-only commit, and that is the
+    🔴 **A target no leaf names gets a path-only commit, and that is the
     point.** ``add_members([])`` is a commit with no proposals and a
     fresh UpdatePath. It is what rescues a removal whose commit landed and whose
     DELETE then failed: the leaf is already out of the tree, so no second Remove
@@ -153,49 +153,38 @@ def _post_removal(
     to this group at this epoch, and named this target before it knew which
     DELETE would land. Do not "simplify" it back to returning ``None``.
 
-    🔴 **What "no leaf" means here is narrower than it reads.** The leaf is
-    resolved from the signing key the target publishes *now*, so three states
-    arrive as one:
-
-    1. The server publishes no key for them — revoked, or gone. No leaf this
-       group can name, and the path-only commit is right.
-    2. Their leaf is already out: the stranded-removal rescue above. Right too.
-    3. They rotated their signing key. ``POST /agents/{id}/keys`` has no MLS
-       guard, so the tree still carries a leaf under the credential they
-       published before, and this removal completes as a delivery-filter
-       removal with that leaf's epoch secrets still valid.
-
-    (2) and (3) cannot be told apart from here — there is no identity → agent
-    lookup — so the removal proceeds, because refusing would break the rescue
-    this path exists for, and every surface says the narrow, true thing: no leaf
-    carries the key they publish now. Closing (3) needs key rotation to commit a
-    self-update into every MLS group the agent is in; until it does,
-    :func:`rine._mls.orphans.reclaim_orphan_leaves` declines to run on a group
-    in this state and names the member.
+    A leaf names the target when its credential identity is the target's agent
+    id. Two cases leave no such leaf: the removal's own commit already landed (the
+    stranded-removal rescue above), or the agent was never seated. A revoked agent,
+    an agent on a revoked branch and an agent that rotated its key all still hold
+    the leaf their id names, so they get a real Remove.
     """
-    # The group's own ciphersuite, never the default: a group created on the
-    # classical suite is unreadable through a client opened on the current one.
-    suite = read_group(client, agent_id, group_id).mls_cipher_suite
-    group = open_mls_group(config_dir, agent_id, group_id, cipher_suite=suite)
-    leaf = None if identity is None else leaf_index(group, identity)
-    bundle = group.add_members([]) if leaf is None else group.remove_member(leaf)
+    actor = MlsActor(client=client, config_dir=config_dir, agent_id=agent_id)
+    admit_group_peers(actor, group_id)
+    group = open_mls_group(config_dir, agent_id, group_id)
+    leaf = leaf_index(group, identity)
+    bundle = admit_refused_peers(
+        actor,
+        group,
+        lambda: group.add_members([]) if leaf is None else group.remove_member(leaf),
+    )
     epoch = post_mls_commit(
-        MlsActor(client=client, config_dir=config_dir, agent_id=agent_id),
+        actor,
         group_id,
         MlsCommit(
             commit=bundle.commit,
             group_info=bundle.group_info,
             epoch=bundle.epoch,
-            cipher_suite=group.cipher_suite(),
+            cipher_suite=DEFAULT_CIPHER_SUITE,
             removes=(member_agent_id,),
         ),
         headers,
     )
     # Only after the server accepted it, so a refused commit leaves no forked
     # local state for the retry to build on.
-    group.save()
+    drained = drain_escrow(actor, group_id, group, carry_unreported=True)
     note_mls_state_changed(config_dir, agent_id, group_id)
-    return MlsRemovalCommit(epoch=epoch, removed_leaf=leaf is not None)
+    return MlsRemovalCommit(epoch=epoch, removed_leaf=leaf is not None, escrow=drained.report())
 
 
 __all__ = ["MlsRemovalCommit", "remove_mls_group_member"]

@@ -20,6 +20,8 @@ from rine._mls import open_mls_client
 from rine._mls.group_access import load_mls_group
 from rine.errors import AuthorizationError
 
+pytestmark = pytest.mark.usefixtures("mls_escrow_stub")
+
 API = "https://rine.network"
 GROUP_ID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 OTHER_AGENT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -124,6 +126,36 @@ class TestLeaveWipesLocalMlsState:
         assert not os.path.exists(_group_dir(tmp_config_dir, agent_id))
 
     @respx.mock
+    def test_remove_member_when_removing_self_settles_the_escrow_before_the_server_removal(
+        self, sync_client, tmp_config_dir, agent_id, escrow_calls
+    ):
+        """The wipe discards deferred exports, so they are sealed while the leaver is a member."""
+        routes = _mock_server(agent_id)
+        sync_client.groups.create("test-group", visibility="private")
+
+        def removal(request):
+            escrow_calls.append(("remove", GROUP_ID))
+            return httpx.Response(204)
+
+        routes["remove_self"].mock(side_effect=removal)
+
+        sync_client.groups.remove_member(GROUP_ID, agent_id)
+
+        assert escrow_calls == [("settle", GROUP_ID), ("remove", GROUP_ID)]
+
+    @respx.mock
+    def test_remove_member_when_removing_someone_else_settles_nothing(
+        self, sync_client, tmp_config_dir, agent_id, escrow_calls
+    ):
+        """A kick wipes nothing of this agent's, so there is nothing to settle."""
+        _mock_server(agent_id)
+        sync_client.groups.create("test-group", visibility="private")
+
+        sync_client.groups.remove_member(GROUP_ID, OTHER_AGENT_ID)
+
+        assert escrow_calls == []
+
+    @respx.mock
     def test_leaving_an_mls_group_reports_the_mls_wipe_it_actually_did(
         self, sync_client, tmp_config_dir, agent_id
     ):
@@ -184,7 +216,7 @@ class TestLeaveWipesLocalMlsState:
 
     @respx.mock
     async def test_async_remove_member_when_removing_self_retires_the_group_state(
-        self, async_client, tmp_config_dir, agent_id
+        self, async_client, tmp_config_dir, agent_id, escrow_calls
     ):
         _mock_server(agent_id)
         await async_client.groups.create("test-group", visibility="private")
@@ -193,6 +225,7 @@ class TestLeaveWipesLocalMlsState:
         await async_client.groups.remove_member(GROUP_ID, agent_id)
 
         assert _has_local_state(tmp_config_dir, agent_id) is False
+        assert escrow_calls == [("settle", GROUP_ID)]
         await async_client.close()
 
 

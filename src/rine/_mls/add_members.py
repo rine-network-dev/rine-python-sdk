@@ -18,10 +18,10 @@ from typing import TYPE_CHECKING, Any
 from rine._actor import AGENT_HEADER
 from rine._mls.admission_loop import run_admission
 from rine._mls.admission_state import Admission
-from rine._mls.api import read_group
 from rine._mls.failures import group_failures
 from rine._mls.group_access import holds_mls_state, open_mls_group
 from rine._mls.heartbeat import MlsActor, mls_heartbeat
+from rine._mls.revoked_seats import hold_for_revoked_seats, tree_agent_ids
 from rine._mls.tree import fetch_agent_identities, leaf_index, read_group_tree
 from rine._mls.welcomes import process_mls_welcomes
 
@@ -104,18 +104,14 @@ def add_mls_group_members(
         # all, and the seat below is best-effort for every caller — so establish
         # it here rather than fail silently and leave the applicant outside.
         _ensure_admitter_state(client, config_dir, agent_id, group_id)
-        # The group's own ciphersuite, never the default: a group created on the
-        # classical suite is unreadable through a client opened on the current one.
-        suite = read_group(client, agent_id, group_id).mls_cipher_suite
         tree = read_group_tree(client, group_id, headers)
-        group = open_mls_group(config_dir, agent_id, group_id, cipher_suite=suite)
+        group = open_mls_group(config_dir, agent_id, group_id)
         admission = Admission(
             client=client,
             config_dir=config_dir,
             agent_id=agent_id,
             group_id=group_id,
             extra_headers=headers,
-            cipher_suite=suite,
             group=group,
             saved=True,
             epoch=group.epoch(),
@@ -126,7 +122,9 @@ def add_mls_group_members(
         # went on to be admitted, or the acting agent's own outcome would sort to
         # the end instead of to where the caller named it.
         admission.order = list(dict.fromkeys(a.lower() for a in member_agent_ids))
-        identities = fetch_agent_identities(client, wanted)
+        identities = fetch_agent_identities(
+            client, list(dict.fromkeys([*wanted, *tree_agent_ids(group)]))
+        )
         candidates: list[str] = []
         for member in wanted:
             identity = identities.get(member.lower())
@@ -134,6 +132,7 @@ def add_mls_group_members(
                 admission.skip(member, "already_in_group")
             else:
                 candidates.append(member)
+        candidates = hold_for_revoked_seats(admission, group, candidates, identities)
 
         # The tree already counts an agent this call is about to seat when that
         # agent holds an invitation — a voucher takes its seat the moment it is

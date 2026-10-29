@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from rine._crypto.envelope import encode_envelope
-from rine._crypto.sign import sign_payload
+from rine._crypto.sign import GroupSig, sign_message
 from rine._utils import from_base64url, to_base64url
 from rine.errors import CryptoError, NoSenderKeyStateError
 from rine.sender_key_words import no_sender_key_state_detail
@@ -141,14 +141,14 @@ def seal_group(
 
     Args:
         sender_signing_private_key: 32-byte Ed25519 private seed.
-        sender_signing_kid: Key ID for signing (``rine:{uuid}``).
+        sender_signing_kid: Key ID for signing (``rine:{uuid}#{gen}``).
         state: Current sender key state.
         plaintext: Raw payload bytes.
 
     Returns:
         Tuple of (encrypted_payload bytes, updated SenderKeyState).
     """
-    signature = sign_payload(sender_signing_private_key, plaintext)
+    signature = sign_message(sender_signing_private_key, GroupSig(state.group_id), plaintext)
     inner_envelope = encode_envelope(sender_signing_kid, signature, plaintext)
 
     message_key, next_chain_key = derive_message_key(state.chain_key)

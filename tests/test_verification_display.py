@@ -14,7 +14,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from rine._crypto.keys import generate_agent_keys, save_agent_keys
+from rine._crypto.keys import save_agent_keys
+from rine.testing import WORLD
 from rine.verification_display import (
     compare_verification_words_for_agent,
     verification_words_lines,
@@ -29,7 +30,7 @@ OTHER_WORDS = "abandon ability able about above"
 def _config_dir_with_keys(tmp_path, agent_id: str = AGENT_ID) -> tuple[str, str]:
     """A config dir holding one agent's keys, and the words they derive."""
     config_dir = str(tmp_path)
-    keys = generate_agent_keys()
+    keys = WORLD.keys(agent_id)
     save_agent_keys(config_dir, agent_id, keys)
     return config_dir, verification_words_for_key(keys.signing.public_key)
 

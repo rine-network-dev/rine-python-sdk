@@ -59,7 +59,7 @@ import pytest
 import respx
 
 from rine._actor import AGENT_HEADER
-from rine._crypto.keys import generate_agent_keys, save_agent_keys, signing_public_key_to_jwk
+from rine._crypto.keys import save_agent_keys
 from rine._mls import (
     KEY_PACKAGE_TARGET,
     add_mls_group_members,
@@ -73,7 +73,10 @@ from rine._mls import (
     reset_mls_heartbeat_gate,
     sync_mls_group,
 )
+from rine.testing import WORLD
 from rine.types import GroupRead
+
+pytestmark = pytest.mark.usefixtures("mls_escrow_stub")
 
 API = "https://rine.network"
 HOST = "rine.network"
@@ -111,7 +114,7 @@ class _Server:
         self.founding_roster: list[str] = []
         self.welcome_seq = 0
         for agent_id in self.agents:
-            save_agent_keys(config_dir, agent_id, generate_agent_keys())
+            save_agent_keys(config_dir, agent_id, WORLD.keys(agent_id))
 
     @property
     def agents(self) -> tuple[str, str, str]:
@@ -135,9 +138,9 @@ class _Server:
         return {AGENT_HEADER: agent_id}
 
     def _published(self, agent_id: str) -> dict[str, Any]:
-        # The MLS basic-credential identity is the agent's raw Ed25519 key.
-        jwk = signing_public_key_to_jwk(open_mls_client(self.config_dir, agent_id).public_key())
-        return {"signing_public_key": jwk, "encryption_public_key": jwk}
+        # The chain-valid published body of one agent's keys, minted from the
+        # same derived world the agent's own keys came from.
+        return WORLD.keys_response(agent_id)
 
     # -- routes ----------------------------------------------------------------
 

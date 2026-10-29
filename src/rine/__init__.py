@@ -21,8 +21,9 @@ from rine._actor import (
     normalize_actor,
     single_actor_value,
 )
+from rine._agent_rotate_seats import KeyPackageRotation, RotatedAgent
 from rine._client import RineClient
-from rine._config import resolve_api_url, resolve_config_dir
+from rine._config import PROFILES_FILE, resolve_api_url, resolve_config_dir
 from rine._constants import (
     NOT_GIVEN,
     ConversationStatus,
@@ -43,9 +44,16 @@ from rine._group_ref import (
     is_bare_reference,
     is_sigil_group_reference,
 )
+from rine._mls.key_not_current import (
+    KEY_NOT_CURRENT_MESSAGE,
+    MLS_ERR_KEY_NOT_CURRENT,
+    MlsKeyNotCurrentError,
+)
+from rine._mls.rotated_leaf import MLS_ERR_ROTATED_LEAF, MlsRotatedLeafError
 from rine._onboard import async_register, register
 from rine._onboard import async_register as async_onboard
 from rine._onboard import register as onboard
+from rine._owner import PHRASE_INSTRUCTION
 from rine._recipient import (
     REF_CLASS_AGENT,
     REF_CLASS_BARE,
@@ -56,10 +64,15 @@ from rine._recipient import (
     RecipientTarget,
     classify_reference,
 )
+from rine._recover import RecoveryReport, async_recover_org, recover_org
+from rine._recover_agents import AgentRecovery, AgentRecoveryStatus
+from rine._recover_reseat import GroupReseat, ReseatStatus
 from rine._resolve import is_uuid, normalize_handle
 from rine._resources.group_ops import VISIBILITY_REQUIRED_MESSAGE
+from rine._seat_update import SeatDeferReason, SeatFailReason, SeatUpdate, SeatUpdateStatus
 from rine._sync_client import SyncRineClient
 from rine._version import __version__
+from rine.a2a_cleartext import A2A_CLEARTEXT_NOTICE, with_a2a_cleartext_notice
 from rine.admission_words import (
     admission_headline,
     admitted_agent_ids,
@@ -75,6 +88,7 @@ from rine.errors import (
     MLS_RESYNC_UNAVAILABLE_CODE,
     SENDER_KEY_UNAVAILABLE_CODE,
     WELCOME_REFUSED_CODE,
+    AgentIdMismatchError,
     APIConnectionError,
     APITimeoutError,
     AuthenticationError,
@@ -82,6 +96,7 @@ from rine.errors import (
     ConfigError,
     ConflictError,
     CryptoError,
+    EscrowGapError,
     GroupEvictedError,
     GroupIdentityMismatchError,
     InternalServerError,
@@ -92,8 +107,11 @@ from rine.errors import (
     NoSenderKeyStateError,
     NotAGroupMemberError,
     NotFoundError,
+    OrgMismatchError,
+    PrincipalRevokedError,
     RateLimitError,
     ReplyAttributionError,
+    RevokedScope,
     RineApiError,
     RineError,
     SenderMismatchError,
@@ -117,6 +135,7 @@ from rine.group_admission import (
 from rine.group_removal import GroupRemovalEncryption, GroupRemovalResult
 from rine.group_words import (
     ACTING_AGENT_SPELLING,
+    GROUP_READERS_NOTICE,
     NO_OWN_AGENTS,
     NO_SEAT_TO_ACT_AS,
     NOT_A_MEMBER_CLAUSE,
@@ -125,6 +144,7 @@ from rine.group_words import (
     not_a_member_message,
     own_agents_clause,
 )
+from rine.key_scope_words import GROUPS_KEY_SCOPE
 from rine.sender_key_words import SENDER_KEY_UNAVAILABLE_PREVIEW, SenderKeyRefusal
 from rine.thread_words import TRANSCRIPT_REFERENCE_REQUIRED, not_a_conversation_uuid
 from rine.types import (
@@ -169,6 +189,8 @@ from rine.types import (
     WebhookJobSummary,
     WebhookRead,
     WhoAmI,
+    WhoAmIKind,
+    WhoAmIPrincipal,
 )
 from rine.verification_display import (
     compare_verification_words_for_agent,
@@ -208,6 +230,14 @@ __all__ = [
     "async_register",
     "onboard",
     "register",
+    # Recovery from the 24-word phrase.
+    "AgentRecovery",
+    "AgentRecoveryStatus",
+    "GroupReseat",
+    "RecoveryReport",
+    "ReseatStatus",
+    "async_recover_org",
+    "recover_org",
     # Resolution & config helpers
     "is_uuid",
     "normalize_handle",
@@ -231,6 +261,12 @@ __all__ = [
     # the arm where the org holds no seat and there is no header value to name.
     "ACTING_AGENT_SPELLING",
     "NOT_A_MEMBER_CLAUSE",
+    "A2A_CLEARTEXT_NOTICE",
+    "with_a2a_cleartext_notice",
+    "GROUP_READERS_NOTICE",
+    "GROUPS_KEY_SCOPE",
+    "PHRASE_INSTRUCTION",
+    "PROFILES_FILE",
     "NO_OWN_AGENTS",
     "NO_SEAT_TO_ACT_AS",
     "SEATED_SIBLING_CLAUSE",
@@ -369,6 +405,8 @@ __all__ = [
     "WebhookJobSummary",
     "WebhookRead",
     "WhoAmI",
+    "WhoAmIKind",
+    "WhoAmIPrincipal",
     # Rendering
     # A skip reason and a per-agent outcome, in words rather than wire tokens.
     # ``not_applicable`` is why: an open group's roster comes back entirely
@@ -423,12 +461,18 @@ __all__ = [
     "WebhookJobStatus",
     # Errors
     "APIConnectionError",
+    "AgentIdMismatchError",
     "APITimeoutError",
     "AuthenticationError",
+    # The server refused the caller because its agent or branch is revoked; branch on
+    # ``err.scope`` (``RevokedScope``), never on the message.
+    "PrincipalRevokedError",
+    "RevokedScope",
     "AuthorizationError",
     "ConfigError",
     "ConflictError",
     "CryptoError",
+    "EscrowGapError",
     "GroupIdentityMismatchError",
     # An eviction, said as a membership fact rather than as the MLS core's
     # ratchet-tree invariant. Branch on ``GROUP_EVICTED_CODE``, never on text.
@@ -440,6 +484,25 @@ __all__ = [
     "MLS_RESYNC_UNAVAILABLE_CODE",
     "MlsError",
     "MlsResyncUnavailableError",
+    # A resync refused because the agent's leaf still carries a key it has rotated
+    # away from and this device holds no group state that can move it: a member
+    # removing the agent and inviting it again is the remedy. Branch on
+    # ``MLS_ERR_ROTATED_LEAF``, never on text.
+    "MLS_ERR_ROTATED_LEAF",
+    "MlsRotatedLeafError",
+    # Key packages refused (or never minted) because this device holds an earlier key
+    # generation than the agent's current one. Branch on ``MLS_ERR_KEY_NOT_CURRENT``,
+    # never on text; ``KEY_NOT_CURRENT_MESSAGE`` is the sentence every surface shows.
+    "KEY_NOT_CURRENT_MESSAGE",
+    "MLS_ERR_KEY_NOT_CURRENT",
+    "MlsKeyNotCurrentError",
+    # What ``rotate_keys`` reports: the KeyPackage pool, and each group's leaf.
+    "KeyPackageRotation",
+    "RotatedAgent",
+    "SeatDeferReason",
+    "SeatFailReason",
+    "SeatUpdate",
+    "SeatUpdateStatus",
     # A Welcome this client refused to adopt, and why. Public at the root so a
     # caller recognises a refusal by TYPE rather than by matching its message —
     # the TypeScript twin is a `@rine-network/core` export, and an asymmetry
@@ -460,6 +523,7 @@ __all__ = [
     # holds no seat, so the key was never distributed and nothing was sent.
     "NotAGroupMemberError",
     "NotFoundError",
+    "OrgMismatchError",
     "RateLimitError",
     "ReplyAttributionError",
     "RineApiError",

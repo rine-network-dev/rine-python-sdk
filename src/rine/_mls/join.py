@@ -1,10 +1,18 @@
 """Getting into a group's MLS state — the joiner side of the group lifecycle.
 
-Two ways in, tried in that order:
+Three ways in. The join verb tries them in this order through
+:func:`rine._mls.join_establish.establish_mls_state`. The sync verb runs
+``recover_mls_group_or_reseat``, which does a Welcome pass and then a retake, and never takes
+the third way in below for an agent that has no seat; it can still post an external commit
+on the agent's own leaf (the resync rung, or the orphan reconciliation of ``sync_mls_group``).
+The read path (:func:`install_mls_state`) installs a Welcome or joins
+externally and never retakes a seat; the retake runs on sync and join only.
 
 1. **A Welcome**, minted by whoever added this agent. The normal path for closed,
    majority and unanimity enrollment (:mod:`rine._mls.welcomes`).
-2. **An external commit**, for a rine member nobody minted a Welcome for — open
+2. **The agent's own seat**, retaken by external commit when the tree already holds a
+   leaf for it and no state matches (:mod:`rine._mls.stranded_seat`).
+3. **An external commit**, for a rine member nobody minted a Welcome for — open
    enrollment, where the server admits a joiner with no member in the loop
    (:mod:`rine._mls.external_join`).
 
@@ -17,11 +25,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from rine._actor import AGENT_HEADER
-from rine._logging import logger
-from rine._mls.api import read_group
 from rine._mls.binding import open_mls_client
 from rine._mls.external_join import ExternalJoin, external_join_mls_group
 from rine._mls.group_access import load_mls_group
+from rine._mls.join_establish import MlsEstablishment, establish_mls_state, report_join_failure
 from rine._mls.welcome_guard import MlsWelcomeRefusedError
 from rine._mls.welcomes import process_mls_welcomes
 
@@ -45,7 +52,9 @@ def install_mls_state(client: Any, config_dir: str, agent_id: str, group: GroupR
         MlsWelcomeRefusedError: A Welcome **for this group** was refused. The
             group substitution guard is the one failure this path does not
             absorb: a client that quietly carried on would fall through to the
-            external-join fallback for a group it just decided not to trust.
+            external-join fallback for a group it just decided not to trust. The
+            external join raises the same refusal when the tree holds a member this
+            agent cannot verify.
     """
     if group.mls_group_id is None:
         return
@@ -59,7 +68,7 @@ def install_mls_state(client: Any, config_dir: str, agent_id: str, group: GroupR
     # queue was ordered by (measured, not hypothetical).
     process_mls_welcomes(client, config_dir, agent_id, for_group=group_id)
 
-    mls = open_mls_client(config_dir, agent_id, cipher_suite=group.mls_cipher_suite)
+    mls = open_mls_client(config_dir, agent_id)
     if load_mls_group(mls, group_id) is not None:
         return
     external_join_mls_group(
@@ -69,43 +78,41 @@ def install_mls_state(client: Any, config_dir: str, agent_id: str, group: GroupR
             agent_id=agent_id,
             group_id=group_id,
             extra_headers={AGENT_HEADER: agent_id},
-            cipher_suite=group.mls_cipher_suite,
         )
     )
 
 
+def establish_mls_membership(client: Any, group_id: str, agent: str | None) -> MlsEstablishment:
+    """:func:`establish_mls_state` for the agent a verb acts as.
+
+    Raises:
+        MlsWelcomeRefusedError: As :func:`establish_mls_state`.
+    """
+    agent_id = client._resolve_agent_id(agent)
+    return establish_mls_state(client._http, client._config_dir, agent_id, group_id)
+
+
 def join_mls_state(client: Any, group_id: str, agent: str | None) -> None:
-    """Install MLS state for a group this SDK just joined, best-effort.
+    """Establish MLS state for a group this SDK just joined, best-effort.
 
     The rine membership stands either way: state can be installed on any later
     read or send, so a failure is reported rather than raised.
 
     Raises:
-        MlsWelcomeRefusedError: The one exception to "best-effort". A refused
-            Welcome for **this** group is a security decision, not a setup
-            hiccup: carrying on quietly would fall through to the external-join
-            fallback for a group this client has just decided not to trust.
-
-            Both stacks are required to be loud AND to agree, so this is
-            a contract rather than a stack preference. 🔴 Do not soften it to
-            match a TypeScript verb that warns — when the two disagree, the fix
-            belongs on the quiet side. (Written because they did disagree: when
-            this raise landed, ``rine-core``'s ``processMlsWelcomes`` raised but
-            every TypeScript join verb above it caught the refusal and warned.)
+        MlsWelcomeRefusedError: As :func:`establish_mls_state`.
     """
     try:
-        agent_id = client._resolve_agent_id(agent)
-        install_mls_state_by_id(client._http, client._config_dir, agent_id, group_id)
+        establish_mls_membership(client, group_id, agent)
     except MlsWelcomeRefusedError:
         raise
     except Exception:
-        _report_join_failure(group_id)
+        report_join_failure(group_id)
 
 
 async def join_mls_state_async(client: Any, group_id: str, agent: str | None) -> None:
     """Async counterpart of :func:`join_mls_state`.
 
-    Only the agent lookup differs; the join itself is the same function, run on a
+    Only the agent lookup differs; the establishment itself is the same function, run on a
     worker thread.
 
     Raises:
@@ -117,28 +124,9 @@ async def join_mls_state_async(client: Any, group_id: str, agent: str | None) ->
         agent_id = await client._resolve_agent_id(agent)
         await with_sync_http(
             client,
-            lambda http: install_mls_state_by_id(http, client._config_dir, agent_id, group_id),
+            lambda http: establish_mls_state(http, client._config_dir, agent_id, group_id),
         )
     except MlsWelcomeRefusedError:
         raise
     except Exception:
-        _report_join_failure(group_id)
-
-
-def install_mls_state_by_id(client: Any, config_dir: str, agent_id: str, group_id: str) -> None:
-    """:func:`install_mls_state` for a caller that holds only the group's id.
-
-    Reads the group first, so the MLS client is opened on the group's *own*
-    ciphersuite rather than the current default — a group created on the
-    classical suite is therefore still joinable.
-    """
-    install_mls_state(client, config_dir, agent_id, read_group(client, agent_id, group_id))
-
-
-def _report_join_failure(group_id: str) -> None:
-    logger.warning(
-        "MLS setup failed for group %s — this agent is a member, but reading and "
-        "sending in the group will keep retrying the setup until it succeeds",
-        group_id,
-        exc_info=True,
-    )
+        report_join_failure(group_id)

@@ -43,8 +43,9 @@ def mls_read_refusal(group_id: str, remedy: str) -> str:
         "that opens it. Either it has no ratchet-tree leaf in the group yet — a seat on the "
         "roster is not a leaf in the tree — or the message was committed before its leaf "
         f"existed, which no key can ever open. {remedy} to catch this agent's group state up "
-        "and republish the key packages an admission claims, then ask a group admin to resume "
-        "the admission; anything committed before a leaf exists for this agent stays closed."
+        "and republish the key packages an admission claims, then ask any other member that "
+        "holds a leaf in the group to resume the admission (an admin is not required); "
+        "anything committed before a leaf exists for this agent stays closed."
     )
 
 

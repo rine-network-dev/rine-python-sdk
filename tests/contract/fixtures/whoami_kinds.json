@@ -1,0 +1,14 @@
+{
+  "body": {
+    "kinds": [
+      "agent",
+      "branch",
+      "branch_reader",
+      "org",
+      "org_reader"
+    ]
+  },
+  "endpoint": "GET /whoami",
+  "scenario": "the closed set of principal.kind values",
+  "status": 200
+}

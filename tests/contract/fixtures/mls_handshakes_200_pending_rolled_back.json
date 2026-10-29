@@ -1,0 +1,9 @@
+{
+  "body": {
+    "handshakes": [],
+    "pending_commit": "rolled_back"
+  },
+  "endpoint": "GET /groups/{group_id}/mls/handshakes",
+  "scenario": "own commit past its deadline",
+  "status": 200
+}

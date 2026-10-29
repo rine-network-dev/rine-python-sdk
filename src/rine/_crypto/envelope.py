@@ -43,13 +43,9 @@ def encode_envelope(kid: str, signature: bytes, payload: bytes) -> bytes:
     """
     kid_bytes = kid.encode("utf-8")
     if len(kid_bytes) > MAX_KID_LENGTH:
-        raise CryptoError(
-            f"KID too long: {len(kid_bytes)} bytes (max {MAX_KID_LENGTH})"
-        )
+        raise CryptoError(f"KID too long: {len(kid_bytes)} bytes (max {MAX_KID_LENGTH})")
     if len(signature) != SIGNATURE_SIZE:
-        raise CryptoError(
-            f"Signature must be {SIGNATURE_SIZE} bytes, got {len(signature)}"
-        )
+        raise CryptoError(f"Signature must be {SIGNATURE_SIZE} bytes, got {len(signature)}")
 
     return bytes([len(kid_bytes)]) + kid_bytes + signature + payload
 
@@ -72,9 +68,7 @@ def decode_envelope(data: bytes) -> InnerEnvelope:
     kid_len = data[0]
     min_len = 1 + kid_len + SIGNATURE_SIZE
     if len(data) < min_len:
-        raise CryptoError(
-            f"Envelope too short: {len(data)} bytes, need at least {min_len}"
-        )
+        raise CryptoError(f"Envelope too short: {len(data)} bytes, need at least {min_len}")
 
     try:
         kid = data[1 : 1 + kid_len].decode("utf-8")

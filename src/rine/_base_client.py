@@ -15,7 +15,7 @@ from rine._actor import (
     actor_from_env,
     normalize_actor,
 )
-from rine._config import get_credential_entry, resolve_api_url, resolve_config_dir
+from rine._config import resolve_api_url, resolve_config_dir
 from rine._constants import (
     DECRYPT_MEMO_MAX_ENTRIES,
     DEFAULT_MAX_RETRIES,
@@ -25,7 +25,11 @@ from rine._constants import (
     NotGiven,
 )
 from rine._crypto._decrypt_memo import DecryptMemo
+from rine._custody import resolve_auth
 from rine._logging import logger
+from rine._owner import effective_owner_dir
+from rine._principal import PrincipalKind
+from rine._profiles import DEFAULT_PROFILE, get_profile
 from rine._resolve import is_wire_agent_id
 from rine.errors import (
     ConfigError,
@@ -59,6 +63,12 @@ class BaseRineClient:
             server auto-selects when the org has exactly one active agent.
         timeout: HTTP request timeout in seconds.
         max_retries: Maximum retry attempts for rate limiting.
+        owner_dir: Owner directory holding ``root.key`` (``RINE_OWNER_DIR``, else
+            ``~/.config/rine-owner``). Needed only to act as the org or a branch.
+        profile: Named profile to act as. The default profile when omitted.
+        agent_only: Act only as an agent whose leaf keys are in ``config_dir``; the
+            owner dir is never read, so a host that also holds ``root.key`` cannot
+            turn this client into the org. Excludes ``owner_dir``.
     """
 
     def __init__(
@@ -69,8 +79,14 @@ class BaseRineClient:
         agent: str | NotGiven = NOT_GIVEN,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        owner_dir: str | None = None,
+        profile: str | None = None,
+        agent_only: bool = False,
     ) -> None:
         self._config_dir = config_dir or resolve_config_dir()
+        self._agent_only = agent_only
+        self._owner_dir = effective_owner_dir(owner_dir, agent_only)
+        self._profile = profile
         self._api_url = api_url or resolve_api_url()
         # Rungs 2 and 3 of the ladder, settled once, here: the constructor's
         # agent, then ``RINE_AGENT``. An agent that is empty after trimming is
@@ -109,10 +125,42 @@ class BaseRineClient:
         # hitting the consumed sender-key ratchet.
         self._decrypt_memo = DecryptMemo(DECRYPT_MEMO_MAX_ENTRIES)
 
-        # Validate credentials exist
-        entry = get_credential_entry(self._config_dir)
-        if not entry:
-            logger.debug("No credentials found at %s", self._config_dir)
+    def _poll_url(self) -> str:
+        """The one-time poll URL recorded on this client's runtime profile.
+
+        Raises:
+            ConfigError: No agent was created through this profile yet.
+        """
+        entry = get_profile(self._config_dir, self._profile or DEFAULT_PROFILE)
+        poll_url = entry.get("poll_url") if entry else None
+        if not poll_url:
+            raise ConfigError("No poll URL. Create an agent first.")
+        return poll_url
+
+    def _local_org_id(self) -> str | None:
+        """The org id of the identity this client acts as, when it holds one.
+
+        Read from the resolved auth, which prefers the owner dir's profile, so a
+        recovered or org-principal client compares the server's answer with the
+        org its own credentials name.
+        """
+        found = resolve_auth(self._config_dir, self._owner_dir, self._profile)
+        return found.org_id if found is not None else None
+
+    def _escrow_sweep_agent(self) -> str | None:
+        """The one agent a start-up escrow sweep may act for, or ``None`` for every local agent.
+
+        An agent principal acts as itself and no other. An unresolvable identity
+        gives ``None`` too: every request of such a client fails the same way, so
+        the sweep it starts fails before it records anything.
+        """
+        try:
+            found = resolve_auth(self._config_dir, self._owner_dir, self._profile)
+        except ConfigError:
+            return None
+        if found is None or found.signer.principal.kind is not PrincipalKind.AGENT:
+            return None
+        return found.signer.principal.ident
 
     @property
     def config_dir(self) -> str:
@@ -253,6 +301,15 @@ class BaseRineClient:
         )
 
     @staticmethod
+    def _signed_for(msg: MessageRead) -> str | None:
+        """The recipient a 1:1 row's sender signed for, when it is not the reader.
+
+        A sender opening its own copy of a send reads it as the sender, but the
+        signature is addressed to the message's recipient.
+        """
+        return str(msg.to_agent_id) if msg.direction == "sent" and msg.to_agent_id else None
+
+    @staticmethod
     def _expected_sender(agent_id: str, msg: MessageRead) -> str:
         """The sender every decrypt of this row must find in the envelope.
 
@@ -376,15 +433,6 @@ class BaseRineClient:
             msg.verification_status = "invalid"
         logger.debug("Decrypt failed for %s", msg.id, exc_info=error)
         return msg
-
-    def _require_credentials(self) -> None:
-        """Raise ConfigError if no credentials are available."""
-        entry = get_credential_entry(self._config_dir)
-        if not entry:
-            raise ConfigError(
-                "No credentials found. Run: rine onboard\n"
-                "Or set RINE_CLIENT_ID and RINE_CLIENT_SECRET environment variables."
-            )
 
 
 #: The MLS core's code for a message no key this agent holds will open.

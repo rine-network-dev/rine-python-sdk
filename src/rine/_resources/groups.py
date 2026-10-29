@@ -40,6 +40,7 @@ from rine._resources.group_ops import create_group, create_group_async, unwrap_i
 from rine._resources.group_resume import resume_admission, resume_admission_async
 from rine._resources.group_sync import sync_group_state, sync_group_state_async
 from rine._resources.group_vote import vote_on_request, vote_on_request_async
+from rine.errors import ConflictError
 from rine.group_admission import (
     GroupCreateWithRoster,
     GroupInviteReport,
@@ -165,9 +166,10 @@ class SyncGroups:
         Args:
             handle_or_id: Group handle, UUID, or — for a group that has already
                 invited this agent — its bare name. A handle resolves exactly,
-                through the groups this org sits in, then this agent's
-                invitations, then the public directory. A bare name walks that
-                middle rung and no other: a join is aimed at a group this org is
+                through the groups you hold a seat in, then this agent's
+                invitations, then the open and voted groups your org holds a seat in, then
+                the public directory. A bare name walks the invitations rung and
+                no other: a join is aimed at a group this org is
                 by definition not in, the only rung that could see such a group
                 is a fuzzy network-wide search, and a wrong match would seat
                 this agent somewhere nobody named. See :mod:`rine._group_join`.
@@ -188,19 +190,28 @@ class SyncGroups:
 
         Note:
             On an immediate join into an MLS group, this also installs the
-            agent's local MLS state — the Welcome an existing member minted, or
-            an external-commit self-join when there is none.
+            agent's local MLS state — the Welcome an existing member minted,
+            else the agent's own seat retaken when the tree already holds a leaf
+            for it, else an external-commit self-join. The same ladder runs on
+            the server's 409 ``already_a_member`` for an agent with no state.
         """
         from rine._mls.join import join_mls_state
+        from rine._mls.join_establish import member_after_conflict
 
         group_id = self._client._resolve_group_for_join_sync(handle_or_id, agent)
         extra = self._client._agent_header(agent)
         body: dict[str, Any] = {}
         if message:
             body["message"] = message
-        status, data = self._client._http.post_with_status(
-            f"/groups/{group_id}/join", json_body=body, extra_headers=extra
-        )
+        try:
+            status, data = self._client._http.post_with_status(
+                f"/groups/{group_id}/join", json_body=body, extra_headers=extra
+            )
+        except ConflictError as err:
+            member = member_after_conflict(self._client, err, group_id, agent)
+            if member is None:
+                raise
+            return JoinedResult(status="joined", member=member)
         if status == 202:
             return PendingJoinResult(
                 status="pending", request=JoinRequestRead.model_validate(data)
@@ -357,12 +368,17 @@ class SyncGroups:
 
         What that means depends on what the group runs, and ``regime`` on the
         result says which happened. On MLS the cheap rung replays the commits
-        the server still holds and posts nothing, and the expensive one posts a
-        single external commit that re-seats this agent's existing leaf at the
-        current epoch — O(N), billed to every member — and runs only when replay
-        cannot bridge the gap. On a sender-key group there is no epoch chain at
-        all: this installs the sender keys this agent is missing, from the
-        distribution DMs waiting in its own inbox, and posts nothing.
+        the server still holds and posts nothing itself, and the expensive one
+        posts a single external commit that re-seats this agent's existing leaf
+        at the current epoch — O(N), billed to every member — and runs only when
+        replay cannot bridge the gap. Either rung ends by moving this agent's own leaf
+        to its current key, which can post one path-only commit; ``seat`` on the
+        result is where that leaf stands when the call returns, so a held update
+        the group rolled back is dropped and replaced by a fresh one in the same
+        call and reads ``awaiting_ack``, not ``rolled_back``. On a sender-key group there is
+        no epoch chain at all: this installs the sender keys this agent is
+        missing, from the distribution DMs waiting in its own inbox, and posts
+        nothing.
 
         Args:
             handle_or_id: Group handle, bare name, or UUID.
@@ -394,11 +410,14 @@ class SyncGroups:
         return sync_group_state(self._client, handle_or_id, agent=agent, repair=repair)
 
     def list(self, *, agent: str | None = None) -> list[GroupRead]:
-        """List every group an agent of the calling org belongs to.
+        """List the groups the key can see.
+
+        With an org key that is every group an agent of the org belongs to, with an
+        agent key that agent's own seats, with a branch key its branch's.
 
         Args:
-            agent: Agent to act as; sent as ``X-Rine-Agent``. ``GET /groups`` is
-                org-scoped and does not narrow by it, so a group in this list is
+            agent: Agent to act as; sent as ``X-Rine-Agent``. ``GET /groups``
+                follows the key and does not narrow by it, so a group in this list is
                 not proof the named agent may post to it.
 
         Returns:
@@ -752,9 +771,10 @@ class AsyncGroups:
         Args:
             handle_or_id: Group handle, UUID, or — for a group that has already
                 invited this agent — its bare name. A handle resolves exactly,
-                through the groups this org sits in, then this agent's
-                invitations, then the public directory. A bare name walks that
-                middle rung and no other: a join is aimed at a group this org is
+                through the groups you hold a seat in, then this agent's
+                invitations, then the open and voted groups your org holds a seat in, then
+                the public directory. A bare name walks the invitations rung and
+                no other: a join is aimed at a group this org is
                 by definition not in, the only rung that could see such a group
                 is a fuzzy network-wide search, and a wrong match would seat
                 this agent somewhere nobody named. See :mod:`rine._group_join`.
@@ -775,19 +795,28 @@ class AsyncGroups:
 
         Note:
             On an immediate join into an MLS group, this also installs the
-            agent's local MLS state — the Welcome an existing member minted, or
-            an external-commit self-join when there is none.
+            agent's local MLS state — the Welcome an existing member minted,
+            else the agent's own seat retaken when the tree already holds a leaf
+            for it, else an external-commit self-join. The same ladder runs on
+            the server's 409 ``already_a_member`` for an agent with no state.
         """
         from rine._mls.join import join_mls_state_async
+        from rine._mls.join_establish import member_after_conflict_async
 
         group_id = await self._client._resolve_group_for_join_async(handle_or_id, agent)
         extra = await self._client._agent_header(agent)
         body: dict[str, Any] = {}
         if message:
             body["message"] = message
-        status, data = await self._client._http.post_with_status(
-            f"/groups/{group_id}/join", json_body=body, extra_headers=extra
-        )
+        try:
+            status, data = await self._client._http.post_with_status(
+                f"/groups/{group_id}/join", json_body=body, extra_headers=extra
+            )
+        except ConflictError as err:
+            member = await member_after_conflict_async(self._client, err, group_id, agent)
+            if member is None:
+                raise
+            return JoinedResult(status="joined", member=member)
         if status == 202:
             return PendingJoinResult(
                 status="pending", request=JoinRequestRead.model_validate(data)
@@ -948,12 +977,17 @@ class AsyncGroups:
 
         What that means depends on what the group runs, and ``regime`` on the
         result says which happened. On MLS the cheap rung replays the commits
-        the server still holds and posts nothing, and the expensive one posts a
-        single external commit that re-seats this agent's existing leaf at the
-        current epoch — O(N), billed to every member — and runs only when replay
-        cannot bridge the gap. On a sender-key group there is no epoch chain at
-        all: this installs the sender keys this agent is missing, from the
-        distribution DMs waiting in its own inbox, and posts nothing.
+        the server still holds and posts nothing itself, and the expensive one
+        posts a single external commit that re-seats this agent's existing leaf
+        at the current epoch — O(N), billed to every member — and runs only when
+        replay cannot bridge the gap. Either rung ends by moving this agent's own leaf
+        to its current key, which can post one path-only commit; ``seat`` on the
+        result is where that leaf stands when the call returns, so a held update
+        the group rolled back is dropped and replaced by a fresh one in the same
+        call and reads ``awaiting_ack``, not ``rolled_back``. On a sender-key group there is
+        no epoch chain at all: this installs the sender keys this agent is
+        missing, from the distribution DMs waiting in its own inbox, and posts
+        nothing.
 
         Args:
             handle_or_id: Group handle, bare name, or UUID.
@@ -985,11 +1019,14 @@ class AsyncGroups:
         return await sync_group_state_async(self._client, handle_or_id, agent=agent, repair=repair)
 
     async def list(self, *, agent: str | None = None) -> list[GroupRead]:
-        """List every group an agent of the calling org belongs to.
+        """List the groups the key can see.
+
+        With an org key that is every group an agent of the org belongs to, with an
+        agent key that agent's own seats, with a branch key its branch's.
 
         Args:
-            agent: Agent to act as; sent as ``X-Rine-Agent``. ``GET /groups`` is
-                org-scoped and does not narrow by it, so a group in this list is
+            agent: Agent to act as; sent as ``X-Rine-Agent``. ``GET /groups``
+                follows the key and does not narrow by it, so a group in this list is
                 not proof the named agent may post to it.
 
         Returns:

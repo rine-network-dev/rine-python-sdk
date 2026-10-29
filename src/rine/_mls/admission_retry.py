@@ -16,7 +16,13 @@ from __future__ import annotations
 from rine._logging import logger
 from rine._mls.admission import MlsAdmissionOutcome
 from rine._mls.admission_recheck import drop_seated_joiners
-from rine._mls.admission_state import Admission, commit_batch, discard_uncommitted
+from rine._mls.admission_state import (
+    Admission,
+    commit_batch,
+    discard_uncommitted,
+    install_batch,
+    publish_batch,
+)
 from rine._mls.failures import is_epoch_conflict
 from rine._mls.sync import sync_mls_group
 from rine._mls.wire import rejected_welcome_recipients
@@ -81,7 +87,6 @@ def _catch_up_and_retry(
         admission.config_dir,
         admission.agent_id,
         admission.group_id,
-        cipher_suite=admission.cipher_suite,
     )
     # Reopened only now, so the handle holds what the sync just adopted.
     discard_uncommitted(admission)
@@ -134,7 +139,7 @@ def _retry_without(
     if not kept:
         return
     try:
-        commit_batch(admission, [a for a, _ in kept], [kp for _, kp in kept])
+        group = publish_batch(admission, [a for a, _ in kept], [kp for _, kp in kept])
     except Exception:
         # The retry is spent. Whatever refused this batch a second time is not
         # something a third attempt would tell us more about.
@@ -147,6 +152,9 @@ def _retry_without(
         for agent_id, _ in kept:
             admission.skip(agent_id, "rejected_by_server")
         return
+    # Outside the try: the server has seated these joiners, so a failure to
+    # install the commit is the caller's, never a rejection.
+    install_batch(admission, group)
     admission.outcomes.extend(MlsAdmissionOutcome(agent_id=a, status="added") for a, _ in kept)
 
 

@@ -3,10 +3,10 @@
 Most version bounds in ``pyproject.toml`` are ordinary caution and belong to
 whoever next edits them. One is not: ``rine-mls`` carries an upper bound because
 this SDK and the Node stack (``@rine-network/mls``, which ``rewrite-file-deps.py``
-publishes as ``^0.1.1``) read and write the *same* on-disk group state, and our
+publishes as ``^0.2.0``) read and write the *same* on-disk group state, and our
 own docs bless a shared config directory between a Python agent and a Node one.
 The two runtimes have to agree on that encoding byte for byte, so an unbounded
-floor would let Python pick up a ``0.2.0`` that changed it while Node refuses
+floor would let Python pick up a ``0.3.0`` that changed it while Node refuses
 that release — a corrupt shared state with no error on either side.
 
 That reasoning is eight lines of comment in ``pyproject.toml`` and, until this

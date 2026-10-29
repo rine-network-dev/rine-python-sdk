@@ -196,7 +196,7 @@ def is_bare_reference(value: str) -> bool:
 
     A blank recipient is deliberately NOT one of them. It names nothing in
     either namespace, and the agent resolver's *"expected a UUID or handle"*
-    says that far better than a hunt through the org's groups ending in *"no
+    says that far better than a hunt through the groups the key can see ending in *"no
     group is called ''"* would.
 
     One reading of :func:`~rine._recipient.classify_reference`, not a fifth
@@ -423,8 +423,8 @@ def _and_the_groups_there_are(lead: str, groups: list[dict[str, Any]]) -> str:
     The empty-field arms are a guard against a wire that contradicts its own
     type, and are worth naming precisely so nobody reads them as a fact about
     groups: ``groups.name`` and ``groups.handle`` are both ``nullable=False``
-    (``src/rine/db/models.py``) and ``GroupRead`` types them ``str``, so no row
-    the server can mint reaches them. What the actor side's ``bob (None)``
+    (``src/rine/db/models/groups.py``) and ``GroupRead`` types them ``str``, so
+    no row the server can mint reaches them. What the actor side's ``bob (None)``
     incident is a precedent for is the SHAPE of the arm — ``.get`` with a
     default does not fire on a key that is present and ``None`` — not for a
     nullability groups do not have (``agents.handle`` genuinely is nullable).
@@ -562,7 +562,7 @@ def group_row_by_local_name(
 
     The server's ``GET /groups?handle=`` matches a *full* ``#name@org`` handle
     only, so a bare ``ops`` — or a sigiled, org-less ``#ops`` — finds nothing
-    there however many groups carry that name. Listing the org's groups and
+    there however many groups carry that name. Listing the groups the key can see and
     running the ladder over them is what lets every group verb take the name a
     caller says out loud.
 
@@ -636,7 +636,7 @@ def refuse_if_a_bare_agent_name(agents: list[dict[str, Any]], name: str) -> None
     :func:`normalize_group_ref` records, and it is worth saying HERE because this
     is the guard the safety argument rests on: a reference the twin does not fold
     the same way is one the twin does not refuse. It is unreachable today — an
-    agent's ``name`` is a DNS slug (``src/rine/api/schemas.py``), so only the
+    agent's ``name`` is a DNS slug (``src/rine/api/schemas_org.py`` ``validate_slug``), so only the
     caller's spelling can carry a folding case, and a caller who types ``STRASSE``
     at an agent named ``strasse`` is refused here and sent to the group ladder on
     the TypeScript side, where nothing answers to it either. Reachability would
@@ -769,8 +769,8 @@ def recipient_group_for_bare_name(groups: list[dict[str, Any]], name: str) -> di
         return match
     raise NotFoundError(
         compose_group_refusal(
-            f"'{name}' {NEITHER_NAMESPACE_LEAD}. A bare name is read as a group this "
-            "org is seated in, and none of them answers to it. An agent is "
+            f"'{name}' {NEITHER_NAMESPACE_LEAD}. A bare name is read as a group you "
+            "hold a seat in, and none of them answers to it. An agent is "
             "addressed in full — its name, an at sign, and its org's domain — "
             "and a group by its whole handle, which is a leading hash and the "
             "same three parts.",

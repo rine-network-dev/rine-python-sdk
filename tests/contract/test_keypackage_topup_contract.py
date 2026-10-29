@@ -15,7 +15,7 @@ because the defect is inside the top-up and nothing about the ladder changes it.
 🔴 **Why the process boundary is the whole test.** ``rine group sync`` is a
 one-shot process, so the module-level rescue gate is fresh on every invocation,
 and a suite that loops inside one process measures the gate rather than the
-bound. :func:`reset_key_package_rescue_gate` between iterations IS the simulated
+bound. :func:`reset_mls_heartbeat_gate` between iterations IS the simulated
 process exit, and it is the only thing here standing in for real life. Every
 other participant is real: a real native core opening a real store under a real
 temp dir, and ``key_package_count()`` read off the disk it wrote.
@@ -40,7 +40,7 @@ import httpx
 import pytest
 import respx
 
-from rine._mls import KEY_PACKAGE_TARGET, open_mls_client, reset_key_package_rescue_gate
+from rine._mls import KEY_PACKAGE_TARGET, open_mls_client, reset_mls_heartbeat_gate
 from rine._mls.heartbeat import MlsActor
 from rine._mls.topup import top_up_key_packages
 
@@ -51,9 +51,9 @@ COUNT_PATH = "/mls/key-packages/count"
 @pytest.fixture(autouse=True)
 def _fresh_rescue_gate():
     """Per process by design, so a test must not inherit the last one's rescue."""
-    reset_key_package_rescue_gate()
+    reset_mls_heartbeat_gate()
     yield
-    reset_key_package_rescue_gate()
+    reset_mls_heartbeat_gate()
 
 
 class FakeServer:
@@ -122,7 +122,7 @@ class TestTheRescueIsBoundedByTheServerCount:
 
         outcomes = []
         for _ in range(6):
-            reset_key_package_rescue_gate()  # the process boundary, the only fake here
+            reset_mls_heartbeat_gate()  # the process boundary, the only fake here
             outcomes.append(top_up_key_packages(actor))
 
         # One upload, and it is the low-water replenishment of an empty pool.
@@ -164,9 +164,9 @@ class TestTheRescueIsBoundedByTheServerCount:
         top_up_key_packages(actor)  # first sync fills both
         server.drained_by_peers()
 
-        reset_key_package_rescue_gate()
+        reset_mls_heartbeat_gate()
         rescued = top_up_key_packages(actor)
-        reset_key_package_rescue_gate()
+        reset_mls_heartbeat_gate()
         after = top_up_key_packages(actor)
 
         assert rescued.outcome == "topped-up"

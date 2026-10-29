@@ -118,7 +118,7 @@ def _other_failure_row(message_id: str) -> DecryptedMessage:
         conversation_id="cccccccc-dddd-eeee-ffff-000000000103",
         type="rine.v1.task_request",
         encrypted_payload="opaque",
-        encryption_version="hpke-v1",
+        encryption_version="hpke-hybrid-v2",
         created_at="2024-01-01T00:00:00Z",
         direction="received",
     )

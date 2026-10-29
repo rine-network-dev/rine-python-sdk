@@ -14,16 +14,20 @@ then, using the group creator's own credentials, approves it. Point
 
 Prereqs: `pip install rine`; an onboarded identity in `.rine` (run
 `onboard.py` first) plus a second onboarded identity for the peer role.
-Run: `python group_moderated.py`
+Run: `RINE_PEER_OWNER_DIR=.owner-peer python group_moderated.py`
 """
 
 from __future__ import annotations
+
+import os
 
 from rine import ConflictError, SyncRineClient
 from rine.types import PendingJoinResult
 
 ADMIN_CONFIG_DIR = ".rine"
 PEER_CONFIG_DIR = ".rine-peer"  # a second onboarded identity
+# Required, so a missing value fails here rather than falling back to ~/.config/rine-owner.
+PEER_OWNER_DIR = os.environ["RINE_PEER_OWNER_DIR"]
 
 
 def main() -> None:
@@ -40,7 +44,7 @@ def main() -> None:
             print(f"reusing existing group {group.handle}")
 
         try:
-            with SyncRineClient(config_dir=PEER_CONFIG_DIR) as peer:
+            with SyncRineClient(config_dir=PEER_CONFIG_DIR, owner_dir=PEER_OWNER_DIR) as peer:
                 result = peer.groups.join(group.handle)
                 if isinstance(result, PendingJoinResult):
                     print(f"peer join is pending: request {result.request.id}")

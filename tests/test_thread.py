@@ -13,19 +13,17 @@ import json
 import httpx
 import respx
 
-from rine._crypto.keys import (
-    generate_agent_keys,
-    save_agent_keys,
-    signing_public_key_to_jwk,
-)
+from rine._crypto.keys import save_agent_keys
 from rine._crypto.message import encrypt_message
-from rine._utils import to_base64url
+from rine.a2a_cleartext import A2A_CLEARTEXT_NOTICE
+from rine.testing import WORLD
 from rine.types import DecryptedMessage, ThreadEntry
 from tests.conftest import recipient_view
 
 API = "https://rine.network"
 AGENT_ID = "00000000-1111-2222-3333-444444444444"  # matches conftest fixtures
 PEER_ID = "99999999-8888-7777-6666-555555555555"
+FORGER_ID = "77777777-6666-5555-4444-333333333333"
 CONVERSATION_ID = "dddddddd-eeee-ffff-0000-111111111111"
 TOKEN = {"access_token": "test-token", "expires_in": 900}
 
@@ -56,7 +54,7 @@ def _mock_no_group_of_that_id(uuid: str) -> None:
     """Answer the group probe a UUID recipient costs, the way the real route answers it.
 
     ``send()`` offers a UUID to this org's groups before the agent namespace
-    By ratified decision: ``GET /groups/{id}`` is org-scoped
+    By ratified decision: ``GET /groups/{id}`` is credential-scoped
     where ``GET /agents/{id}/keys`` is global, so asking the agent side first
     would prefer a stranger's namespace over the caller's own org's. A peer's
     AGENT id names no group, the route 404s, and the send falls through to the
@@ -67,16 +65,11 @@ def _mock_no_group_of_that_id(uuid: str) -> None:
     )
 
 
-def _keys_jwk(keys) -> dict:
-    return {
-        "agent_id": AGENT_ID,
-        "signing_public_key": signing_public_key_to_jwk(keys.signing.public_key),
-        "encryption_public_key": {
-            "kty": "OKP",
-            "crv": "X25519",
-            "x": to_base64url(keys.encryption.public_key),
-        },
-    }
+def _mock_peer_keys() -> None:
+    """Mock ``/agents/{id}/keys`` for the peer with its chain-valid response."""
+    respx.get(f"{API}/agents/{PEER_ID}/keys").mock(
+        return_value=httpx.Response(200, json=WORLD.keys_response(PEER_ID))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -84,11 +77,13 @@ def _keys_jwk(keys) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _build_rows(config_dir: str, peer_keys) -> tuple[list[dict], dict]:
-    """Build a both-sided row set + the agent's own keys JWK for verify.
+def _build_rows(config_dir: str, peer_keys) -> list[dict]:
+    """Build a both-sided row set for a conversation.
 
     Rows: a SENT row (with self-blob), a RECEIVED row (sealed to the agent),
-    and a SENT row with a NULL self-blob (legacy / undecryptable).
+    and a SENT row with a NULL self-blob (legacy / undecryptable). ``peer_keys``
+    are the keys saved under ``PEER_ID`` and so the ones the received row is
+    signed with; the published peer keys are always the world's own.
     """
     from rine._crypto.keys import load_agent_keys
 
@@ -99,7 +94,7 @@ def _build_rows(config_dir: str, peer_keys) -> tuple[list[dict], dict]:
     sent = encrypt_message(
         config_dir,
         AGENT_ID,
-        recipient_view(peer_keys),
+        recipient_view(peer_keys, PEER_ID),
         {"text": "hi peer, the codeword is albatross"},
     )
 
@@ -108,7 +103,7 @@ def _build_rows(config_dir: str, peer_keys) -> tuple[list[dict], dict]:
     # PEER_ID so its signature can be verified, then seal to the agent.
     save_agent_keys(config_dir, PEER_ID, peer_keys)
     received = encrypt_message(
-        config_dir, PEER_ID, recipient_view(my_keys), {"text": "got it, albatross noted"}
+        config_dir, PEER_ID, recipient_view(my_keys, AGENT_ID), {"text": "got it, albatross noted"}
     )
 
     rows = [
@@ -121,7 +116,7 @@ def _build_rows(config_dir: str, peer_keys) -> tuple[list[dict], dict]:
             "direction": "sent",
             "encrypted_payload": sent.encrypted_payload,
             "self_encrypted_payload": sent.self_encrypted_payload,
-            "encryption_version": "hpke-v1",
+            "encryption_version": "hpke-hybrid-v2",
             "sender_handle": "me@myorg.rine.network",
             "created_at": "2024-01-01T00:00:01Z",
         },
@@ -134,7 +129,7 @@ def _build_rows(config_dir: str, peer_keys) -> tuple[list[dict], dict]:
             "direction": "received",
             "encrypted_payload": received.encrypted_payload,
             "self_encrypted_payload": None,
-            "encryption_version": "hpke-v1",
+            "encryption_version": "hpke-hybrid-v2",
             "sender_handle": "peer@myorg.rine.network",
             "created_at": "2024-01-01T00:00:02Z",
         },
@@ -147,33 +142,20 @@ def _build_rows(config_dir: str, peer_keys) -> tuple[list[dict], dict]:
             "direction": "sent",
             "encrypted_payload": "legacy-recipient-only-blob",
             "self_encrypted_payload": None,  # legacy: no self-seal
-            "encryption_version": "hpke-v1",
+            "encryption_version": "hpke-hybrid-v2",
             "sender_handle": "me@myorg.rine.network",
             "created_at": "2024-01-01T00:00:03Z",
         },
     ]
-    return rows, _keys_jwk(my_keys)
+    return rows
 
 
-def _mock_keys(agent_jwk: dict, peer_keys) -> None:
+def _mock_keys() -> None:
     """Mock /agents/{id}/keys for both the agent (self-verify) and peer."""
     respx.get(f"{API}/agents/{AGENT_ID}/keys").mock(
-        return_value=httpx.Response(200, json=agent_jwk)
+        return_value=httpx.Response(200, json=WORLD.keys_response(AGENT_ID))
     )
-    respx.get(f"{API}/agents/{PEER_ID}/keys").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "agent_id": PEER_ID,
-                "signing_public_key": signing_public_key_to_jwk(peer_keys.signing.public_key),
-                "encryption_public_key": {
-                    "kty": "OKP",
-                    "crv": "X25519",
-                    "x": to_base64url(peer_keys.encryption.public_key),
-                },
-            },
-        )
-    )
+    _mock_peer_keys()
 
 
 # ---------------------------------------------------------------------------
@@ -190,21 +172,7 @@ class TestSelfSealOnSend:
         _mock_token()
         _mock_agents()
         _mock_no_group_of_that_id(PEER_ID)
-        peer_keys = generate_agent_keys()
-        respx.get(f"{API}/agents/{PEER_ID}/keys").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "agent_id": PEER_ID,
-                    "signing_public_key": signing_public_key_to_jwk(peer_keys.signing.public_key),
-                    "encryption_public_key": {
-                        "kty": "OKP",
-                        "crv": "X25519",
-                        "x": to_base64url(peer_keys.encryption.public_key),
-                    },
-                },
-            )
-        )
+        _mock_peer_keys()
         post = respx.post(f"{API}/messages").mock(
             return_value=httpx.Response(
                 200,
@@ -215,7 +183,7 @@ class TestSelfSealOnSend:
                     "to_agent_id": PEER_ID,
                     "type": "rine.v1.task_request",
                     "encrypted_payload": "x",
-                    "encryption_version": "hpke-v1",
+                    "encryption_version": "hpke-hybrid-v2",
                     "created_at": "2024-01-01T00:00:00Z",
                 },
             )
@@ -234,21 +202,7 @@ class TestSelfSealOnSend:
         _mock_token()
         _mock_agents()
         _mock_no_group_of_that_id(PEER_ID)
-        peer_keys = generate_agent_keys()
-        respx.get(f"{API}/agents/{PEER_ID}/keys").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "agent_id": PEER_ID,
-                    "signing_public_key": signing_public_key_to_jwk(peer_keys.signing.public_key),
-                    "encryption_public_key": {
-                        "kty": "OKP",
-                        "crv": "X25519",
-                        "x": to_base64url(peer_keys.encryption.public_key),
-                    },
-                },
-            )
-        )
+        _mock_peer_keys()
         post = respx.post(f"{API}/messages").mock(
             return_value=httpx.Response(
                 200,
@@ -259,7 +213,7 @@ class TestSelfSealOnSend:
                     "to_agent_id": PEER_ID,
                     "type": "rine.v1.task_request",
                     "encrypted_payload": "x",
-                    "encryption_version": "hpke-v1",
+                    "encryption_version": "hpke-hybrid-v2",
                     "created_at": "2024-01-01T00:00:00Z",
                 },
             )
@@ -276,7 +230,7 @@ class TestSelfSealOnSend:
         """A 1:1 reply POSTs self_encrypted_payload (async)."""
         _mock_token()
         _mock_agents()
-        peer_keys = generate_agent_keys()
+        _mock_peer_keys()
         original_id = "bbbb1111-0000-0000-0000-000000000001"
         # reply() fetches the original to recover the peer (from_agent_id).
         respx.get(f"{API}/messages/{original_id}").mock(
@@ -289,22 +243,8 @@ class TestSelfSealOnSend:
                     "to_agent_id": AGENT_ID,
                     "type": "rine.v1.task_request",
                     "encrypted_payload": "x",
-                    "encryption_version": "hpke-v1",
+                    "encryption_version": "hpke-hybrid-v2",
                     "created_at": "2024-01-01T00:00:00Z",
-                },
-            )
-        )
-        respx.get(f"{API}/agents/{PEER_ID}/keys").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "agent_id": PEER_ID,
-                    "signing_public_key": signing_public_key_to_jwk(peer_keys.signing.public_key),
-                    "encryption_public_key": {
-                        "kty": "OKP",
-                        "crv": "X25519",
-                        "x": to_base64url(peer_keys.encryption.public_key),
-                    },
                 },
             )
         )
@@ -318,7 +258,7 @@ class TestSelfSealOnSend:
                     "to_agent_id": PEER_ID,
                     "type": "rine.v1.task_response",
                     "encrypted_payload": "x",
-                    "encryption_version": "hpke-v1",
+                    "encryption_version": "hpke-hybrid-v2",
                     "created_at": "2024-01-01T00:00:04Z",
                 },
             )
@@ -353,9 +293,8 @@ class TestGetConversationMessages:
         """Sent rows decrypt from the self-blob, received from the recipient blob (async)."""
         _mock_token()
         _mock_agents()
-        peer_keys = generate_agent_keys()
-        rows, agent_jwk = _build_rows(tmp_config_dir, peer_keys)
-        _mock_keys(agent_jwk, peer_keys)
+        rows = _build_rows(tmp_config_dir, WORLD.keys(PEER_ID))
+        _mock_keys()
         _mock_thread_endpoint(rows)
 
         msgs = await async_client.get_conversation_messages(CONVERSATION_ID)
@@ -373,39 +312,12 @@ class TestGetConversationMessages:
         await async_client.close()
 
     @respx.mock
-    async def test_async_classical_self_blob_on_hybrid_row_decrypts(
-        self, async_client, tmp_config_dir
-    ):
-        """A classical self-blob on a ``hpke-hybrid-v1`` sent row still self-reads.
-
-        The row is tagged hybrid (recipient negotiation) but the self-blob is a
-        CLASSICAL ``hpke-v1`` seal; the swap pins the version to the blob's actual
-        scheme instead of degrading the recoverable row to [unavailable].
-        """
-        _mock_token()
-        _mock_agents()
-        peer_keys = generate_agent_keys()
-        rows, agent_jwk = _build_rows(tmp_config_dir, peer_keys)
-        _mock_keys(agent_jwk, peer_keys)
-        # The server tagged the row hybrid (sealed to a PQ-capable recipient),
-        # but the Python SDK only ever self-seals classical.
-        rows[0]["encryption_version"] = "hpke-hybrid-v1"
-        _mock_thread_endpoint(rows)
-
-        msgs = await async_client.get_conversation_messages(CONVERSATION_ID)
-
-        assert msgs[0].decrypt_error is None
-        assert json.loads(msgs[0].plaintext)["text"].startswith("hi peer")
-        await async_client.close()
-
-    @respx.mock
     def test_sync_decrypts_both_directions_and_degrades(self, sync_client, tmp_config_dir):
         """Sent rows decrypt from the self-blob, received from the recipient blob (sync)."""
         _mock_token()
         _mock_agents()
-        peer_keys = generate_agent_keys()
-        rows, agent_jwk = _build_rows(tmp_config_dir, peer_keys)
-        _mock_keys(agent_jwk, peer_keys)
+        rows = _build_rows(tmp_config_dir, WORLD.keys(PEER_ID))
+        _mock_keys()
         _mock_thread_endpoint(rows)
 
         msgs = sync_client.get_conversation_messages(CONVERSATION_ID)
@@ -425,9 +337,8 @@ class TestThread:
         """Both turns decrypt + render; undecryptable rows are [unavailable] (async)."""
         _mock_token()
         _mock_agents()
-        peer_keys = generate_agent_keys()
-        rows, agent_jwk = _build_rows(tmp_config_dir, peer_keys)
-        _mock_keys(agent_jwk, peer_keys)
+        rows = _build_rows(tmp_config_dir, WORLD.keys(PEER_ID))
+        _mock_keys()
         _mock_thread_endpoint(rows)
 
         entries = await async_client.thread(CONVERSATION_ID)
@@ -453,9 +364,8 @@ class TestThread:
         """Both turns decrypt + render; undecryptable rows are [unavailable] (sync)."""
         _mock_token()
         _mock_agents()
-        peer_keys = generate_agent_keys()
-        rows, agent_jwk = _build_rows(tmp_config_dir, peer_keys)
-        _mock_keys(agent_jwk, peer_keys)
+        rows = _build_rows(tmp_config_dir, WORLD.keys(PEER_ID))
+        _mock_keys()
         _mock_thread_endpoint(rows)
 
         entries = sync_client.thread(CONVERSATION_ID)
@@ -494,32 +404,11 @@ class TestThread:
         """
         _mock_token()
         _mock_agents()
-        peer_keys = generate_agent_keys()
-        rows, agent_jwk = _build_rows(tmp_config_dir, peer_keys)
-
-        # Self-verify keys are honest; the PEER's published signing key is a
-        # DIFFERENT key than the one that actually signed the received row, so
+        # The received row is signed with a forger's key while its envelope names
+        # PEER_ID; the published PEER_ID keys are the world's honest ones, so
         # verification returns "invalid" → CryptoError → degrade.
-        forged_keys = generate_agent_keys()
-        respx.get(f"{API}/agents/{AGENT_ID}/keys").mock(
-            return_value=httpx.Response(200, json=agent_jwk)
-        )
-        respx.get(f"{API}/agents/{PEER_ID}/keys").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "agent_id": PEER_ID,
-                    "signing_public_key": signing_public_key_to_jwk(
-                        forged_keys.signing.public_key
-                    ),
-                    "encryption_public_key": {
-                        "kty": "OKP",
-                        "crv": "X25519",
-                        "x": to_base64url(peer_keys.encryption.public_key),
-                    },
-                },
-            )
-        )
+        rows = _build_rows(tmp_config_dir, WORLD.keys(FORGER_ID))
+        _mock_keys()
         _mock_thread_endpoint(rows)
 
         entries = await async_client.thread(CONVERSATION_ID)
@@ -552,6 +441,62 @@ class TestThread:
 
         assert route.calls[0].request.headers.get("x-rine-agent") == PEER_ID
         await async_client.close()
+
+
+class TestThreadA2aCleartext:
+    """A cleartext A2A turn says it was not end-to-end encrypted; others are unchanged."""
+
+    @staticmethod
+    def _cleartext_row() -> dict:
+        return {
+            "id": "11111111-0000-0000-0000-0000000000aa",
+            "conversation_id": CONVERSATION_ID,
+            "from_agent_id": PEER_ID,
+            "to_agent_id": AGENT_ID,
+            "type": "rine.v1.a2a_message",
+            "direction": "received",
+            # One text part "plain" as the server serves it: unpadded base64url of the parts' JSON.
+            "encrypted_payload": "W3sidGV4dCI6ICJwbGFpbiJ9XQ",
+            "self_encrypted_payload": None,
+            "encryption_version": "none",
+            "sender_handle": "external@myorg.rine.network",
+            "created_at": "2024-01-01T00:00:04Z",
+        }
+
+    @respx.mock
+    async def test_async_thread_when_a_turn_is_a2a_cleartext_then_its_text_leads_with_the_notice(
+        self, async_client, tmp_config_dir
+    ):
+        """The async thread leads the cleartext turn with the notice and leaves the rest alone."""
+        _mock_token()
+        _mock_agents()
+        rows = _build_rows(tmp_config_dir, WORLD.keys(PEER_ID))
+        _mock_keys()
+        _mock_thread_endpoint([*rows, self._cleartext_row()])
+
+        entries = await async_client.thread(CONVERSATION_ID)
+
+        assert entries[3].text == f'[{A2A_CLEARTEXT_NOTICE}] [{{"text":"plain"}}]'
+        assert entries[3].verification_status != "verified"
+        assert entries[1].text == "got it, albatross noted"
+        await async_client.close()
+
+    @respx.mock
+    def test_sync_thread_when_a_turn_is_a2a_cleartext_then_its_text_leads_with_the_notice(
+        self, sync_client, tmp_config_dir
+    ):
+        """The sync thread leads the cleartext turn with the notice and leaves the rest alone."""
+        _mock_token()
+        _mock_agents()
+        rows = _build_rows(tmp_config_dir, WORLD.keys(PEER_ID))
+        _mock_keys()
+        _mock_thread_endpoint([*rows, self._cleartext_row()])
+
+        entries = sync_client.thread(CONVERSATION_ID)
+
+        assert entries[3].text.startswith(f"[{A2A_CLEARTEXT_NOTICE}] ")
+        assert entries[3].verification_status != "verified"
+        assert entries[1].text == "got it, albatross noted"
 
 
 class TestRenderTextContentType:

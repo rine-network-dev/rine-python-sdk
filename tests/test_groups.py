@@ -8,13 +8,10 @@ import httpx
 import pytest
 import respx
 
-from rine._crypto.keys import (
-    encryption_public_key_to_jwk,
-    generate_agent_keys,
-    save_agent_keys,
-)
+from rine._crypto.keys import save_agent_keys
 from rine.errors import AuthorizationError, ConflictError, NotFoundError
 from rine.format import group_is_mls
+from rine.testing import WORLD
 from rine.types import (
     GroupRead,
     InviteResult,
@@ -211,18 +208,9 @@ _OPEN_INVITE_PAYLOAD = {
 
 def _mock_invitee_keys(tmp_config_dir: str) -> None:
     """Mock the recipient (invitee) key endpoint so ``send`` can seal a DM."""
-    keys = generate_agent_keys()
-    save_agent_keys(tmp_config_dir, OTHER_AGENT_ID, keys)
-    enc_jwk = encryption_public_key_to_jwk(keys.encryption.public_key)
+    save_agent_keys(tmp_config_dir, OTHER_AGENT_ID, WORLD.keys(OTHER_AGENT_ID))
     respx.get(f"https://rine.network/agents/{OTHER_AGENT_ID}/keys").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "agent_id": OTHER_AGENT_ID,
-                "encryption_public_key": enc_jwk,
-                "signing_public_key": {"kty": "OKP", "crv": "Ed25519", "x": "AAAA"},
-            },
-        )
+        return_value=httpx.Response(200, json=WORLD.keys_response(OTHER_AGENT_ID))
     )
 
 
@@ -230,7 +218,7 @@ def _mock_no_group_of_that_id(uuid: str) -> None:
     """Answer the group probe a UUID recipient costs, the way the real route answers it.
 
     ``send()`` offers a UUID to this org's groups before the agent namespace
-    By ratified decision: ``GET /groups/{id}`` is org-scoped
+    By ratified decision: ``GET /groups/{id}`` is credential-scoped
     where ``GET /agents/{id}/keys`` is global, so asking the agent side first
     would prefer a stranger's namespace over the caller's own org's. An
     invitee's AGENT id names no group, the route 404s, and the send falls
@@ -621,9 +609,9 @@ class TestSyncGroupsList:
 
     @respx.mock
     def test_list_says_which_of_this_orgs_agents_are_seated_in_each_group(self, sync_client):
-        """From the SDK's side: ``GET /groups`` is ORG-scoped.
+        """From the SDK's side: ``GET /groups`` is credential-scoped.
 
-        A group is listed whenever *any* agent of the org is in it, so the row
+        With an org key a group is listed whenever *any* agent of the org is in it, so the row
         alone never said whether the agent about to post was one of them. It says
         so now, and — as with ``conversation_id`` — a field this model does not
         declare is one pydantic silently drops before any surface can render it.
@@ -675,7 +663,7 @@ class TestSyncGroupsMembers:
     ):
         """The second field. A marker, never a filter.
 
-        The read is authorised for the org rather than for one agent, so it also
+        The read is authorised for the credential's scope rather than for one agent, so it also
         answers for a group the acting agent is not seated in. ``is_own_org``
         tells the two kinds of row apart; both kinds come back, because the agent
         needs to see who it is talking to as much as who it can talk as.

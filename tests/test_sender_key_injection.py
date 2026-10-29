@@ -34,19 +34,15 @@ import pytest
 import respx
 
 from rine._constants import MessageType
-from rine._crypto._agent_keys import recipient_keys_from_response
-from rine._crypto.keys import (
-    generate_agent_keys,
-    load_agent_keys,
-    public_keys_body,
-    save_agent_keys,
-)
+from rine._crypto.keys import load_agent_keys, save_agent_keys
 from rine._crypto.message import encrypt_message
 from rine._crypto.sender_keys import generate_sender_key
 from rine._crypto.sender_keys_helpers import load_sender_key_states, save_sender_key_state
 from rine._http import SyncHttpClient
 from rine._sender_key_ops import get_or_create_sender_key_sync
 from rine._utils import to_base64url
+from rine.testing import WORLD
+from tests.conftest import recipient_view
 
 API = "https://rine.network"
 #: Any agent that can DM the reader. It never has to be a member to send the DM.
@@ -78,9 +74,8 @@ def foreign_config_dir(tmp_path):
 
 def _agent(config_dir: str, agent_id: str) -> dict:
     """Mint one agent's keys into *config_dir* and return their published form."""
-    keys = generate_agent_keys()
-    save_agent_keys(config_dir, agent_id, keys)
-    return public_keys_body(keys)
+    save_agent_keys(config_dir, agent_id, WORLD.keys(agent_id))
+    return WORLD.keys_response(agent_id)
 
 
 def _distribution_row(
@@ -97,10 +92,11 @@ def _distribution_row(
     sender's sole control is ``sender_agent_id``, which lives inside the
     plaintext and is what this file is about.
     """
+    recipient = recipient_view(load_agent_keys(reader_dir, reader_id), reader_id)
     sealed = encrypt_message(
         foreign_dir,
         signer_id,
-        recipient_keys_from_response(public_keys_body(load_agent_keys(reader_dir, reader_id))),
+        recipient,
         {
             "group_id": GROUP_ID,
             "sender_key_id": ARRIVING_KEY_ID,

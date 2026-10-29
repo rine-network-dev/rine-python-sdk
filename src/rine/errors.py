@@ -5,6 +5,9 @@ All errors include three components: what failed, why, and what to try.
 
 from __future__ import annotations
 
+import json
+from enum import StrEnum
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Literal, Protocol
 
 # Safe as a module-level import in the module every other one imports: ``format``
@@ -13,6 +16,8 @@ from rine.format import _join_lines, key_package_top_up_line
 
 if TYPE_CHECKING:
     from rine._group_recovery import KeyPackageTopUp
+    from rine._mls.binding import EscrowGapReason
+    from rine._mls.escrow_gap import EscrowLoss
 
 
 class RineError(Exception):
@@ -36,14 +41,101 @@ class RineApiError(RineError):
 
 
 class AuthenticationError(RineApiError):
-    """401 — invalid or missing credentials.
+    """401 — the token request or the token was refused.
 
-    Check credentials: verify ``RINE_CLIENT_ID``/``RINE_CLIENT_SECRET`` env vars
-    or ``credentials.json`` in your config directory.
+    Check the identity this client acts as: its ``profiles.json`` entry in the
+    config directory, and the key files that entry names (``keys/<agent>/`` for an
+    agent, ``root.key`` in the owner directory for the org).
     """
 
     def __init__(self, detail: str = "Authentication failed", raw: object = None) -> None:
         super().__init__(401, detail, raw)
+
+
+class RevokedScope(StrEnum):
+    """Which principal the server named when it refused a revoked caller."""
+
+    AGENT = "agent"
+    BRANCH = "branch"
+
+
+class PrincipalRevokedError(AuthenticationError):
+    """401 — the server refused the caller because its agent or its branch is revoked.
+
+    Retrying cannot help and the credentials are not at fault: the principal itself
+    was revoked. The server names the scope on a bearer route (always) and on the token
+    mint (only once the key assertion verified, so the answer never reveals a
+    revocation to a stranger).
+
+    Args:
+        scope: Whether the agent or the branch it belongs to is revoked.
+        detail: Human-readable description.
+        raw: Optional raw response body.
+    """
+
+    def __init__(
+        self,
+        scope: RevokedScope,
+        detail: str = "The principal is revoked",
+        raw: object = None,
+    ) -> None:
+        """Build the error from the scope the server named."""
+        self.scope = scope
+        super().__init__(detail, raw)
+
+
+#: The wire code naming a revoked principal, as the ``error`` key on a bearer route and
+#: as the ``reason`` key on the token mint (whose ``error`` is ``invalid_client``).
+def revoked_code(scope: RevokedScope) -> str:
+    """The wire code naming a revoked ``scope``; the one place the two spellings are made."""
+    return f"{scope.value}_revoked"
+
+
+_REVOKED_CODES = {revoked_code(scope): scope for scope in RevokedScope}
+
+
+def _error_body(raw: object) -> dict[str, object] | None:
+    """The JSON object a raw response body holds, or ``None`` for anything else."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def revoked_scope(raw: object) -> RevokedScope | None:
+    """The revoked scope a 401 response body names, or ``None`` for any other refusal."""
+    body = _error_body(raw)
+    if body is None:
+        return None
+    code = body.get("reason") if body.get("error") == "invalid_client" else body.get("error")
+    return _REVOKED_CODES.get(code) if isinstance(code, str) else None
+
+
+#: The ``reason`` the token mint adds to ``invalid_client`` once the assertion's signature
+#: verified but its time window did not: the caller's clock is off.
+CLOCK_SKEW_REASON = "clock_skew"
+
+
+def names_clock_skew(raw: object) -> bool:
+    """Whether a raw token-mint refusal body says the caller's clock is outside the window."""
+    body = _error_body(raw)
+    return (
+        body is not None
+        and body.get("error") == "invalid_client"
+        and body.get("reason") == CLOCK_SKEW_REASON
+    )
+
+
+def revoked_error(status: int, detail: str, raw: object) -> PrincipalRevokedError | None:
+    """The typed error for a 401 whose body names a revoked principal, else ``None``.
+
+    Only a 401 is a revocation refusal: the same body on any other status is not one.
+    """
+    scope = revoked_scope(raw) if status == HTTPStatus.UNAUTHORIZED else None
+    return None if scope is None else PrincipalRevokedError(scope, detail, raw)
 
 
 class AuthorizationError(RineApiError):
@@ -572,10 +664,13 @@ WELCOME_REFUSED_CODE = "RINE_WELCOME_REFUSED"
 #:   leaf in the joined tree.
 #: * ``state_would_be_overwritten`` — this agent holds local state for that group
 #:   id and the roster could not be read, so nothing corroborates spending it.
+#: * ``peer_not_admitted`` — the tree holds a member this agent could not verify, so
+#:   the Welcome never opens.
 WelcomeRefusalReason = Literal[
     "group_id_mismatch",
     "roster_uncorroborated",
     "state_would_be_overwritten",
+    "peer_not_admitted",
 ]
 
 
@@ -587,6 +682,14 @@ class MlsWelcomeRefusedError(CryptoError):
     :class:`MlsError`: the MLS core did not raise it, and
     :func:`rine._mls.failures.is_recoverable_mls_failure` must answer ``False``
     or the refusal would be retried away instead of surfaced.
+
+    Two kinds of verdict use this error. Most reasons are the substitution
+    guard's verdict about who minted a Welcome; retrying the join does not
+    change them. Reason ``peer_not_admitted`` is different: the group's tree
+    holds a member the server no longer vouches for. The Welcome install, the
+    external join and the seat retake all raise it, and it clears once any
+    member reclaims that seat with ``rine group resume-admission --reclaim``;
+    then repeat the join.
 
     It **raises** rather than logging, and both stacks owe that: a refusal that
     is loud on one stack and a warning on the other is a defect a user only ever
@@ -611,6 +714,84 @@ class MlsWelcomeRefusedError(CryptoError):
         self.group_id = group_id
         self.reason: WelcomeRefusalReason = reason
         super().__init__(detail)
+
+
+#: The stable code the escrow-gap refusal carries, shared with ``rine-core``'s
+#: ``ESCROW_GAP_CODE`` (``rine-core/src/errors.ts``).
+ESCROW_GAP_CODE = "mls_escrow_gap"
+
+
+class EscrowGapError(CryptoError):
+    """A send at an epoch whose read escrow can never exist.
+
+    The core reported the epoch as a gap (``reason``) and the drain filed a marker
+    before saving, so a message sent at it would be unreadable to the org after a
+    recovery. Raised instead of sending; a later epoch sends normally. A
+    ``too_many_leaves`` gap is retried once after the orphaned leaves are reclaimed
+    before this reaches the caller.
+
+    Args:
+        group_id: The group the send was for.
+        epoch: The epoch with no escrow.
+        reason: The ``EscrowGapReason`` or ``EscrowLoss`` the marker records.
+    """
+
+    code = ESCROW_GAP_CODE
+
+    def __init__(self, group_id: str, epoch: int, reason: EscrowGapReason | EscrowLoss) -> None:
+        """Build the refusal for one gap epoch."""
+        self.group_id = group_id
+        self.epoch = epoch
+        self.reason = reason
+        super().__init__(
+            f"group {group_id} epoch {epoch} has no org read escrow ({reason.value}), so a "
+            "message sent now would be unreadable to the org after a recovery. Wait for "
+            "the next epoch (any commit) and send again."
+        )
+
+
+class OrgMismatchError(CryptoError):
+    """The server names a different org than the one this profile was created under.
+
+    Raised by ``whoami()`` before anything is trusted: a server that answers with
+    another org's id is either misconfigured or an impersonation, and every key
+    pin in this profile belongs to the org it recorded.
+
+    Args:
+        local_org_id: The org id stored in the local profile.
+        server_org_id: The org id the server returned.
+    """
+
+    def __init__(self, local_org_id: str, server_org_id: str) -> None:
+        """Build the refusal for one org-id disagreement."""
+        self.local_org_id = local_org_id
+        self.server_org_id = server_org_id
+        super().__init__(
+            f"This profile belongs to org {local_org_id}, but the server answered as org "
+            f"{server_org_id}. Check the API URL and the profile name; nothing was changed."
+        )
+
+
+class AgentIdMismatchError(CryptoError):
+    """The server created an agent under a different id than the one the client minted.
+
+    The agent id is bound into the keys and certificates the client built before
+    the request, so a different id makes all of them unusable. Nothing was saved.
+
+    Args:
+        minted_id: The id the client generated and sent.
+        server_id: The id the server returned.
+    """
+
+    def __init__(self, minted_id: str, server_id: str) -> None:
+        """Build the refusal for one agent-id disagreement."""
+        self.minted_id = minted_id
+        self.server_id = server_id
+        super().__init__(
+            f"The server created the agent as {server_id}, but this client minted {minted_id}. "
+            "The keys were bound to the minted id, so none were saved and no profile was "
+            "written. Retry the create; if it repeats, report it."
+        )
 
 
 class SpiffeVerificationError(RineError):
@@ -667,6 +848,9 @@ def raise_for_status(status: int, detail: str, raw: object = None) -> None:
     Raises:
         RineApiError: Subclass matching the status code.
     """
+    revoked = revoked_error(status, detail, raw)
+    if revoked is not None:
+        raise revoked
     cls = _STATUS_MAP.get(status)
     if cls:
         raise cls(detail=detail, raw=raw)

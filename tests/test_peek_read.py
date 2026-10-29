@@ -23,15 +23,10 @@ import respx
 
 from rine import RineClient, SyncRineClient
 from rine._actor import AGENT_HEADER
-from rine._constants import PEEK_HEADER
-from rine._crypto.keys import (
-    encryption_public_key_to_jwk,
-    generate_agent_keys,
-    load_agent_keys,
-    save_agent_keys,
-    signing_public_key_to_jwk,
-)
+from rine._constants import PEEK_HEADER, EncryptionVersion
+from rine._crypto.keys import load_agent_keys, make_kid, save_agent_keys
 from rine._crypto.message import encrypt_message
+from rine.testing import WORLD
 from tests.conftest import recipient_view
 
 API = "https://rine.network"
@@ -88,22 +83,12 @@ def _mock_readable_dm(tmp_config_dir: str, agent_id: str, sender_id: str, payloa
     exercised against a row that really decrypts — a wire-only test would pass
     on a client that sent the header and then dropped the plaintext.
     """
-    sender_keys = generate_agent_keys()
-    save_agent_keys(tmp_config_dir, sender_id, sender_keys)
-    recipient = recipient_view(load_agent_keys(tmp_config_dir, agent_id))
+    save_agent_keys(tmp_config_dir, sender_id, WORLD.keys(sender_id))
+    recipient = recipient_view(load_agent_keys(tmp_config_dir, agent_id), agent_id)
     sealed = encrypt_message(tmp_config_dir, sender_id, recipient, payload)
 
     respx.get(f"{API}/agents/{sender_id}/keys").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "agent_id": sender_id,
-                "encryption_public_key": encryption_public_key_to_jwk(
-                    sender_keys.encryption.public_key
-                ),
-                "signing_public_key": signing_public_key_to_jwk(sender_keys.signing.public_key),
-            },
-        )
+        return_value=httpx.Response(200, json=WORLD.keys_response(sender_id))
     )
     respx.get(f"{API}/messages/{MESSAGE_ID}").mock(
         return_value=httpx.Response(
@@ -128,8 +113,8 @@ def _mock_unopenable_dm(sender_id: str, agent_id: str) -> respx.Route:
                 sender_id,
                 agent_id,
                 payload="bm90LWFuLWVudmVsb3Bl",
-                version="hpke-v1",
-                kid=f"rine:{sender_id}",
+                version=EncryptionVersion.HPKE_HYBRID_V2,
+                kid=make_kid(sender_id, 0),
             ),
         )
     )

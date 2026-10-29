@@ -2,7 +2,7 @@
 
 The wheel has two surfaces and each has exactly one owner in this SDK:
 ``rine._mls.binding`` owns the MLS group surface, and this module owns the raw
-post-quantum primitives the 1:1 ``hpke-hybrid-v1`` DM envelope is built from.
+post-quantum primitives the 1:1 ``hpke-hybrid-v2`` DM envelope is built from.
 They are separate files rather than one because ``rine._mls`` pulls in the whole
 group stack on import, and the DM path must not.
 
@@ -34,11 +34,15 @@ PRIVATE_KEY_SIZE: int = rine_mls.ML_KEM768_PRIVATE_KEY_SIZE
 CIPHERTEXT_SIZE: int = rine_mls.ML_KEM768_CIPHERTEXT_SIZE
 SHARED_SECRET_SIZE: int = rine_mls.ML_KEM768_SHARED_SECRET_SIZE
 
+#: The 64-byte ``d||z`` seed :func:`key_pair_from_seed` expands.
+SEED_SIZE: int = rine_mls.ML_KEM768_SEED_SIZE
+
 #: Raised by the wheel for a malformed key or ciphertext. A subclass of the MLS
 #: core's base error, so it carries a ``code`` like every other core failure.
 MlKemError = rine_mls.MlKemError
 
 generate_key_pair = rine_mls.ml_kem768_generate_key_pair
+key_pair_from_seed = rine_mls.ml_kem768_key_pair_from_seed
 public_key = rine_mls.ml_kem768_public_key
 encapsulate = rine_mls.ml_kem768_encapsulate
 decapsulate = rine_mls.ml_kem768_decapsulate
@@ -47,10 +51,12 @@ __all__ = [
     "CIPHERTEXT_SIZE",
     "PRIVATE_KEY_SIZE",
     "PUBLIC_KEY_SIZE",
+    "SEED_SIZE",
     "SHARED_SECRET_SIZE",
     "MlKemError",
     "decapsulate",
     "encapsulate",
     "generate_key_pair",
+    "key_pair_from_seed",
     "public_key",
 ]

@@ -20,11 +20,14 @@ The TypeScript twin is ``mlsHeartbeat`` (``rine-core/src/mls-heartbeat.ts``).
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Literal
 
+from rine._constants import MLS_HEARTBEAT_MIN_INTERVAL_S
 from rine._logging import logger
+from rine._mls.actor import MlsActor
+from rine._mls.escrow_sweep import sweep_pending_escrow
 from rine._mls.key_packages import ensure_mls_key_packages
+from rine._mls.topup import _rescued_this_process
 
 #: How a heartbeat treats the per-process floor.
 #:
@@ -37,26 +40,12 @@ from rine._mls.key_packages import ensure_mls_key_packages
 #: added later has to answer the question rather than inherit an answer.
 MlsHeartbeatPace = Literal["gated", "forced"]
 
-#: Shortest gap between two gated heartbeats for one (config dir, agent) in one
-#: process. Keyed on the agent and not on the group because the pool is
-#: per-agent: ten groups draw down one inventory.
-MLS_HEARTBEAT_MIN_INTERVAL_S = 60.0
+# ``MLS_HEARTBEAT_MIN_INTERVAL_S`` (``rine._constants``) is the shortest gap between
+# two gated heartbeats for one (config dir, agent) in one process. Keyed on the
+# agent and not on the group because the pool is per-agent: ten groups draw down
+# one inventory. The escrow retry schedule uses the same interval as its base.
 
 _last_heartbeat: dict[tuple[str, str], float] = {}
-
-
-@dataclass(frozen=True)
-class MlsActor:
-    """The agent an MLS operation acts as, and the client it acts through."""
-
-    client: Any
-    """Sync HTTP client."""
-
-    config_dir: str
-    """Config directory path."""
-
-    agent_id: str
-    """The acting agent's UUID."""
 
 
 def mls_heartbeat(actor: MlsActor, pace: MlsHeartbeatPace) -> None:
@@ -79,6 +68,12 @@ def mls_heartbeat(actor: MlsActor, pace: MlsHeartbeatPace) -> None:
     batch of commits issued back to back still does not each start a top-up
     while the first is in flight.
 
+    The same beat uploads the pending escrow files of groups this agent no
+    longer holds (:func:`rine._mls.escrow_sweep.sweep_pending_escrow`), so a
+    process's first MLS operation is also its startup sweep. A failed sweep leaves
+    its files for the next beat and does not lift the floor, which guards the
+    key-package top-up.
+
     Best-effort by contract: it runs behind work that has already succeeded, so
     it never raises.
 
@@ -92,16 +87,47 @@ def mls_heartbeat(actor: MlsActor, pace: MlsHeartbeatPace) -> None:
     if pace == "gated" and previous is not None and now - previous < MLS_HEARTBEAT_MIN_INTERVAL_S:
         return
     _last_heartbeat[key] = now
+    _settle_rotation_best_effort(actor)
     try:
         ensure_mls_key_packages(actor.client, actor.config_dir, actor.agent_id)
     except Exception:
         _last_heartbeat.pop(key, None)
         logger.debug("MLS KeyPackage heartbeat deferred", exc_info=True)
+    try:
+        sweep_pending_escrow(actor)
+    except Exception:
+        logger.debug("MLS escrow sweep deferred", exc_info=True)
+
+
+def _settle_rotation_best_effort(actor: MlsActor) -> None:
+    """Bring KeyPackages and seats up to the key on disk before the top-up counts them.
+
+    A rotation that this host has not settled replaces the whole pool, so the
+    top-up that follows never trusts a local count that still includes private
+    halves of the previous generation. Imported here because the settlement opens
+    groups, and opening a group runs this heartbeat.
+    """
+    from rine._mls.seat_sweep import settle_rotation
+
+    try:
+        settle_rotation(actor, background=True)
+    except Exception:
+        logger.debug("MLS rotation settlement deferred", exc_info=True)
 
 
 def reset_mls_heartbeat_gate() -> None:
-    """Forget every gate. Test-only: a process boundary is what clears it in life."""
+    """Forget the heartbeat floor, the key-package rescue mark and the catch-up floor.
+
+    Test-only: a process boundary is what clears them in life. Like its TypeScript
+    twin it is the one seam that forgets the MLS rate gates, so no gate has a reset
+    of its own. The catch-up is imported here because it runs a sync, and a sync
+    runs this heartbeat.
+    """
+    from rine._mls.catchup import _last_attempt
+
     _last_heartbeat.clear()
+    _rescued_this_process.clear()
+    _last_attempt.clear()
 
 
 __all__ = [

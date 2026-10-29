@@ -12,11 +12,8 @@ from __future__ import annotations
 import pytest
 
 from rine._mls import catchup
-from rine._mls.catchup import (
-    MLS_CATCHUP_MIN_INTERVAL_S,
-    catch_up_mls_group,
-    reset_mls_catch_up_gate,
-)
+from rine._mls.catchup import MLS_CATCHUP_MIN_INTERVAL_S, catch_up_mls_group
+from rine._mls.heartbeat import reset_mls_heartbeat_gate
 from rine._mls.sync import MlsSyncResult
 
 CONFIG_DIR = "/tmp/rine-catchup"
@@ -39,14 +36,14 @@ def synced(monkeypatch):
     """Every call the gate let through."""
     calls: list[tuple] = []
 
-    def _sync(client, config_dir, agent_id, group_id, *, cipher_suite=None):
+    def _sync(client, config_dir, agent_id, group_id, **_kwargs):
         calls.append((config_dir, agent_id, group_id))
         return MlsSyncResult(epoch=7, processed=3, evicted=False)
 
     monkeypatch.setattr(catchup, "sync_mls_group", _sync)
-    reset_mls_catch_up_gate()
+    reset_mls_heartbeat_gate()
     yield calls
-    reset_mls_catch_up_gate()
+    reset_mls_heartbeat_gate()
 
 
 def test_first_read_when_nothing_cached_then_catches_up(clock, synced):
@@ -101,11 +98,11 @@ def test_catchup_when_the_sync_fails_then_does_not_raise(clock, monkeypatch):
         raise RuntimeError("the server is down")
 
     monkeypatch.setattr(catchup, "sync_mls_group", _boom)
-    reset_mls_catch_up_gate()
+    reset_mls_heartbeat_gate()
 
     # It runs behind a read that already succeeded, so a failure here must leave
     # that read exactly where it was: nothing raised, and nothing reported —
     # there is no work to report, because none of it landed.
     assert catch_up_mls_group(None, CONFIG_DIR, AGENT, GROUP) is None
     assert attempts == ["tried"]
-    reset_mls_catch_up_gate()
+    reset_mls_heartbeat_gate()

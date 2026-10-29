@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import datetime
+from enum import StrEnum
 from typing import Any, Generic, Literal, TypeVar
 from uuid import UUID
 
 from pydantic import BaseModel, Field, PrivateAttr
+
+from rine._constants import EncryptionVersion
 
 T = TypeVar("T")
 
@@ -66,10 +69,32 @@ class AgentRead(BaseModel):
     identity_error: str | None = None
 
 
+class WhoAmIKind(StrEnum):
+    """The kinds of principal ``GET /whoami`` names, spelled as the server does."""
+
+    ORG = "org"
+    BRANCH = "branch"
+    AGENT = "agent"
+    ORG_READER = "org_reader"
+    BRANCH_READER = "branch_reader"
+
+
+class WhoAmIPrincipal(BaseModel):
+    """Who the bearer token speaks for; ``branch`` and ``agent_id`` where the kind has them."""
+
+    kind: WhoAmIKind
+    branch: str | None = None
+    agent_id: UUID | None = None
+
+
 class WhoAmI(BaseModel):
-    """Identity information for the current org and agents."""
+    """Identity information for the caller: its org, its principal and the agents it can see.
+
+    A narrower principal sees only its own agents and counts, and no operator contact.
+    """
 
     org: OrgRead
+    principal: WhoAmIPrincipal
     agents: list[AgentRead]
     trust_tier: int = 0
 
@@ -93,7 +118,7 @@ class MessageRead(BaseModel):
     # Viewer-relative tag: ``"sent"`` when ``from_agent_id == caller``, else
     # ``"received"``. Populated by the thread/history endpoint.
     direction: Literal["sent", "received"] | None = None
-    encryption_version: str = "hpke-v1"
+    encryption_version: str = EncryptionVersion.HPKE_HYBRID_V2
     sender_signing_kid: str | None = None
     parent_conversation_id: UUID | None = None
     content_type: str | None = None
@@ -188,6 +213,10 @@ class DecryptedMessage(MessageRead):
     "this is final" and never a maybe — which is the point — but must not read
     the code's absence as "this row opened": ``plaintext`` is what says that.
 
+    ``a2a_cleartext`` is ``True`` for a message an external A2A client posted to an agent
+    that accepts cleartext: its ``plaintext`` is the payload as it arrived, never verified,
+    and ``a2a_cleartext_notice`` is the sentence a renderer shows beside it.
+
     ``catch_up`` reports what this read did to a closed group's local MLS state.
     It is present whenever the read ran a sync, including the ordinary case of a
     current member that applied nothing — ``processed`` is then ``0``. It is
@@ -212,6 +241,20 @@ class DecryptedMessage(MessageRead):
     decrypt_error_code: str | None = None
     key_changed: SenderKeyChange | None = None
     catch_up: GroupCatchUp | None = None
+    a2a_cleartext: bool = False
+    a2a_cleartext_notice: str | None = None
+
+    @classmethod
+    def from_wire(cls, raw: Mapping[str, Any]) -> DecryptedMessage:
+        """Build from a server row, keeping only what the server may say.
+
+        Every field this class adds to :class:`MessageRead` is a verdict this client
+        reaches by decrypting, so none is read from the wire: a server that sent
+        ``verified: true`` with a ciphertext that never opens would otherwise hand
+        the money paths a forged sender verdict that no local step overwrites.
+        """
+        local = DecryptedMessage.model_fields.keys() - MessageRead.model_fields.keys()
+        return cls.model_validate({k: v for k, v in raw.items() if k not in local})
 
 
 class ThreadEntry(BaseModel):
@@ -237,6 +280,11 @@ class ThreadEntry(BaseModel):
     tampered with, or attributed to an agent that did not sign it, never renders
     as trusted content), so consumers that inject the transcript into a model's
     context can also mark or exclude ``"unverifiable"`` turns.
+
+    A turn an external A2A client posted in cleartext carries the
+    :data:`~rine.a2a_cleartext.A2A_CLEARTEXT_NOTICE` sentence in brackets ahead of its
+    ``text``, so a transcript handed to a model never reads that turn as end-to-end encrypted;
+    ``a2a_cleartext`` is that same fact as a typed flag.
     """
 
     direction: Literal["sent", "received"]
@@ -245,6 +293,7 @@ class ThreadEntry(BaseModel):
     verification_status: VerificationStatus = "unverifiable"
     type: str
     created_at: datetime
+    a2a_cleartext: bool = False
 
 
 class ConversationRead(BaseModel):
@@ -331,10 +380,10 @@ class GroupRead(BaseModel):
     # agent was seated. Defaulted so an older server that omits the key still
     # parses.
     conversation_id: UUID | None = None
-    # Which of the CALLING ORG's agents hold a seat in this group. ``GET /groups``
-    # is org-scoped — it lists every group any agent of the org is in — so the row
+    # Which of the CALLER's own agents hold a seat in this group. ``GET /groups``
+    # follows the key — an org key lists every group any agent of the org is in — so the row
     # alone never said whether the agent about to post is one of them. This field
-    # is that answer, on the row itself: an empty list means no agent of this org
+    # is that answer, on the row itself: an empty list means none of the caller's agents
     # is seated, and a send would be refused. It names only the caller's own
     # agents, never the whole roster (``member_count`` is still the whole roster),
     # and it is a MARKER, never a filter — no group is hidden because the list is
@@ -393,8 +442,8 @@ class GroupMember(BaseModel):
     role: str = "member"
     joined_at: datetime
     agent_handle: str | None = None
-    # Whether this seat belongs to the calling org. A roster is org-authorised
-    # but not org-filtered: ``GET /groups/{id}/members`` returns every member of
+    # Whether this seat belongs to the calling org. A roster is authorised at the key's
+    # scope but not filtered to it: ``GET /groups/{id}/members`` returns every member of
     # the group, and this marks which of them are the caller's own. A MARKER,
     # never a filter — no surface may hide the rows where it is ``False``, and
     # ``total`` is still the whole roster. Defaulted so an older server that
@@ -718,7 +767,10 @@ class RegistrationResult(BaseModel):
     """Result of org registration."""
 
     org_id: str
-    client_id: str
+    #: The 8 org verification words: safe to print, they are not the recovery phrase.
+    org_words: str
+    #: Where the 24-word recovery phrase was written. The phrase is never returned.
+    phrase_path: str
 
 
 # --- Streaming ---

@@ -12,6 +12,7 @@ fields at all.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from rine import (
@@ -24,6 +25,8 @@ from rine import (
 )
 from rine._constants import VoteEligibilityReason
 from rine.types import JoinRequestRead
+from rine.vote_words import _ELIGIBILITY_CLAUSES
+from tests._twin import core_source
 
 _BASE: dict[str, Any] = {
     "id": "11111111-2222-3333-4444-555555555555",
@@ -301,3 +304,16 @@ class TestVoteElectorateRule:
             "Denials refuse it on that same electorate — half of them under majority, "
             "a single one under unanimity — so both bars fall as members leave."
         ) in VOTE_ELECTORATE_RULE
+
+
+class TestEligibilityClausesTwin:
+    def test_clauses_when_read_beside_the_core_table_then_every_reason_agrees(self):
+        """One clause per reason token, byte for byte, in both stacks."""
+        source = core_source("vote-words.ts")
+        table = re.search(
+            r"VOTE_ELIGIBILITY_CLAUSES = Object\.freeze\(\{(.*?)\} as const\)", source, re.S
+        )
+        assert table, "no readable VOTE_ELIGIBILITY_CLAUSES table in the twin's source"
+        core = dict(re.findall(r'(\w+):\s*"((?:[^"\\]|\\.)*)"', table.group(1)))
+
+        assert core == dict(_ELIGIBILITY_CLAUSES)

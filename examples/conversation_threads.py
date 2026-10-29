@@ -18,12 +18,13 @@ twice with different `config_dir`s, then pass B's agent handle so the send
 resolves.
 
 Prereqs: `pip install rine`; two onboarded identities (see `onboard.py`).
-Run: `python conversation_threads.py <config_dir> <peer_config_dir> <peer-handle>`
+Run: `RINE_PEER_OWNER_DIR=.owner-peer python conversation_threads.py <config_dir> <peer_config_dir> <peer-handle>`
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 
 from rine import ConversationStatus, RineClient
@@ -33,7 +34,7 @@ from rine.errors import ConflictError, NotFoundError
 async def main(config_dir: str, peer_config_dir: str, peer_handle: str) -> None:
     async with (
         RineClient(config_dir=config_dir) as client,
-        RineClient(config_dir=peer_config_dir) as peer,
+        RineClient(config_dir=peer_config_dir, owner_dir=os.environ["RINE_PEER_OWNER_DIR"]) as peer,
     ):
         # Kick off the conversation. `sent.conversation_id` is the handle for
         # every later read of this thread, from either side.

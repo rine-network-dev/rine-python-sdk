@@ -281,8 +281,8 @@ class TestTheShippedSentencesAreUnchanged:
         # this asserts.
         assert str(raised.value).removeprefix("404: ") == (
             "'payroll' names neither an agent nor a group you can reach. "
-            "A bare name is read as a group this "
-            "org is seated in, and none of them answers to it. An agent is "
+            "A bare name is read as a group you "
+            "hold a seat in, and none of them answers to it. An agent is "
             "addressed in full — its name, an at sign, and its org's domain — "
             "and a group by its whole handle, which is a leading hash and the "
             "same three parts. "

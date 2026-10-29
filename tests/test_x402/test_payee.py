@@ -100,6 +100,7 @@ def _payment_message(payload: dict[str, Any] | None = None, **overrides: Any) ->
         "created_at": "2024-01-01T00:00:00Z",
         "plaintext": json.dumps(payload if payload is not None else _payment_payload()),
         "decrypt_error": None,
+        "verification_status": "verified",
     }
     data.update(overrides)
     return DecryptedMessage.model_validate(data)
@@ -477,6 +478,79 @@ async def test_fulfill_when_referenced_quote_signature_invalid_refuses() -> None
     assert result.settlement is None
     assert not verify_route.called
     assert client.replies[0]["payload"]["errorReason"] == X402ErrorCode.NO_QUOTE
+
+
+@respx.mock
+@pytest.mark.parametrize("status", ["sender-mismatch", "invalid"])
+async def test_fulfill_when_payment_sender_not_signed_refuses_without_settling(
+    status: str,
+) -> None:
+    """A payment its sender did not sign never reaches the facilitator."""
+    verify_route = respx.post(f"{FAC_URL}/verify")
+    settle_route = respx.post(f"{FAC_URL}/settle")
+    client = FakeRefClient()
+
+    async with FacilitatorClient("x402-rs", base_url=FAC_URL) as fac:
+        result = await fulfill(
+            client, _payment_message(verification_status=status), facilitator=fac
+        )
+
+    assert result.settlement is None
+    assert result.matched_quote is None
+    assert not verify_route.called
+    assert not settle_route.called
+    assert client.replies[0]["payload"]["success"] is False
+    assert client.replies[0]["payload"]["errorReason"] == X402ErrorCode.INAUTHENTIC_SENDER
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"decrypt_error": "AEAD failure"},
+        {"a2a_cleartext": True},
+        {"from_agent_id": None},
+    ],
+    ids=["failed-to-decrypt", "a2a-cleartext", "no-sender"],
+)
+async def test_fulfill_when_unverifiable_payment_cannot_pass_on_retry_threads_terminal_receipt(
+    overrides: dict[str, Any],
+) -> None:
+    """A payment that failed to decrypt, is cleartext A2A or has no sender gets a final receipt."""
+    verify_route = respx.post(f"{FAC_URL}/verify")
+    settle_route = respx.post(f"{FAC_URL}/settle")
+    client = FakeRefClient()
+
+    async with FacilitatorClient("x402-rs", base_url=FAC_URL) as fac:
+        result = await fulfill(
+            client,
+            _payment_message(verification_status="unverifiable", **overrides),
+            facilitator=fac,
+        )
+
+    assert result.settlement is None
+    assert not verify_route.called
+    assert not settle_route.called
+    assert client.replies[0]["payload"]["errorReason"] == X402ErrorCode.INAUTHENTIC_SENDER
+
+
+@respx.mock
+async def test_fulfill_when_payment_sender_unverifiable_raises_retryable_without_receipt() -> None:
+    """A sender check that could not run settles nothing and sends no receipt, so a retry can."""
+    verify_route = respx.post(f"{FAC_URL}/verify")
+    settle_route = respx.post(f"{FAC_URL}/settle")
+    client = FakeRefClient()
+
+    async with FacilitatorClient("x402-rs", base_url=FAC_URL) as fac:
+        with pytest.raises(X402Error) as exc:
+            await fulfill(
+                client, _payment_message(verification_status="unverifiable"), facilitator=fac
+            )
+
+    assert exc.value.code == X402ErrorCode.SENDER_UNVERIFIABLE
+    assert client.replies == []
+    assert not verify_route.called
+    assert not settle_route.called
 
 
 @respx.mock

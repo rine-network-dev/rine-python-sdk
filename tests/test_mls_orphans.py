@@ -21,7 +21,7 @@ import httpx
 import pytest
 import respx
 
-from rine._crypto.keys import generate_agent_keys, save_agent_keys, signing_public_key_to_jwk
+from rine._crypto.keys import save_agent_keys
 from rine._mls import (
     DEFAULT_CIPHER_SUITE,
     load_mls_group,
@@ -35,32 +35,21 @@ from rine._mls.admission import (
     MlsReclamation,
     MlsReclamationDecline,
 )
-from rine._mls.binding import MlsGroup
+from rine._mls.binding import CommitPendingError, allowed_for, credential_identity
+from rine._mls.group_access import open_mls_group
 from rine._mls.tree import leaf_index
 from rine.admission_words import describe_mls_admission
+from rine.errors import MlsError
+from rine.testing import WORLD
+from tests.escrow_outcomes import DEFERRED, DEFERRED_REPORT
+from tests.mls_peers import RefusesOnce
 
-#: The tree-query surface lands in ``rine-mls`` 0.1.1, and reaching Python needs
-#: a wheel built from it — a ``--native`` artifact build, not a source change.
-#: Every installed wheel at the time of writing predates it, so the tests that
-#: enumerate a tree are skipped rather than silently passing against a binding
-#: that cannot answer. The TypeScript twin runs against a rebuilt napi addon and
-#: covers the same set.
-#:
-#: The two refusal tests are deliberately NOT skipped: a pass that declines
-#: returns before it enumerates anything, so they exercise the whole wire —
-#: reads, degradation, refusal — on the wheel that is actually installed.
-needs_tree_surface = pytest.mark.skipif(
-    not hasattr(MlsGroup, "member_identities"),
-    reason=(
-        "the installed rine-mls wheel predates the tree-query surface "
-        "(MlsGroup.member_identities); rebuild it with "
-        "./scripts/build-mls-artifacts.sh and reinstall to run these"
-    ),
-)
+pytestmark = pytest.mark.usefixtures("mls_escrow_stub")
 
 API = "https://rine.network"
 GROUP_ID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 NO_SHOW_ID = "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
+REFUSED_ID = "55555555-6666-7777-8888-999999999999"
 
 _GROUP_PAYLOAD = {
     "id": GROUP_ID,
@@ -82,25 +71,25 @@ def _mock_token() -> None:
     )
 
 
-def _peer_client(tmp_path, agent: str):
-    peer_dir = str(tmp_path / f"peer-{agent}")
-    save_agent_keys(peer_dir, agent, generate_agent_keys())
-    return open_mls_client(peer_dir, agent)
+def _found_with(tmp_config_dir, agent_id, seated: list[str]):
+    """This agent founds the group with `seated` already in its ratchet tree.
 
-
-def _found_with(tmp_config_dir, agent_id, tmp_path, seated: list[str]):
-    """This agent founds the group with `seated` already in its ratchet tree."""
+    Every seated agent's keys are saved beside the founder's: the core refuses a
+    leaf whose ``(agent id, leaf key)`` pair is outside the client's allowed set,
+    which is every agent whose keys live in the config dir.
+    """
+    for other in seated:
+        save_agent_keys(tmp_config_dir, other, WORLD.keys(other))
     admin = open_mls_client(tmp_config_dir, agent_id)
-    peers = {other: _peer_client(tmp_path, other) for other in seated}
     group = admin.create_group_with_members(
         mls_group_id_bytes(GROUP_ID),
-        [peer.generate_key_package() for peer in peers.values()],
+        [open_mls_client(tmp_config_dir, other).generate_key_package() for other in seated],
     )
     group.save()
-    return {other: peer.public_key() for other, peer in peers.items()}
+    return {other: credential_identity(other) for other in seated}
 
 
-def _mock_server(*, members: list[str], live: list[dict], unreadable: set[str], identities):
+def _mock_server(*, members: list[str], live: list[dict], unreadable: set[str]):
     """The four reads and the one write a reclamation pass makes."""
     _mock_token()
     respx.get(f"{API}/groups/{GROUP_ID}").mock(
@@ -116,9 +105,9 @@ def _mock_server(*, members: list[str], live: list[dict], unreadable: set[str], 
     def _keys(request: httpx.Request) -> httpx.Response:
         wanted = (request.url.params.get("ids") or "").split(",")
         keys = {
-            agent: {"signing_public_key": signing_public_key_to_jwk(identity)}
-            for agent, identity in identities.items()
-            if agent in wanted and agent not in unreadable
+            agent: WORLD.keys_response(agent)
+            for agent in wanted
+            if agent and agent not in unreadable
         }
         return httpx.Response(200, json={"keys": keys})
 
@@ -144,25 +133,24 @@ def _nomination(agent_id: str, nominator: str) -> dict:
     return {"agent_id": agent_id, "status": "pending", "invited_by": nominator}
 
 
-@needs_tree_surface
 class TestTheSetItself:
     def test_orphan_leaves_when_an_identity_is_unaccounted_for_then_its_leaf_is_named(
-        self, tmp_config_dir, saved_agent_keys, agent_id, tmp_path
+        self, tmp_config_dir, saved_agent_keys, agent_id
     ):
-        identities = _found_with(tmp_config_dir, agent_id, tmp_path, [NO_SHOW_ID])
+        identities = _found_with(tmp_config_dir, agent_id, [NO_SHOW_ID])
         group = _local(tmp_config_dir, agent_id)
 
-        orphans = orphan_leaves(group, [open_mls_client(tmp_config_dir, agent_id).public_key()])
+        orphans = orphan_leaves(group, [credential_identity(agent_id)])
 
         assert [leaf.index for leaf in orphans] == [leaf_index(group, identities[NO_SHOW_ID])]
 
     def test_orphan_leaves_when_nobody_is_entitled_then_this_agents_own_leaf_survives(
-        self, tmp_config_dir, saved_agent_keys, agent_id, tmp_path
+        self, tmp_config_dir, saved_agent_keys, agent_id
     ):
         # The degenerate input. An admin that self-evicts can neither commit nor
         # recover, so its own leaf is excluded structurally rather than by
         # trusting the membership read.
-        identities = _found_with(tmp_config_dir, agent_id, tmp_path, [NO_SHOW_ID])
+        identities = _found_with(tmp_config_dir, agent_id, [NO_SHOW_ID])
         group = _local(tmp_config_dir, agent_id)
 
         orphans = orphan_leaves(group, [])
@@ -171,18 +159,16 @@ class TestTheSetItself:
 
 
 class TestThePass:
-    @needs_tree_surface
     @respx.mock
     def test_reclaim_when_an_invitee_has_not_accepted_yet_then_its_leaf_survives(
-        self, sync_client, tmp_config_dir, agent_id, tmp_path
+        self, sync_client, tmp_config_dir, agent_id
     ):
-        identities = _found_with(tmp_config_dir, agent_id, tmp_path, [NO_SHOW_ID])
-        identities[agent_id] = open_mls_client(tmp_config_dir, agent_id).public_key()
+        identities = _found_with(tmp_config_dir, agent_id, [NO_SHOW_ID])
+        identities[agent_id] = credential_identity(agent_id)
         posted = _mock_server(
             members=[agent_id],
             live=[_invitation(NO_SHOW_ID, agent_id)],
             unreadable=set(),
-            identities=identities,
         )
 
         result = reclaim_orphan_leaves(sync_client._http, tmp_config_dir, agent_id, GROUP_ID)
@@ -191,10 +177,9 @@ class TestThePass:
         assert posted.call_count == 0
         assert leaf_index(_local(tmp_config_dir, agent_id), identities[NO_SHOW_ID]) is not None
 
-    @needs_tree_surface
     @respx.mock
     def test_reclaim_when_a_nomination_is_awaiting_a_vote_then_its_leaf_survives(
-        self, sync_client, tmp_config_dir, agent_id, tmp_path
+        self, sync_client, tmp_config_dir, agent_id
     ):
         """``live`` is ``pending`` plus ``invited``, and both entitle.
 
@@ -204,13 +189,12 @@ class TestThePass:
         resume may admit would evict every agent the electorate still owes
         an answer to.
         """
-        identities = _found_with(tmp_config_dir, agent_id, tmp_path, [NO_SHOW_ID])
-        identities[agent_id] = open_mls_client(tmp_config_dir, agent_id).public_key()
+        identities = _found_with(tmp_config_dir, agent_id, [NO_SHOW_ID])
+        identities[agent_id] = credential_identity(agent_id)
         posted = _mock_server(
             members=[agent_id],
             live=[_nomination(NO_SHOW_ID, agent_id)],
             unreadable=set(),
-            identities=identities,
         )
 
         result = reclaim_orphan_leaves(sync_client._http, tmp_config_dir, agent_id, GROUP_ID)
@@ -219,35 +203,101 @@ class TestThePass:
         assert posted.call_count == 0
         assert leaf_index(_local(tmp_config_dir, agent_id), identities[NO_SHOW_ID]) is not None
 
-    @needs_tree_surface
     @respx.mock
     def test_reclaim_when_a_voucher_lapsed_and_was_reaped_then_its_leaf_is_retired(
-        self, sync_client, tmp_config_dir, agent_id, tmp_path
+        self, sync_client, tmp_config_dir, agent_id, mls_escrow_stub
     ):
-        identities = _found_with(tmp_config_dir, agent_id, tmp_path, [NO_SHOW_ID])
-        identities[agent_id] = open_mls_client(tmp_config_dir, agent_id).public_key()
+        identities = _found_with(tmp_config_dir, agent_id, [NO_SHOW_ID])
+        identities[agent_id] = credential_identity(agent_id)
         # The reaper freed the seat: no member row, no live voucher. The leaf is
         # what it left behind.
-        posted = _mock_server(members=[agent_id], live=[], unreadable=set(), identities=identities)
+        posted = _mock_server(members=[agent_id], live=[], unreadable=set())
 
         result = reclaim_orphan_leaves(sync_client._http, tmp_config_dir, agent_id, GROUP_ID)
 
         assert (result.found, result.reclaimed, result.commits) == (1, 1, 1)
         assert posted.call_count == 1
-        # An orphan holds no member row, so the Remove commit declares no target
-        # and carries no Welcome: no DELETE may ever be authorised by it.
+        # An orphan holds no member row, so the Remove commit carries no Welcome and
+        # there is no row for its declared target to delete. It still declares the
+        # target: the server closes a seat span only by a declared removal.
         body = json.loads(posted.calls[0].request.content)
         assert body["welcomes"] == []
-        assert body.get("removes", []) == []
+        assert body["removes"] == [NO_SHOW_ID]
         assert leaf_index(_local(tmp_config_dir, agent_id), identities[NO_SHOW_ID]) is None
+        assert mls_escrow_stub[-1] == (GROUP_ID, _local(tmp_config_dir, agent_id).epoch())
+
+    @respx.mock
+    def test_reclaim_when_a_build_is_refused_for_an_unadmitted_peer_then_it_verifies_and_retries(
+        self, sync_client, tmp_config_dir, agent_id, monkeypatch
+    ):
+        """The refused agent is chain-verified once and the same removal is built again."""
+        identities = _found_with(tmp_config_dir, agent_id, [NO_SHOW_ID])
+        identities[agent_id] = credential_identity(agent_id)
+        posted = _mock_server(members=[agent_id], live=[], unreadable=set())
+        real_open = open_mls_group
+        monkeypatch.setattr(
+            "rine._mls.orphans.open_mls_group",
+            lambda *args: RefusesOnce(real_open(*args), REFUSED_ID),
+        )
+
+        result = reclaim_orphan_leaves(sync_client._http, tmp_config_dir, agent_id, GROUP_ID)
+
+        assert (result.found, result.reclaimed, result.commits) == (1, 1, 1)
+        assert posted.call_count == 1
+        assert allowed_for(tmp_config_dir, agent_id).contains(
+            credential_identity(REFUSED_ID), WORLD.keys(REFUSED_ID).mls.public_key
+        )
+
+    @respx.mock
+    def test_reclaim_when_a_key_update_is_awaiting_acknowledgement_then_it_says_to_retry_later(
+        self, sync_client, tmp_config_dir, agent_id, monkeypatch
+    ):
+        """The core's bare refusal names no group and no wait; the pass names both."""
+        _found_with(tmp_config_dir, agent_id, [NO_SHOW_ID])
+        _mock_server(members=[agent_id], live=[], unreadable=set())
+        real_open = open_mls_group
+
+        class _Pending:
+            def __init__(self, group):
+                self._group = group
+
+            def __getattr__(self, name):
+                return getattr(self._group, name)
+
+            def remove_member(self, _leaf):
+                raise CommitPendingError("a commit is pending")
+
+        monkeypatch.setattr(
+            "rine._mls.orphans.open_mls_group", lambda *args: _Pending(real_open(*args))
+        )
+
+        with pytest.raises(MlsError) as caught:
+            reclaim_orphan_leaves(sync_client._http, tmp_config_dir, agent_id, GROUP_ID)
+
+        assert caught.value.code == "RINE_MLS_COMMIT_PENDING"
+        assert GROUP_ID in str(caught.value)
+
+    @respx.mock
+    def test_reclaim_when_the_commit_drain_defers_then_the_result_reports_it(
+        self, sync_client, tmp_config_dir, agent_id, mls_escrow_stub, monkeypatch
+    ):
+        monkeypatch.setattr("rine._mls.orphans.drain_escrow", lambda *args, **kwargs: DEFERRED)
+        identities = _found_with(tmp_config_dir, agent_id, [NO_SHOW_ID])
+        identities[agent_id] = credential_identity(agent_id)
+        _mock_server(members=[agent_id], live=[], unreadable=set())
+
+        result = reclaim_orphan_leaves(sync_client._http, tmp_config_dir, agent_id, GROUP_ID)
+
+        assert result.escrow.deferral == DEFERRED_REPORT.deferral
+        assert result.escrow.gaps == DEFERRED_REPORT.gaps
 
     @respx.mock
     def test_reclaim_when_a_member_publishes_no_readable_key_then_nothing_is_retired(
-        self, sync_client, tmp_config_dir, agent_id, tmp_path
+        self, sync_client, tmp_config_dir, agent_id
     ):
         revoked = "12121212-3434-5656-7878-909090909090"
-        identities = _found_with(tmp_config_dir, agent_id, tmp_path, [NO_SHOW_ID, revoked])
-        identities[agent_id] = open_mls_client(tmp_config_dir, agent_id).public_key()
+        identities = _found_with(tmp_config_dir, agent_id, [NO_SHOW_ID, revoked])
+        identities[agent_id] = credential_identity(agent_id)
         # An INVITATION, not a member row: ``GET /groups/{id}/members`` filters
         # revoked agents out, so a revoked member never reaches this pass at all,
         # while a voucher outlives the revocation of the agent it names. That
@@ -257,7 +307,6 @@ class TestThePass:
             members=[agent_id],
             live=[_invitation(revoked, agent_id)],
             unreadable={revoked},
-            identities=identities,
         )
 
         result = reclaim_orphan_leaves(sync_client._http, tmp_config_dir, agent_id, GROUP_ID)
@@ -272,51 +321,38 @@ class TestThePass:
         assert leaf_index(group, identities[NO_SHOW_ID]) is not None
 
     @respx.mock
-    def test_reclaim_when_a_member_rotated_its_signing_key_then_the_pass_declines(
-        self, sync_client, tmp_config_dir, agent_id, tmp_path
+    def test_reclaim_when_a_member_holds_no_leaf_then_the_pass_declines(
+        self, sync_client, tmp_config_dir, agent_id
     ):
-        """A rotation desynchronises the tree from what the server publishes.
+        """A member the server names whose leaf is not in the tree is not an orphan's owner.
 
-        ``POST /agents/{id}/keys`` has no MLS guard, so a rotation leaves the leaf
-        carrying the credential the group was founded on while the server names a
-        different one. Subtracting by published key would classify this seated
-        member's leaf as an orphan and Remove it.
+        The pass subtracts the server's roster from the tree's leaves; a roster
+        entry with no leaf means the tree and the server disagree about who is
+        seated, and a pass that carried on would Remove leaves on a guess.
         """
-        rotator = "12121212-3434-5656-7878-909090909090"
-        identities = _found_with(tmp_config_dir, agent_id, tmp_path, [NO_SHOW_ID, rotator])
-        identities[agent_id] = open_mls_client(tmp_config_dir, agent_id).public_key()
-        seated_leaf = identities[rotator]
-        # What the server publishes AFTER the rotation: a key no leaf carries.
-        identities[rotator] = _peer_client(
-            tmp_path, "12121212-3434-5656-7878-909090909091"
-        ).public_key()
-        posted = _mock_server(
-            members=[agent_id, rotator],
-            live=[],
-            unreadable=set(),
-            identities=identities,
-        )
+        unseated = "12121212-3434-5656-7878-909090909090"
+        identities = _found_with(tmp_config_dir, agent_id, [NO_SHOW_ID])
+        posted = _mock_server(members=[agent_id, unseated], live=[], unreadable=set())
 
         result = reclaim_orphan_leaves(sync_client._http, tmp_config_dir, agent_id, GROUP_ID)
 
         assert (result.found, result.reclaimed, result.commits) == (0, 0, 0)
         assert result.declined is not None
         assert result.declined.reason == "identity_unseated"
-        assert rotator in result.declined.detail
+        assert unseated in result.declined.detail
         assert posted.call_count == 0
-        # Nothing was committed, so BOTH leaves survive — including the no-show's,
-        # which a pass that ran would legitimately have retired.
+        # Nothing was committed, so the no-show's leaf survives too, which a pass
+        # that ran would legitimately have retired.
         group = _local(tmp_config_dir, agent_id)
-        assert leaf_index(group, seated_leaf) is not None
         assert leaf_index(group, identities[NO_SHOW_ID]) is not None
 
     @respx.mock
     def test_reclaim_when_the_outstanding_read_fails_then_it_declines_by_name(
-        self, sync_client, tmp_config_dir, agent_id, tmp_path
+        self, sync_client, tmp_config_dir, agent_id
     ):
-        identities = _found_with(tmp_config_dir, agent_id, tmp_path, [NO_SHOW_ID])
-        identities[agent_id] = open_mls_client(tmp_config_dir, agent_id).public_key()
-        posted = _mock_server(members=[agent_id], live=[], unreadable=set(), identities=identities)
+        identities = _found_with(tmp_config_dir, agent_id, [NO_SHOW_ID])
+        identities[agent_id] = credential_identity(agent_id)
+        posted = _mock_server(members=[agent_id], live=[], unreadable=set())
         # A member that is not an admin cannot read the invitations, and
         # `read_group_tree` degrades rather than raising — so the pass has to
         # refuse, or it evicts every agent who has not accepted yet.

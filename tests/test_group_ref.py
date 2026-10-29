@@ -9,6 +9,7 @@ none of these tests would notice if one were renamed.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -27,6 +28,8 @@ from rine._group_ref import (
     refuse_if_a_bare_agent_name,
 )
 from rine.errors import ConfigError, NotFoundError
+
+pytestmark = pytest.mark.usefixtures("mls_escrow_stub")
 
 API = "https://rine.network"
 AGENT_ID = "00000000-1111-2222-3333-444444444444"
@@ -352,7 +355,7 @@ class TestTheBareRecipientGuard:
         # replaced ended "a bare name is neither", which stopped being true the
         # day bare names resolved — a refusal that contradicts the instruction
         # the caller has just followed reads as a broken product.
-        assert "A bare name is read as a group this org is seated in" in refusal
+        assert "A bare name is read as a group you hold a seat in" in refusal
         assert "its name, an at sign, and its org's domain" in refusal
         assert "a leading hash and the same three parts" in refusal
         # 🔴 The worked example this used to carry is banned. A complete address
@@ -419,7 +422,8 @@ def _record_the_branch(client, seen: list[str]) -> None:
 
     def _group(agent_id, to, payload, msg_type):
         seen.append(to)
-        return None, {"to_handle": to, "type": msg_type, "encrypted_payload": "x"}
+        body = {"to_handle": to, "type": msg_type, "encrypted_payload": "x"}
+        return SimpleNamespace(escrow_fp=None), body, None
 
     def _dm(agent_id, to, payload, msg_type):
         raise AssertionError(f"a group reference reached the 1:1 path: {to!r}")

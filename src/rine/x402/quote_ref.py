@@ -95,7 +95,7 @@ async def load_referenced_quote(
         raise X402Error(
             X402ErrorCode.NO_QUOTE, f"Referenced quote {ref} is unresolvable: {exc}"
         ) from exc
-    msg = DecryptedMessage.model_validate(raw)
+    msg = DecryptedMessage.from_wire(raw)
     if (
         msg.type != MessageType.X402_PAYMENT_REQUIRED
         or str(msg.from_agent_id) != payee_agent_id

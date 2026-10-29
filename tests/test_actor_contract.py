@@ -27,6 +27,7 @@ from rine._actor import ACTING_AGENT_ENV
 from rine._constants import PEEK_HEADER
 from rine._resolve import resolve_agent
 from rine.errors import ConfigError
+from rine.testing import write_agent_identity
 
 API_URL = "https://rine.network"
 FIRST_ID = "00000000-1111-2222-3333-444444444444"
@@ -70,11 +71,7 @@ def _client(config_dir: str, **kwargs) -> RineClient:
 @pytest.fixture
 def config_dir(tmp_config_dir):
     """A config dir the client can authenticate from."""
-    from rine._config import save_credentials
-
-    save_credentials(
-        tmp_config_dir, {"default": {"client_id": "test-cid", "client_secret": "test-csecret"}}
-    )
+    write_agent_identity(tmp_config_dir, FIRST_ID)
     return tmp_config_dir
 
 

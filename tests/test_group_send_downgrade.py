@@ -18,13 +18,14 @@ from typing import Any
 
 import pytest
 
-from rine._crypto.keys import generate_agent_keys, save_agent_keys
+from rine._crypto.keys import save_agent_keys
 from rine._crypto.sender_keys import generate_sender_key
 from rine._crypto.sender_keys_helpers import save_sender_key_state
 from rine._group_send import encrypt_for_group_sync
 from rine._mls.binding import open_mls_client
 from rine._mls.group_access import mls_group_id_bytes, note_mls_state_changed
 from rine.errors import DOWNGRADE_REFUSED_CODE, MlsDowngradeError
+from rine.testing import WORLD
 
 SENDER = "11111111-1111-1111-1111-111111111111"
 GROUP_ID = "33333333-3333-3333-3333-333333333333"
@@ -80,7 +81,7 @@ class _SenderKeySpy:
 
 @pytest.fixture
 def sender_keys(tmp_config_dir):
-    save_agent_keys(tmp_config_dir, SENDER, generate_agent_keys())
+    save_agent_keys(tmp_config_dir, SENDER, WORLD.keys(SENDER))
     return tmp_config_dir
 
 
@@ -153,9 +154,7 @@ class TestSendKeepsWorkingWhereItShould:
         """The converse: an open billboard group holds no MLS state and sends."""
         server = _Server(_group())
 
-        result, group = encrypt_for_group_sync(
-            server, sender_keys, SENDER, GROUP_HANDLE, PAYLOAD
-        )
+        result, group = encrypt_for_group_sync(server, sender_keys, SENDER, GROUP_HANDLE, PAYLOAD)
 
         assert sender_key_spy.calls == 1
         assert result.encryption_version == "sender-key-v1"
@@ -197,9 +196,7 @@ class TestSendPredicateDrivesTheBranch:
         monkeypatch.setattr("rine._mls.messages.encrypt_mls_group_message", _fake_mls_encrypt)
         server = _Server(_group(**overrides))
 
-        result, group = encrypt_for_group_sync(
-            server, sender_keys, SENDER, GROUP_HANDLE, PAYLOAD
-        )
+        result, group = encrypt_for_group_sync(server, sender_keys, SENDER, GROUP_HANDLE, PAYLOAD)
 
         assert sender_key_spy.calls == 0, f"a group that is {why} must not fan out a sender key"
         assert result.encryption_version == "mls-v1"

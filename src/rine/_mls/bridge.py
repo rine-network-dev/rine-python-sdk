@@ -41,6 +41,9 @@ async def with_sync_http(client: Any, work: Callable[[Any], T]) -> T:
             api_url=client._api_url,
             timeout=client._timeout,
             keys_cache=client._http._keys_cache,
+            owner_dir=client._owner_dir,
+            profile=client._profile,
+            agent_only=client._agent_only,
         )
         try:
             return work(http)

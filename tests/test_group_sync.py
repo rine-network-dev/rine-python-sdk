@@ -20,6 +20,8 @@ other.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import httpx
 import pytest
 import respx
@@ -27,6 +29,7 @@ import respx
 from rine._crypto.sender_keys_helpers import mark_sender_keys_retired
 from rine._group_recovery import KeyPackageTopUp, SenderKeyRecoveryResult
 from rine._mls.resync import MlsRecoveryResult
+from rine._seat_update import SeatUpdate, SeatUpdateStatus
 from rine.format import (
     MLS_NEVER_FOUNDED_NOTE,
     describe_mls_recovery,
@@ -115,14 +118,18 @@ def _fake_ladder(monkeypatch, result: MlsRecoveryResult = REPLAYED) -> list[tupl
     """
     calls: list[tuple] = []
 
-    def _recover(client, config_dir, agent_id, group_id, *, cipher_suite=None):
-        calls.append((config_dir, agent_id, group_id, cipher_suite))
+    def _recover(client, config_dir, agent_id, group_id):
+        calls.append((config_dir, agent_id, group_id))
         return result
 
-    monkeypatch.setattr("rine._resources.group_sync.recover_mls_group", _recover)
+    monkeypatch.setattr("rine._resources.group_sync.recover_mls_group_or_reseat", _recover)
     monkeypatch.setattr(
         "rine._resources.group_sync.top_up_key_packages",
         lambda _actor: KeyPackageTopUp(outcome="healthy"),
+    )
+    monkeypatch.setattr(
+        "rine._resources.group_sync.self_update_group",
+        lambda _actor, group_id: SeatUpdate(group_id, SeatUpdateStatus.CURRENT),
     )
     return calls
 
@@ -312,16 +319,56 @@ class TestSyncGroupMls:
         self, sync_client, mock_group_message_routes, monkeypatch, agent_id
     ):
         mock_group_message_routes()
-        _mock_group(mls_group_id="latched", mls_enabled=True, mls_cipher_suite=61015)
+        _mock_group(mls_group_id="latched", mls_enabled=True)
         calls = _fake_ladder(monkeypatch)
 
         result = sync_client.groups.sync(GROUP_ID)
 
         # Equal, not identical: the arm re-mints the ladder's result to hang the
-        # top-up on it, and a healthy pool hangs nothing.
-        assert result == REPLAYED
+        # top-up on it, and a healthy pool hangs nothing; the seat is the stubbed
+        # self-update's, which found the leaf already current.
+        assert result == replace(REPLAYED, seat=SeatUpdate(GROUP_ID, SeatUpdateStatus.CURRENT))
         assert result.regime == "mls"
-        assert calls == [(sync_client._config_dir, agent_id, GROUP_ID, 61015)]
+        assert calls == [(sync_client._config_dir, agent_id, GROUP_ID)]
+
+    @respx.mock
+    def test_sync_when_the_leaf_moves_then_the_seat_outcome_rides_on_the_result(
+        self, sync_client, mock_group_message_routes, monkeypatch
+    ):
+        """The seat outcome of a self-update reaches the caller on the sync result."""
+        mock_group_message_routes()
+        _mock_group(mls_group_id="latched", mls_enabled=True)
+        _fake_ladder(monkeypatch)
+        moved = SeatUpdate(GROUP_ID, SeatUpdateStatus.UPDATED, epoch=5)
+        monkeypatch.setattr(
+            "rine._resources.group_sync.self_update_group", lambda _actor, _group_id: moved
+        )
+
+        result = sync_client.groups.sync(GROUP_ID)
+
+        assert result.seat == moved
+        assert "Its leaf now carries the agent's current key (epoch 5)." in describe_mls_recovery(
+            "#ops", result
+        )
+
+    @respx.mock
+    def test_sync_when_the_recovery_evicted_the_agent_then_no_self_update_runs(
+        self, sync_client, mock_group_message_routes, monkeypatch
+    ):
+        """An evicted agent has no leaf to move, so no self-update is attempted."""
+        mock_group_message_routes()
+        _mock_group(mls_group_id="latched", mls_enabled=True)
+        _fake_ladder(monkeypatch, replace(REPLAYED, evicted=True))
+        attempts: list[str] = []
+        monkeypatch.setattr(
+            "rine._resources.group_sync.self_update_group",
+            lambda _actor, group_id: attempts.append(group_id),
+        )
+
+        result = sync_client.groups.sync(GROUP_ID)
+
+        assert attempts == []
+        assert result.seat is None
 
     @respx.mock
     def test_sync_when_the_group_is_mls_then_no_distribution_scan_runs(
@@ -529,7 +576,7 @@ class TestSyncGroupNeverFounded:
 
         result = sync_client.groups.sync(GROUP_ID)
 
-        assert result == REPLAYED
+        assert result == replace(REPLAYED, seat=SeatUpdate(GROUP_ID, SeatUpdateStatus.CURRENT))
         assert not hasattr(result, "mls_never_founded_note")
 
 
@@ -618,13 +665,13 @@ class TestAsyncGroupSync:
         self, async_client, mock_group_message_routes, monkeypatch, agent_id
     ):
         mock_group_message_routes()
-        _mock_group(mls_group_id="latched", mls_enabled=True, mls_cipher_suite=61015)
+        _mock_group(mls_group_id="latched", mls_enabled=True)
         calls = _fake_ladder(monkeypatch)
 
         result = await async_client.groups.sync(GROUP_ID)
 
-        assert result == REPLAYED
-        assert calls == [(async_client._config_dir, agent_id, GROUP_ID, 61015)]
+        assert result == replace(REPLAYED, seat=SeatUpdate(GROUP_ID, SeatUpdateStatus.CURRENT))
+        assert calls == [(async_client._config_dir, agent_id, GROUP_ID)]
         await async_client.close()
 
     @respx.mock

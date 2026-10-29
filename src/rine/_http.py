@@ -5,16 +5,15 @@ from __future__ import annotations
 import json as _json
 import random
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
-from typing import Any
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from rine._actor import AGENT_HEADER
-from rine._config import (
-    get_credential_entry,
-    resolve_api_url,
-)
+from rine._assertion import TOKEN_PATH, token_form
+from rine._client_auth import ClientAuth
+from rine._config import resolve_api_url
 from rine._constants import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_TIMEOUT,
@@ -28,7 +27,7 @@ from rine._constants import (
 )
 from rine._crypto._key_cache import KeyCache
 from rine._logging import logger
-from rine._token_cache import TokenCache
+from rine._owner import effective_owner_dir
 from rine._version import __version__
 from rine.errors import (
     APIConnectionError,
@@ -36,7 +35,13 @@ from rine.errors import (
     AuthenticationError,
     RateLimitError,
     raise_for_status,
+    revoked_error,
 )
+
+if TYPE_CHECKING:
+    from rine._crypto._key_pins import KeyPins
+    from rine._custody import Signer
+    from rine._principal import Principal
 
 _USER_AGENT = f"rine-python/{__version__}"
 _TOKEN_BACKOFF_BASE = 0.5
@@ -133,15 +138,6 @@ def _jittered_margin(rng: Callable[[], float]) -> float:
     return TOKEN_REFRESH_MARGIN + rng() * TOKEN_REFRESH_JITTER
 
 
-def _token_form(client_id: str, client_secret: str) -> dict[str, str]:
-    """Build the ``client_credentials`` grant form body."""
-    return {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
-    }
-
-
 def _token_result(resp: httpx.Response) -> tuple[str, int]:
     """Parse a successful token response into ``(access_token, expires_in)``."""
     body = resp.json()
@@ -149,8 +145,13 @@ def _token_result(resp: httpx.Response) -> tuple[str, int]:
 
 
 def _token_error(resp: httpx.Response) -> AuthenticationError:
-    """Build the hard-failure error for a non-success token response."""
-    return AuthenticationError(detail=f"Token fetch failed: {_parse_error_detail(resp)}")
+    """Build the hard-failure error for a non-success token response.
+
+    A refusal that names a revoked principal comes back as the typed
+    :class:`PrincipalRevokedError`, so a caller can tell it from a bad credential.
+    """
+    detail = f"Token fetch failed: {_parse_error_detail(resp)}"
+    return revoked_error(resp.status_code, detail, resp.text) or AuthenticationError(detail=detail, raw=resp.text)
 
 
 def _check_response(response: httpx.Response) -> Any:
@@ -186,12 +187,14 @@ def _check_response_with_status(response: httpx.Response) -> tuple[int, Any]:
 def _fetch_oauth_token(
     http: httpx.Client,
     api_url: str,
-    client_id: str,
-    client_secret: str,
+    signer: Signer,
     *,
     rng: Callable[[], float] = random.random,
 ) -> tuple[str, int]:
-    """Fetch an OAuth2 token via client_credentials grant.
+    """Fetch an OAuth2 token with a ``private_key_jwt`` client assertion.
+
+    Every attempt carries a fresh assertion: its ``jti`` is single-use, so a
+    retry that resent the first form would be refused as a replay.
 
     On a ``429`` the POST is retried up to ``TOKEN_RETRY_ATTEMPTS`` times,
     honoring ``Retry-After`` (else exponential backoff with full jitter) and
@@ -201,17 +204,16 @@ def _fetch_oauth_token(
     Args:
         http: HTTP client.
         api_url: API base URL.
-        client_id: OAuth client id.
-        client_secret: OAuth client secret.
+        signer: The principal to authenticate as and the seed that signs for it.
         rng: Uniform ``[0, 1)`` jitter source (injectable for tests).
 
     Returns:
         Tuple of (access_token, expires_in).
     """
-    form = _token_form(client_id, client_secret)
     slept = 0.0
     for attempt in range(TOKEN_RETRY_ATTEMPTS):
-        resp = http.post(f"{api_url}/oauth/token", data=form, headers=_TOKEN_FORM_HEADERS)
+        form = token_form(signer, api_url)
+        resp = http.post(f"{api_url}{TOKEN_PATH}", data=form, headers=_TOKEN_FORM_HEADERS)
         if resp.is_success:
             return _token_result(resp)
         delay = _token_backoff(resp, attempt, slept, rng)
@@ -226,18 +228,17 @@ def _fetch_oauth_token(
 async def _fetch_oauth_token_async(
     http: httpx.AsyncClient,
     api_url: str,
-    client_id: str,
-    client_secret: str,
+    signer: Signer,
     *,
     rng: Callable[[], float] = random.random,
 ) -> tuple[str, int]:
     """Async version of :func:`_fetch_oauth_token` (same retry semantics)."""
     import asyncio
 
-    form = _token_form(client_id, client_secret)
     slept = 0.0
     for attempt in range(TOKEN_RETRY_ATTEMPTS):
-        resp = await http.post(f"{api_url}/oauth/token", data=form, headers=_TOKEN_FORM_HEADERS)
+        form = token_form(signer, api_url)
+        resp = await http.post(f"{api_url}{TOKEN_PATH}", data=form, headers=_TOKEN_FORM_HEADERS)
         if resp.is_success:
             return _token_result(resp)
         delay = _token_backoff(resp, attempt, slept, rng)
@@ -253,7 +254,7 @@ class SyncHttpClient:
     """Synchronous HTTP client with token management.
 
     Args:
-        config_dir: Config directory for credentials and token cache.
+        config_dir: Runtime config directory (profiles, agent keys, token cache).
         api_url: API base URL.
         agent_id: Optional agent UUID for ``X-Rine-Agent`` header.
         timeout: Request timeout in seconds.
@@ -266,6 +267,11 @@ class SyncHttpClient:
             view of its peers' keys, which is what lets it notice a rotation.
         time_fn: Wall-clock source for token expiry (injectable for deterministic
             tests). Must agree with the clock ``cache_token`` writes against.
+        owner_dir: Owner directory holding ``root.key``. ``RINE_OWNER_DIR``, else
+            ``~/.config/rine-owner``, when omitted.
+        profile: Named profile to act as; the default profile when omitted.
+        agent_only: Never read the owner dir, so ``root.key`` cannot make this
+            client the org (excludes ``owner_dir``).
     """
 
     def __init__(
@@ -279,6 +285,9 @@ class SyncHttpClient:
         rng: Callable[[], float] = random.random,
         keys_cache: KeyCache | None = None,
         time_fn: Callable[[], float] = time.time,
+        owner_dir: str | None = None,
+        profile: str | None = None,
+        agent_only: bool = False,
     ) -> None:
         self._config_dir = config_dir
         self._api_url = api_url or resolve_api_url()
@@ -287,12 +296,18 @@ class SyncHttpClient:
         self._max_retries = max_retries
         self._owns_client = http_client is None
         self._http = http_client or httpx.Client(timeout=timeout)
-        self._profile = "default"
         self._rng = rng
         self._time_fn = time_fn
         self._refresh_margin = _jittered_margin(rng)
-        self._tokens = TokenCache(config_dir, self._profile, self._refresh_margin, time_fn)
+        self._auth = ClientAuth(
+            config_dir,
+            effective_owner_dir(owner_dir, agent_only),
+            profile,
+            self._refresh_margin,
+            time_fn,
+        )
         self._keys_cache = keys_cache or KeyCache(KEY_CACHE_TTL, KEY_CACHE_MAX_ENTRIES)
+        self._auth.seed_pins(self._keys_cache.pins)
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -312,27 +327,22 @@ class SyncHttpClient:
         is left here is the fetch, which is the only part that differs.
         """
         if not force:
-            held = self._tokens.fresh_token()
+            held = self._auth.tokens.fresh_token()
             if held is not None:
                 return held
-
-        entry = get_credential_entry(self._config_dir, self._profile)
-        if not entry:
-            raise AuthenticationError("No credentials found. Run: rine onboard")
 
         token, expires_in = _fetch_oauth_token(
             self._http,
             self._api_url,
-            entry["client_id"],
-            entry["client_secret"],
+            self._auth.resolved().signer,
             rng=self._rng,
         )
-        self._tokens.stamp(token, expires_in)
+        self._auth.tokens.stamp(token, expires_in)
         return token
 
     def _invalidate_token(self) -> None:
         """Invalidate the in-memory token cache, expiry included."""
-        self._tokens.clear()
+        self._auth.invalidate()
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         headers: dict[str, str] = {"User-Agent": _USER_AGENT}
@@ -591,6 +601,24 @@ class SyncHttpClient:
 
         return []  # unreachable — satisfies type checker
 
+    @property
+    def key_pins(self) -> KeyPins:
+        """The pins every key read of this client is admitted to."""
+        return self._keys_cache.pins
+
+    @property
+    def principal(self) -> Principal:
+        """The principal this client signs its token requests as.
+
+        Raises:
+            AuthenticationError: This process holds no identity to act as.
+        """
+        return self._auth.resolved().signer.principal
+
+    def pin_own_agents(self, agent_ids: Iterable[str]) -> None:
+        """Pin agents this client knows are its own org's, before any key read of them."""
+        self._auth.pin_agents(self._keys_cache.pins, agent_ids)
+
     def get(self, path: str, **kwargs: Any) -> Any:
         """HTTP GET."""
         return self.request("GET", path, **kwargs)
@@ -640,7 +668,7 @@ class AsyncHttpClient:
     """Async HTTP client with token management.
 
     Args:
-        config_dir: Config directory for credentials and token cache.
+        config_dir: Runtime config directory (profiles, agent keys, token cache).
         api_url: API base URL.
         agent_id: Optional agent UUID for ``X-Rine-Agent`` header.
         timeout: Request timeout in seconds.
@@ -650,6 +678,11 @@ class AsyncHttpClient:
             and token-retry backoff (injectable for deterministic tests).
         time_fn: Wall-clock source for token expiry (injectable for deterministic
             tests). Must agree with the clock ``cache_token`` writes against.
+        owner_dir: Owner directory holding ``root.key``. ``RINE_OWNER_DIR``, else
+            ``~/.config/rine-owner``, when omitted.
+        profile: Named profile to act as; the default profile when omitted.
+        agent_only: Never read the owner dir, so ``root.key`` cannot make this
+            client the org (excludes ``owner_dir``).
     """
 
     def __init__(
@@ -662,6 +695,9 @@ class AsyncHttpClient:
         http_client: httpx.AsyncClient | None = None,
         rng: Callable[[], float] = random.random,
         time_fn: Callable[[], float] = time.time,
+        owner_dir: str | None = None,
+        profile: str | None = None,
+        agent_only: bool = False,
     ) -> None:
         self._config_dir = config_dir
         self._api_url = api_url or resolve_api_url()
@@ -670,12 +706,18 @@ class AsyncHttpClient:
         self._max_retries = max_retries
         self._owns_client = http_client is None
         self._http = http_client or httpx.AsyncClient(timeout=timeout)
-        self._profile = "default"
         self._rng = rng
         self._time_fn = time_fn
         self._refresh_margin = _jittered_margin(rng)
-        self._tokens = TokenCache(config_dir, self._profile, self._refresh_margin, time_fn)
+        self._auth = ClientAuth(
+            config_dir,
+            effective_owner_dir(owner_dir, agent_only),
+            profile,
+            self._refresh_margin,
+            time_fn,
+        )
         self._keys_cache = KeyCache(KEY_CACHE_TTL, KEY_CACHE_MAX_ENTRIES)
+        self._auth.seed_pins(self._keys_cache.pins)
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -695,27 +737,22 @@ class AsyncHttpClient:
         is left here is the fetch, which is the only part that differs.
         """
         if not force:
-            held = self._tokens.fresh_token()
+            held = self._auth.tokens.fresh_token()
             if held is not None:
                 return held
-
-        entry = get_credential_entry(self._config_dir, self._profile)
-        if not entry:
-            raise AuthenticationError("No credentials found. Run: rine onboard")
 
         token, expires_in = await _fetch_oauth_token_async(
             self._http,
             self._api_url,
-            entry["client_id"],
-            entry["client_secret"],
+            self._auth.resolved().signer,
             rng=self._rng,
         )
-        self._tokens.stamp(token, expires_in)
+        self._auth.tokens.stamp(token, expires_in)
         return token
 
     def _invalidate_token(self) -> None:
         """Invalidate the in-memory token cache, expiry included."""
-        self._tokens.clear()
+        self._auth.invalidate()
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         headers: dict[str, str] = {"User-Agent": _USER_AGENT}
@@ -975,6 +1012,15 @@ class AsyncHttpClient:
                 return records
 
         return []  # unreachable — satisfies type checker
+
+    @property
+    def key_pins(self) -> KeyPins:
+        """The pins every key read of this client is admitted to."""
+        return self._keys_cache.pins
+
+    def pin_own_agents(self, agent_ids: Iterable[str]) -> None:
+        """Pin agents this client knows are its own org's, before any key read of them."""
+        self._auth.pin_agents(self._keys_cache.pins, agent_ids)
 
     async def get(self, path: str, **kwargs: Any) -> Any:
         """HTTP GET."""

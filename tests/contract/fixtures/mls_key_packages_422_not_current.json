@@ -1,0 +1,9 @@
+{
+  "body": {
+    "detail": "key package is signed by a key this agent no longer publishes; mint it from the agent's current keys",
+    "error": "mls_key_not_current"
+  },
+  "endpoint": "POST /agents/{agent_id}/mls/key-packages",
+  "scenario": "package signed by an earlier key generation",
+  "status": 422
+}

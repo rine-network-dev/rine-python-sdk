@@ -527,7 +527,7 @@ class TestResolveRecipient:
         self, async_client, sync_client
     ):
         # The other half of the same arm, and why the group is asked FIRST:
-        # ``GET /groups/{id}`` is org-scoped and ``GET /agents/{id}/keys`` is
+        # ``GET /groups/{id}`` is credential-scoped and ``GET /agents/{id}/keys`` is
         # unauthenticated and global, so agent-first would prefer a stranger's
         # namespace over the caller's own org's. The agent rung is untouched —
         # it still answers with the id and spends no request of its own.
@@ -608,7 +608,7 @@ class TestResolveRecipient:
         self, async_client, sync_client
     ):
         # It names nothing in either namespace, and the agent resolver says that
-        # far better than a hunt through the org's groups would.
+        # far better than a hunt through the caller's groups would.
         answered, taken = await _twin(async_client, sync_client, "resolve_recipient", "")
 
         kind, said = answered

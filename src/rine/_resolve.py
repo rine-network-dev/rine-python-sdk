@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from rine._actor import (
     ActorOrigin,
@@ -29,6 +29,10 @@ from rine._actor import (
 )
 from rine._logging import logger
 from rine.errors import ConfigError, NotFoundError
+
+if TYPE_CHECKING:
+    from rine._crypto._key_pins import KeyPins
+    from rine._crypto.certs import VerifiedAgentKeys
 
 _DEFAULT_DOMAIN = ".rine.network"
 
@@ -48,6 +52,26 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 _UUID_ALIAS_RE = re.compile(
     r"/agents/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", re.I
 )
+
+
+def warn_if_handle_moved(pins: KeyPins, to: str, keys: VerifiedAgentKeys) -> None:
+    """Warn when a handle now resolves to another org than last time.
+
+    Warn-only: refusing would break re-onboarding, where a reclaimed handle
+    legitimately moves to a new org. Only a ``name@org`` handle is
+    pinned: a UUID or a bare name carries no org of its own.
+    """
+    if "@" not in to or parses_as_uuid(to):
+        return
+    handle = normalize_handle(to).lower()
+    previous = pins.note_handle_org(handle, keys.org_id)
+    if previous is not None:
+        logger.warning(
+            "handle %s now resolves to org %s; it resolved to org %s before",
+            handle,
+            keys.org_id,
+            previous,
+        )
 
 
 def is_uuid(value: str) -> bool:

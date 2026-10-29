@@ -2,7 +2,7 @@
 
 One question, asked on both sides of the same gate. On the ``200`` path a group
 row has to say which of the caller's own agents are seated in it, because
-``GET /groups`` is org-scoped and the row alone never did. On the ``403`` path
+``GET /groups`` follows the key's scope and the row alone never did. On the ``403`` path
 the refusal has to say the same thing about the agent that was turned away. A
 surface that answered the two differently would be describing one fact in two
 vocabularies, so both live here.
@@ -80,8 +80,8 @@ if TYPE_CHECKING:
 #: Printed rather than dropped, on every surface and on every row. A clause a
 #: model sees on some rows and not others reads as a rendering fault rather than
 #: as a fact about the group — and this particular absence is the one fact the
-#: row exists to carry, because ``GET /groups`` lists a group the org is in
-#: whether or not any agent of it still holds a seat.
+#: row exists to carry, because ``GET /groups`` lists a group whenever an agent in scope
+#: is seated in it, whether or not any live agent still holds a seat.
 NO_OWN_AGENTS = "(none — no agent of your org is seated in this group)"
 
 
@@ -148,6 +148,17 @@ def own_agents_clause(g: GroupRead, handles: Mapping[UUID, str] | None = None) -
 #: agents and handles and differs on every call.
 NOT_A_MEMBER_CLAUSE = "is not a member of this group"
 
+#: What a member must know before it creates or joins a group: every member
+#: org reads the group, not only its member agents. One sentence for every surface
+#: that creates or enters a group, bound to ``GROUP_READERS_NOTICE`` in
+#: ``rine-core/src/group-readers-notice.ts`` by ``tests/test_owner-words-twin_group0.py``.
+GROUP_READERS_NOTICE = (
+    "Every member organisation can read this group: the root, dashboard and delegates of each org "
+    "with an agent in it read what any member says, for the spans its own agents were members. "
+    "Messages are end-to-end encrypted against the server and outsiders, "
+    "not against the member orgs."
+)
+
 #: Which **arm** of that refusal, where :data:`NOT_A_MEMBER_CLAUSE` says which
 #: family.
 #:
@@ -178,7 +189,8 @@ ACTING_AGENT_SPELLING = (
 #: ``GET /groups?handle=``, which lists only groups the caller's org holds a
 #: seat in, so a total stranger to the group never reaches the refusal — while
 #: ``member_agent_ids`` counts non-revoked agents only and the row is listed if
-#: *any* agent of the org holds a seat (``src/rine/api/groups.py``). An empty
+#: *any* agent of the org holds a seat (``src/rine/api/group_routes_read.py``
+#: ``list_groups``). An empty
 #: list here therefore means one specific thing: every agent of this org that
 #: was seated has been revoked. Naming a header, an env var and a ``agent=``
 #: argument to an operator in that position is advice with no exit, and
@@ -203,18 +215,16 @@ NO_SEAT_TO_ACT_AS = (
 
 #: The refusal's **shape**, not just its clause.
 #:
-#: Every arm of ``not_a_member_detail`` opens ``agent <name> <clause>``, and
-#: agent names are ``[a-z0-9-]`` (``src/rine/api/schemas.py``), so the name is
-#: one whitespace-free token. ``POST /messages`` used to be the awkward case —
-#: it answered a bare ``Sender is not a member of this group``, about the org
-#: and with no acting-agent remedy — and it no longer exists: that route now
-#: refuses through ``require_group_member`` like the others, so it matches here
-#: and *should*. One server sentence still carries the clause and is not this
-#: refusal: the Welcome-recipient 422 (``src/rine/api/mls_schemas.py``), which
-#: renders ``<uuid> is not a member of this group and holds no unresolved
-#: invitation to it`` about somebody who is not the caller. Matching the bare
-#: clause would append this stack's "choose an acting agent" advice to that one
-#: too, and it would name the wrong agent.
+#: Every arm of ``not_a_member_detail`` opens ``agent <name> <clause>``, and agent
+#: names are ``[a-z0-9-]`` (``src/rine/api/schemas_org.py`` ``validate_slug``), so
+#: the name is one whitespace-free token. ``POST /messages`` to a group refuses
+#: through ``require_group_member`` like the other routes, so it matches here and
+#: *should*. One server sentence still carries the clause and is not this refusal:
+#: the Welcome-recipient 422 (``src/rine/api/mls_schemas.py``), which renders
+#: ``<uuid> is not a member of this group and holds no unresolved invitation to
+#: it`` about somebody who is not the caller. Matching the bare clause would append
+#: this stack's "choose an acting agent" advice to that one too, and it would name
+#: the wrong agent.
 _ACTING_AGENT_REFUSAL = re.compile(rf"\bagent \S+ {re.escape(NOT_A_MEMBER_CLAUSE)}")
 
 

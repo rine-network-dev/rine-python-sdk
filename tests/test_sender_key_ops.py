@@ -2,23 +2,20 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
 
-from rine._config import save_credentials
-from rine._constants import MessageType
-from rine._crypto.keys import (
-    encryption_public_key_to_jwk,
-    generate_agent_keys,
-    save_agent_keys,
-    signing_public_key_to_jwk,
-)
+from rine._constants import EncryptionVersion, MessageType
+from rine._crypto.keys import make_kid, save_agent_keys
 from rine._crypto.sender_keys import SenderKeyState, generate_sender_key
 from rine._group_send import resolve_group_for_send
 from rine._http import SyncHttpClient
 from rine._sender_key_ops import distribute_sender_key_sync, get_or_create_sender_key_sync
 from rine.errors import NotFoundError
+from rine.testing import WORLD, write_agent_identity
 
 AGENT_ID = "00000000-1111-2222-3333-444444444444"
 MEMBER_ID_1 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -32,15 +29,28 @@ _TOKEN_RESPONSE = {"access_token": "test-token", "expires_in": 900}
 
 
 def _make_http_client(tmp_config_dir: str) -> SyncHttpClient:
-    save_credentials(tmp_config_dir, {"default": {"client_id": "cid", "client_secret": "csecret"}})
+    write_agent_identity(tmp_config_dir, AGENT_ID)
     return SyncHttpClient(config_dir=tmp_config_dir, api_url="https://rine.network")
 
 
-def _make_enc_jwk(agent_id: str, config_dir: str) -> dict[str, str]:
-    """Return an encryption JWK for a fresh keypair saved to disk."""
-    keys = generate_agent_keys()
-    save_agent_keys(config_dir, agent_id, keys)
-    return encryption_public_key_to_jwk(keys.encryption.public_key)
+def _seat_member(config_dir: str, agent_id: str) -> None:
+    """Save a member's derived keys to disk, so its published body is chain-valid."""
+    save_agent_keys(config_dir, agent_id, WORLD.keys(agent_id))
+
+
+def _distribution_response(to_agent_id: str) -> dict[str, str]:
+    """A posted distribution DM, as the server echoes it back."""
+    return {
+        "id": "dddddddd-eeee-ffff-0000-111111111111",
+        "conversation_id": "dddddddd-eeee-ffff-0000-111111111112",
+        "from_agent_id": AGENT_ID,
+        "to_agent_id": to_agent_id,
+        "type": MessageType.SENDER_KEY_DISTRIBUTION,
+        "encrypted_payload": "abc",
+        "encryption_version": EncryptionVersion.HPKE_HYBRID_V2,
+        "sender_signing_kid": make_kid(AGENT_ID, 0),
+        "created_at": "2024-01-01T00:00:00Z",
+    }
 
 
 class TestGetOrCreateSenderKeySync:
@@ -59,7 +69,7 @@ class TestGetOrCreateSenderKeySync:
         )
 
         # Members
-        member1_jwk = _make_enc_jwk(MEMBER_ID_1, tmp_config_dir)
+        _seat_member(tmp_config_dir, MEMBER_ID_1)
         respx.get(f"https://rine.network/groups/{GROUP_ID}/members").mock(
             return_value=httpx.Response(
                 200,
@@ -73,34 +83,12 @@ class TestGetOrCreateSenderKeySync:
 
         # Recipient keys fetch for distribution
         respx.get(f"https://rine.network/agents/{MEMBER_ID_1}/keys").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "agent_id": MEMBER_ID_1,
-                    "encryption_public_key": member1_jwk,
-                    "signing_public_key": signing_public_key_to_jwk(
-                        generate_agent_keys().signing.public_key
-                    ),
-                },
-            )
+            return_value=httpx.Response(200, json=WORLD.keys_response(MEMBER_ID_1))
         )
 
         # Message post for distribution
         respx.post("https://rine.network/messages").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "id": "dddddddd-eeee-ffff-0000-111111111111",
-                    "conversation_id": "dddddddd-eeee-ffff-0000-111111111112",
-                    "from_agent_id": AGENT_ID,
-                    "to_agent_id": MEMBER_ID_1,
-                    "type": MessageType.SENDER_KEY_DISTRIBUTION,
-                    "encrypted_payload": "abc",
-                    "encryption_version": "hpke-v1",
-                    "sender_signing_kid": f"rine:{AGENT_ID}",
-                    "created_at": "2024-01-01T00:00:00Z",
-                },
-            )
+            return_value=httpx.Response(200, json=_distribution_response(MEMBER_ID_1))
         )
 
         http = _make_http_client(tmp_config_dir)
@@ -132,7 +120,7 @@ class TestGetOrCreateSenderKeySync:
 
     @respx.mock
     def test_returns_existing_key_when_valid(self, tmp_config_dir, saved_agent_keys):
-        """When a valid, non-rotated sender key exists, it is returned without generating a new one."""
+        """A valid, non-rotated sender key is returned without generating a new one."""
         import time
 
         from rine._crypto.sender_keys_helpers import save_sender_key_state
@@ -172,40 +160,14 @@ class TestDistributeSenderKeySync:
             return_value=httpx.Response(200, json=_TOKEN_RESPONSE)
         )
 
-        member2_jwk = _make_enc_jwk(MEMBER_ID_2, tmp_config_dir)
-
-        for member_id, jwk in [
-            (MEMBER_ID_1, _make_enc_jwk(MEMBER_ID_1, tmp_config_dir)),
-            (MEMBER_ID_2, member2_jwk),
-        ]:
+        for member_id in (MEMBER_ID_1, MEMBER_ID_2):
+            _seat_member(tmp_config_dir, member_id)
             respx.get(f"https://rine.network/agents/{member_id}/keys").mock(
-                return_value=httpx.Response(
-                    200,
-                    json={
-                        "agent_id": member_id,
-                        "encryption_public_key": jwk,
-                        "signing_public_key": signing_public_key_to_jwk(
-                            generate_agent_keys().signing.public_key
-                        ),
-                    },
-                )
+                return_value=httpx.Response(200, json=WORLD.keys_response(member_id))
             )
 
         msg_route = respx.post("https://rine.network/messages").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "id": "dddddddd-eeee-ffff-0000-111111111111",
-                    "conversation_id": "dddddddd-eeee-ffff-0000-111111111112",
-                    "from_agent_id": AGENT_ID,
-                    "to_agent_id": MEMBER_ID_1,
-                    "type": MessageType.SENDER_KEY_DISTRIBUTION,
-                    "encrypted_payload": "abc",
-                    "encryption_version": "hpke-v1",
-                    "sender_signing_kid": f"rine:{AGENT_ID}",
-                    "created_at": "2024-01-01T00:00:00Z",
-                },
-            )
+            return_value=httpx.Response(200, json=_distribution_response(MEMBER_ID_1))
         )
 
         state = generate_sender_key(GROUP_ID, AGENT_ID)
@@ -228,6 +190,34 @@ class TestDistributeSenderKeySync:
         # Names the sending agent: a multi-agent org has no default sender, and
         # the server rejects the distribution DM without it.
         assert all(c.request.headers["X-Rine-Agent"] == AGENT_ID for c in msg_route.calls)
+
+    @respx.mock
+    def test_distribution_carries_the_senders_own_copy(self, tmp_config_dir, saved_agent_keys):
+        """The posted body carries a self-encrypted copy, distinct from the recipient's.
+
+        Without it the org's reader cannot open an own agent's open-group posts:
+        a sender never distributes its key to itself, so the first distribution
+        the org sent is unreadable to it and no recovery path can re-ingest it.
+        """
+        respx.post("https://rine.network/oauth/token").mock(
+            return_value=httpx.Response(200, json=_TOKEN_RESPONSE)
+        )
+        _seat_member(tmp_config_dir, MEMBER_ID_1)
+        respx.get(f"https://rine.network/agents/{MEMBER_ID_1}/keys").mock(
+            return_value=httpx.Response(200, json=WORLD.keys_response(MEMBER_ID_1))
+        )
+        msg_route = respx.post("https://rine.network/messages").mock(
+            return_value=httpx.Response(200, json=_distribution_response(MEMBER_ID_1))
+        )
+
+        state = generate_sender_key(GROUP_ID, AGENT_ID)
+        http = _make_http_client(tmp_config_dir)
+        distribute_sender_key_sync(http, tmp_config_dir, AGENT_ID, state, GROUP_ID, [MEMBER_ID_1])
+        http.close()
+
+        body = json.loads(msg_route.calls[0].request.content)
+        assert body["self_encrypted_payload"]
+        assert body["self_encrypted_payload"] != body["encrypted_payload"]
 
     @respx.mock
     def test_records_failed_recipients(self, tmp_config_dir, saved_agent_keys):

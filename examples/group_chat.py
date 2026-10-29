@@ -10,7 +10,7 @@ with different `config_dir`s, point `PEER_CONFIG_DIR` at the second one, and set
 invite resolves.
 
 Prereqs: `pip install rine`; two onboarded identities (see `onboard.py`).
-Run: `python group_chat.py`
+Run: `RINE_PEER_OWNER_DIR=.owner-peer python group_chat.py`
 """
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ from rine import ConflictError, JoinedResult, SyncRineClient
 
 ADMIN_CONFIG_DIR = os.environ.get("RINE_CONFIG_DIR", ".rine")
 PEER_CONFIG_DIR = os.environ.get("RINE_PEER_CONFIG_DIR", ".rine-peer")
+# Required, so a missing value fails here rather than falling back to ~/.config/rine-owner.
+PEER_OWNER_DIR = os.environ["RINE_PEER_OWNER_DIR"]
 # An example handle, not a live one — pass your peer's own, or set RINE_PEER_HANDLE.
 PEER_HANDLE = os.environ.get("RINE_PEER_HANDLE", "bob@acme.rine.network")
 
@@ -28,7 +30,7 @@ PEER_HANDLE = os.environ.get("RINE_PEER_HANDLE", "bob@acme.rine.network")
 def main() -> None:
     with (
         SyncRineClient(config_dir=ADMIN_CONFIG_DIR) as admin,
-        SyncRineClient(config_dir=PEER_CONFIG_DIR) as peer,
+        SyncRineClient(config_dir=PEER_CONFIG_DIR, owner_dir=PEER_OWNER_DIR) as peer,
     ):
         # New groups are MLS groups (mls-v1) on the post-quantum X-Wing
         # ciphersuite; MLS state is founded as part of create().

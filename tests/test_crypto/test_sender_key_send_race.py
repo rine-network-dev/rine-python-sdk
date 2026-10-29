@@ -50,12 +50,7 @@ import pytest
 
 from rine import _sender_key_ops
 from rine._crypto import message, sender_keys_store, sender_keys_thread_lock
-from rine._crypto.keys import (
-    generate_agent_keys,
-    load_agent_keys,
-    public_keys_body,
-    save_agent_keys,
-)
+from rine._crypto.keys import save_agent_keys
 from rine._crypto.message import decrypt_group_message_sync, encrypt_group_message
 from rine._crypto.sender_keys import (
     ROTATION_MESSAGE_LIMIT,
@@ -70,7 +65,9 @@ from rine._sender_key_ops import (
     sender_key_state_exists,
 )
 from rine.errors import UnpersistedSenderKeyStateError
+from rine.testing import WORLD
 from tests.conftest import sender_key_region_is_held_here
+from tests.test_crypto.world import KeyServer
 
 SENDER_ID = "00000000-1111-2222-3333-444444444444"
 #: Already holds this agent's key.
@@ -90,24 +87,7 @@ _GROUP = {"id": GROUP_ID, "handle": GROUP_HANDLE, "mls_group_id": None, "mls_pen
 _KEYS_PATH = re.compile(r"^/agents/([^/]+)/keys$")
 
 
-class _ColdKeyCache:
-    """The one client attribute the inbound-verify read reaches for.
-
-    ``rine._crypto._agent_keys.get_agent_keys_sync`` consults ``client._keys_cache``
-    before the network. Kept permanently cold so every verify goes to
-    :class:`FanOutServer`, which is the only thing here that knows what this agent
-    published.
-    """
-
-    def get(self, _agent_id: str) -> None:
-        """Never answer from cache."""
-        return None
-
-    def set(self, _agent_id: str, _data: dict[str, Any]) -> None:
-        """Keep nothing."""
-
-
-class FanOutServer:
+class FanOutServer(KeyServer):
     """The roster read, key reads and distribution posts one send makes.
 
     ``on_post`` runs INSIDE the fan-out — the recipient's keys have been fetched
@@ -116,34 +96,25 @@ class FanOutServer:
     these sends fans out to exactly one recipient; a second post would fire it
     again, which no test wants.
 
-    The SENDER's own published keys are served from what ``_seat_sender`` wrote to
-    disk, not minted fresh: a self-read decrypt verifies this agent's signature
-    against them, and a freshly generated pair would fail that verify rather than
-    answer the question under test. Construct this only after ``_seat_sender``.
+    Key reads are answered from :data:`rine.testing.WORLD`, so every
+    agent's published keys are the derived ones it holds on disk and a self-read
+    decrypt verifies this agent's signature against them.
     """
 
-    def __init__(self, config_dir: str, roster: list[str], on_post: Any = None) -> None:
-        """Serve one group's roster and every seated agent's published keys."""
+    def __init__(self, roster: list[str], on_post: Any = None) -> None:
+        """Serve one group's roster and every agent's chain-valid published keys."""
+        super().__init__()
         self.roster = roster
         self.posts: list[dict[str, Any]] = []
         self._on_post = on_post
-        self._keys_cache = _ColdKeyCache()
-        self._published: dict[str, dict[str, Any]] = {
-            SENDER_ID: public_keys_body(load_agent_keys(config_dir, SENDER_ID))
-        }
-        for agent_id in roster:
-            if agent_id == SENDER_ID:
-                continue
-            self._published[agent_id] = public_keys_body(generate_agent_keys())
 
-    def get(self, path: str, **_kwargs: object) -> Any:
+    def get(self, path: str, **kwargs: Any) -> Any:
         """Answer the roster read and each agent's published keys."""
         if path == f"/groups/{GROUP_ID}/members":
             return {"items": [{"agent_id": a, "role": "member"} for a in self.roster]}
-        match = _KEYS_PATH.match(path)
-        if match is not None and match.group(1) in self._published:
-            return self._published[match.group(1)]
-        raise AssertionError(f"unexpected GET {path}")
+        if _KEYS_PATH.match(path) is None:
+            raise AssertionError(f"unexpected GET {path}")
+        return super().get(path, **kwargs)
 
     def post(self, path: str, **kwargs: Any) -> dict[str, str]:
         """Accept one distribution DM, running the concurrent writer first."""
@@ -156,7 +127,7 @@ class FanOutServer:
 
 def _seat_sender(config_dir: str) -> None:
     """The sending agent's own keys on disk, which every seal loads."""
-    save_agent_keys(config_dir, SENDER_ID, generate_agent_keys())
+    save_agent_keys(config_dir, SENDER_ID, WORLD.keys(SENDER_ID))
 
 
 def _own_key(config_dir: str, distributed_to: list[str], message_index: int = 0) -> SenderKeyState:
@@ -251,7 +222,6 @@ class TestDistributingToANewMember:
         own = _own_key(tmp_config_dir, distributed_to=list(prior))
         arriving: list[SenderKeyState] = []
         server = FanOutServer(
-            tmp_config_dir,
             [SENDER_ID, *prior, MEMBER_B_ID],
             lambda: arriving.append(_peer_key(tmp_config_dir)),
         )
@@ -295,7 +265,7 @@ class TestDistributingToANewMember:
             message_index=0,
         )
         save_sender_key_state(tmp_config_dir, SENDER_ID, GROUP_ID, [squat, own])
-        server = FanOutServer(tmp_config_dir, [SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
+        server = FanOutServer([SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
 
         state = get_or_create_sender_key_sync(server, tmp_config_dir, SENDER_ID, _GROUP)
 
@@ -324,7 +294,6 @@ class TestDistributingToANewMember:
         _own_key(tmp_config_dir, distributed_to=[MEMBER_A_ID])
         peer = _peer_key(tmp_config_dir)
         server = FanOutServer(
-            tmp_config_dir,
             [SENDER_ID, MEMBER_A_ID, MEMBER_B_ID],
             lambda: _advance_on_disk(tmp_config_dir, peer.sender_key_id, 5),
         )
@@ -349,7 +318,6 @@ class TestDistributingToANewMember:
         own = _own_key(tmp_config_dir, distributed_to=[MEMBER_A_ID])
         replacement = generate_sender_key(GROUP_ID, SENDER_ID)
         server = FanOutServer(
-            tmp_config_dir,
             [SENDER_ID, MEMBER_A_ID, MEMBER_B_ID],
             lambda: save_sender_key_state(tmp_config_dir, SENDER_ID, GROUP_ID, [replacement]),
         )
@@ -385,7 +353,7 @@ class TestDistributingToANewMember:
         """
         _seat_sender(tmp_config_dir)
         _own_key(tmp_config_dir, distributed_to=[MEMBER_A_ID])
-        server = FanOutServer(tmp_config_dir, [SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
+        server = FanOutServer([SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
         left: list[bool] = []
 
         def load_then_leave(*args: Any, **kwargs: Any) -> list[SenderKeyState]:
@@ -415,7 +383,6 @@ class TestRotating:
         )
         arriving: list[SenderKeyState] = []
         server = FanOutServer(
-            tmp_config_dir,
             [SENDER_ID, MEMBER_A_ID],
             lambda: arriving.append(_peer_key(tmp_config_dir)),
         )
@@ -442,7 +409,6 @@ class TestRotating:
         )
         peer = _peer_key(tmp_config_dir)
         server = FanOutServer(
-            tmp_config_dir,
             [SENDER_ID, MEMBER_A_ID],
             lambda: _advance_on_disk(tmp_config_dir, peer.sender_key_id, 5),
         )
@@ -473,14 +439,14 @@ class TestRotationAndSelfRead:
         """
         _seat_sender(config_dir)
         _own_key(config_dir, distributed_to=[MEMBER_A_ID, MEMBER_B_ID])
-        seated = FanOutServer(config_dir, [SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
+        seated = FanOutServer([SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
         state = get_or_create_sender_key_sync(seated, config_dir, SENDER_ID, _GROUP)
         result, _ = encrypt_group_message(
             config_dir, SENDER_ID, GROUP_ID, state, {"body": "my own post"}
         )
 
         # MEMBER_B is gone from the roster, which is a rotation trigger.
-        after = FanOutServer(config_dir, [SENDER_ID, MEMBER_A_ID])
+        after = FanOutServer([SENDER_ID, MEMBER_A_ID])
         rotated = get_or_create_sender_key_sync(after, config_dir, SENDER_ID, _GROUP)
         assert rotated.sender_key_id != state.sender_key_id
         return after, result.encrypted_payload, state, rotated
@@ -513,7 +479,7 @@ class TestRotationAndSelfRead:
         assert _own_ids(tmp_config_dir) == [first.sender_key_id, second.sender_key_id]
 
         # Every remaining member leaves too, so the removal check fires again.
-        empty = FanOutServer(tmp_config_dir, [SENDER_ID])
+        empty = FanOutServer([SENDER_ID])
         third = get_or_create_sender_key_sync(empty, tmp_config_dir, SENDER_ID, _GROUP)
 
         assert _own_ids(tmp_config_dir) == [second.sender_key_id, third.sender_key_id]
@@ -533,7 +499,7 @@ class TestRotationAndSelfRead:
         """
         _after, _sealed, _first, second = self._post_then_rotate(tmp_config_dir)
 
-        unchanged = FanOutServer(tmp_config_dir, [SENDER_ID, MEMBER_A_ID])
+        unchanged = FanOutServer([SENDER_ID, MEMBER_A_ID])
         again = get_or_create_sender_key_sync(unchanged, tmp_config_dir, SENDER_ID, _GROUP)
 
         assert again.sender_key_id == second.sender_key_id
@@ -559,7 +525,7 @@ class TestTheSendTail:
         """
         _seat_sender(tmp_config_dir)
         own = _own_key(tmp_config_dir, distributed_to=[MEMBER_A_ID])
-        server = FanOutServer(tmp_config_dir, [SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
+        server = FanOutServer([SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
 
         state = get_or_create_sender_key_sync(server, tmp_config_dir, SENDER_ID, _GROUP)
         encrypt_group_message(tmp_config_dir, SENDER_ID, GROUP_ID, state, {"body": "hello"})
@@ -621,7 +587,6 @@ class TestTheSendTail:
         _seat_sender(tmp_config_dir)
         _own_key(tmp_config_dir, distributed_to=[MEMBER_A_ID])
         server = FanOutServer(
-            tmp_config_dir,
             [SENDER_ID, MEMBER_A_ID, MEMBER_B_ID],
             lambda: delete_sender_key(tmp_config_dir, SENDER_ID, GROUP_ID),
         )
@@ -663,7 +628,6 @@ class TestTheSendTail:
         replacement = generate_sender_key(GROUP_ID, SENDER_ID)
         replacement.distributed_to = [MEMBER_A_ID, MEMBER_B_ID]
         server = FanOutServer(
-            tmp_config_dir,
             [SENDER_ID, MEMBER_A_ID, MEMBER_B_ID],
             lambda: save_sender_key_state(tmp_config_dir, SENDER_ID, GROUP_ID, [own, replacement]),
         )
@@ -675,7 +639,7 @@ class TestTheSendTail:
         # the post it just sent — but it stays where the rotation put it.
         assert _own_ids(tmp_config_dir) == [own.sender_key_id, replacement.sender_key_id]
 
-        unchanged = FanOutServer(tmp_config_dir, [SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
+        unchanged = FanOutServer([SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
         picked = get_or_create_sender_key_sync(unchanged, tmp_config_dir, SENDER_ID, _GROUP)
 
         assert picked.sender_key_id == replacement.sender_key_id
@@ -709,9 +673,7 @@ class TestTheSendTail:
             save_sender_key_state(tmp_config_dir, SENDER_ID, GROUP_ID, [own, first])
             save_sender_key_state(tmp_config_dir, SENDER_ID, GROUP_ID, [first, second])
 
-        server = FanOutServer(
-            tmp_config_dir, [SENDER_ID, MEMBER_A_ID, MEMBER_B_ID], _two_rotations
-        )
+        server = FanOutServer([SENDER_ID, MEMBER_A_ID, MEMBER_B_ID], _two_rotations)
 
         state = get_or_create_sender_key_sync(server, tmp_config_dir, SENDER_ID, _GROUP)
         encrypt_group_message(tmp_config_dir, SENDER_ID, GROUP_ID, state, {"body": "hello"})
@@ -720,7 +682,7 @@ class TestTheSendTail:
 
         # Through the SELECTOR, because that is what the defect costs: the key the
         # next post is sealed under.
-        unchanged = FanOutServer(tmp_config_dir, [SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
+        unchanged = FanOutServer([SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
         picked = get_or_create_sender_key_sync(unchanged, tmp_config_dir, SENDER_ID, _GROUP)
 
         assert picked.sender_key_id == second.sender_key_id
@@ -869,7 +831,7 @@ class TestTwoRotationsAtOnce:
         minted: list[str] = []
 
         def send() -> None:
-            server = FanOutServer(tmp_config_dir, [SENDER_ID, MEMBER_A_ID])
+            server = FanOutServer([SENDER_ID, MEMBER_A_ID])
             state = get_or_create_sender_key_sync(server, tmp_config_dir, SENDER_ID, _GROUP)
             minted.append(state.sender_key_id)
 
@@ -1034,7 +996,7 @@ class TestEveryWriteHappensInsideItsRegion:
         """``_record_distribution``'s merge of ``distributed_to``, after the fan-out."""
         _seat_sender(tmp_config_dir)
         own = _own_key(tmp_config_dir, distributed_to=[MEMBER_A_ID])
-        server = FanOutServer(tmp_config_dir, [SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
+        server = FanOutServer([SENDER_ID, MEMBER_A_ID, MEMBER_B_ID])
         held: list[bool] = []
         real = _sender_key_ops.merge_sender_key_states
 

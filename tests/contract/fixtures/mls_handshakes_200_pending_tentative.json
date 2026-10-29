@@ -1,0 +1,9 @@
+{
+  "body": {
+    "handshakes": [],
+    "pending_commit": "tentative"
+  },
+  "endpoint": "GET /groups/{group_id}/mls/handshakes",
+  "scenario": "own commit awaits a peer ACK",
+  "status": 200
+}

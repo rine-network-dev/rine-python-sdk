@@ -25,7 +25,7 @@ import httpx
 import pytest
 import respx
 
-from rine._mls import KEY_PACKAGE_TARGET, reset_key_package_rescue_gate
+from rine._mls import KEY_PACKAGE_TARGET, reset_mls_heartbeat_gate
 from rine._mls.resync import MlsRecoveryResult
 from rine._resources.group_sync import _recover_mls_with_top_up
 from rine.errors import MlsResyncUnavailableError
@@ -47,9 +47,9 @@ REPLAYED = MlsRecoveryResult(
 @pytest.fixture(autouse=True)
 def _fresh_rescue_gate():
     """Per process by design, so a test must not inherit the last one's rescue."""
-    reset_key_package_rescue_gate()
+    reset_mls_heartbeat_gate()
     yield
-    reset_key_package_rescue_gate()
+    reset_mls_heartbeat_gate()
 
 
 def _mock_token() -> None:
@@ -70,20 +70,18 @@ def _ladder_raises(monkeypatch) -> None:
     def _refuse(*_args, **_kwargs):
         raise MlsResyncUnavailableError(GROUP_ID)
 
-    monkeypatch.setattr("rine._resources.group_sync.recover_mls_group", _refuse)
+    monkeypatch.setattr("rine._resources.group_sync.recover_mls_group_or_reseat", _refuse)
 
 
 def _ladder_returns(monkeypatch, result: MlsRecoveryResult = REPLAYED) -> None:
     monkeypatch.setattr(
-        "rine._resources.group_sync.recover_mls_group",
+        "rine._resources.group_sync.recover_mls_group_or_reseat",
         lambda *_args, **_kwargs: result,
     )
 
 
 def _recover(sync_client, tmp_config_dir, agent_id):
-    return _recover_mls_with_top_up(
-        sync_client._http, tmp_config_dir, agent_id, GROUP_ID, cipher_suite=None
-    )
+    return _recover_mls_with_top_up(sync_client._http, tmp_config_dir, agent_id, GROUP_ID)
 
 
 class TestTheTopUpRidesAheadOfTheLadder:

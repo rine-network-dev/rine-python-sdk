@@ -106,6 +106,13 @@ def _invites(items: list[dict[str, Any]]) -> respx.Route:
     )
 
 
+def _org_joinable(group_id: str | None) -> respx.Route:
+    """``GET /groups/org-joinable``: the open or voted group of that handle the org sits in."""
+    return respx.get(f"{API}/groups/org-joinable").mock(
+        return_value=httpx.Response(200, json={"id": group_id})
+    )
+
+
 def _directory(items: list[dict[str, Any]], total_estimate: int | None = None) -> respx.Route:
     """One directory page, with the server's own ``total_estimate`` field.
 
@@ -196,11 +203,29 @@ class TestJoinReferenceSync:
         assert joined.called
 
     @respx.mock
+    def test_join_when_the_handle_is_an_own_org_group_then_resolves_off_the_lookup(
+        self, sync_client
+    ):
+        """An agent's own seats are all ``GET /groups`` shows it; a sibling's open group is not."""
+        _mock_token()
+        _seated([])
+        _invites([])
+        directory = _directory([])
+        lookup = _org_joinable(INVITED_ID)
+        joined = _joins(INVITED_ID)
+
+        assert sync_client.groups.join(HANDLE).status == "joined"
+        assert joined.called
+        assert lookup.calls.last.request.url.params["handle"] == HANDLE
+        assert not directory.called
+
+    @respx.mock
     def test_join_when_the_handle_is_only_in_the_directory_then_resolves_off_it(self, sync_client):
         """The measured defect: a handle ``discover_groups`` had just printed."""
         _mock_token()
         _seated([])
         _invites([])
+        _org_joinable(None)
         directory = _directory([_group_row(PUBLIC_ID)])
         joined = _joins(PUBLIC_ID)
 
@@ -224,6 +249,7 @@ class TestJoinReferenceSync:
         _mock_token()
         _seated([])
         _invites([])
+        _org_joinable(None)
         directory = _directory([_group_row(PUBLIC_ID)])
         _joins(PUBLIC_ID)
 
@@ -244,6 +270,7 @@ class TestJoinReferenceSync:
         _mock_token()
         _seated([])
         _invites([])
+        _org_joinable(None)
         _directory([_group_row(PUBLIC_ID, NEAR_MISS_HANDLE)], total_estimate=1)
 
         with pytest.raises(NotFoundError):
@@ -276,6 +303,7 @@ class TestJoinReferenceSync:
         _mock_token()
         seated = _seated([_group_row(SEATED_ID)])
         _invites([_invite_row(INVITED_ID, "#other@gqb.rine.network")])
+        _org_joinable(None)
         directory = _directory([_group_row(PUBLIC_ID)])
 
         with pytest.raises(NotFoundError) as refused:
@@ -305,10 +333,11 @@ class TestJoinReferenceSync:
         assert OTHER_ORG_HANDLE in message
 
     @respx.mock
-    def test_join_when_no_rung_answers_the_handle_then_names_all_three(self, sync_client):
+    def test_join_when_no_rung_answers_the_handle_then_names_all_four(self, sync_client):
         _mock_token()
         _seated([])
         _invites([])
+        _org_joinable(None)
         _directory([], total_estimate=0)
 
         with pytest.raises(NotFoundError) as refused:
@@ -332,6 +361,7 @@ class TestJoinReferenceSync:
         _mock_token()
         _seated([])
         _invites([])
+        _org_joinable(None)
         directory = _directory_pages(total_estimate=9)
 
         with pytest.raises(NotFoundError) as refused:
@@ -348,6 +378,7 @@ class TestJoinReferenceSync:
         _mock_token()
         _seated([])
         _invites([])
+        _org_joinable(None)
         _directory_pages(total_estimate=None)
 
         with pytest.raises(NotFoundError) as refused:
@@ -397,12 +428,29 @@ class TestJoinReferenceAsync:
         await async_client.close()
 
     @respx.mock
+    async def test_join_when_the_handle_is_an_own_org_group_then_resolves_off_the_lookup(
+        self, async_client
+    ):
+        _mock_token()
+        _seated([])
+        _invites([])
+        directory = _directory([])
+        lookup = _org_joinable(INVITED_ID)
+        joined = _joins(INVITED_ID)
+
+        assert (await async_client.groups.join(HANDLE)).status == "joined"
+        assert joined.called
+        assert lookup.calls.last.request.url.params["handle"] == HANDLE
+        assert not directory.called
+
+    @respx.mock
     async def test_join_when_the_handle_is_only_in_the_directory_then_resolves_off_it(
         self, async_client
     ):
         _mock_token()
         _seated([])
         _invites([])
+        _org_joinable(None)
         directory = _directory([_group_row(PUBLIC_ID)])
         joined = _joins(PUBLIC_ID)
 
@@ -422,6 +470,7 @@ class TestJoinReferenceAsync:
         _mock_token()
         _seated([])
         _invites([])
+        _org_joinable(None)
         directory = _directory([_group_row(PUBLIC_ID)])
         _joins(PUBLIC_ID)
 
@@ -445,6 +494,7 @@ class TestJoinReferenceAsync:
         _mock_token()
         _seated([])
         _invites([])
+        _org_joinable(None)
         _directory([_group_row(PUBLIC_ID, NEAR_MISS_HANDLE)], total_estimate=1)
 
         with pytest.raises(NotFoundError):
@@ -473,6 +523,7 @@ class TestJoinReferenceAsync:
         _mock_token()
         seated = _seated([_group_row(SEATED_ID)])
         _invites([_invite_row(INVITED_ID, "#other@gqb.rine.network")])
+        _org_joinable(None)
         directory = _directory([_group_row(PUBLIC_ID)])
 
         with pytest.raises(NotFoundError) as refused:
@@ -503,10 +554,11 @@ class TestJoinReferenceAsync:
         await async_client.close()
 
     @respx.mock
-    async def test_join_when_no_rung_answers_the_handle_then_names_all_three(self, async_client):
+    async def test_join_when_no_rung_answers_the_handle_then_names_all_four(self, async_client):
         _mock_token()
         _seated([])
         _invites([])
+        _org_joinable(None)
         _directory([], total_estimate=0)
 
         with pytest.raises(NotFoundError) as refused:
@@ -525,6 +577,7 @@ class TestJoinReferenceAsync:
         _mock_token()
         _seated([])
         _invites([])
+        _org_joinable(None)
         directory = _directory_pages(total_estimate=9)
 
         with pytest.raises(NotFoundError) as refused:
@@ -543,6 +596,7 @@ class TestJoinReferenceAsync:
         _mock_token()
         _seated([])
         _invites([])
+        _org_joinable(None)
         _directory_pages(total_estimate=None)
 
         with pytest.raises(NotFoundError) as refused:

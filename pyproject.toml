@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rine"
-version = "0.13.0"
+version = "0.14.0"
 description = "Python SDK for the Rine messaging platform — E2E-encrypted messaging for AI agents"
 readme = "README.md"
 license = "EUPL-1.2"
@@ -32,22 +32,21 @@ dependencies = [
     # default, so the wheel's ML-KEM-768 primitives are on the DM path too.
     # Prebuilt wheels cover linux x64/arm64 (glibc+musl) and macOS arm64/x64;
     # Windows is not published yet.
-    # Version floor: 0.1.0 is the first rine-mls to export the `ml_kem768_*`
-    # primitives — an older wheel has the MLS surface but not the primitives, and
-    # the DM path fails at import. The floor is 0.1.1 because that release fixes
-    # a state-corruption bug: two processes saving the same group at once shared
-    # one temp file and could leave a spliced group state behind, which no
-    # reader recovers from. A corrupt local state is not something an SDK should
-    # merely tolerate an older wheel for.
-    # Upper bound: this SDK and the Node stack (@rine-network/mls, pinned `^0.1.1`
+    # Version floor: 0.2.0 is the first rine-mls with the org-root surface this
+    # SDK is built on: the ML-KEM-768 and ML-DSA-65 seed-derived keys, the
+    # `AllowedIdentities` set an MLS client opens with (credential identities are
+    # the ASCII of the canonical agent id), the `EpochReader` that opens an
+    # escrowed epoch, and `take_escrow_exports`. It also drops the classical
+    # cipher suite, so a 0.1.x wheel cannot be paired with this SDK at all.
+    # Upper bound: this SDK and the Node stack (@rine-network/mls, pinned `^0.2.0`
     # by rewrite-file-deps.py at publish time) share the same on-disk group-state
     # encoding, since our docs bless a shared config dir between a Python and a
     # Node agent. The two runtimes must agree on that encoding byte-for-byte, so
     # the bound is a correctness constraint, not version caution: an unbounded
-    # floor would let Python silently pick up a 0.2.0 that changed the wire
-    # encoding while Node's `^0.1.1` refuses it, breaking the shared state with
+    # floor would let Python silently pick up a 0.3.0 that changed the wire
+    # encoding while Node's `^0.2.0` refuses it, breaking the shared state with
     # no error on either side.
-    "rine-mls>=0.1.1,<0.2.0",
+    "rine-mls>=0.2.0,<0.3.0",
     # The BIP39 English wordlist, for verification words. A hard dependency
     # rather than an extra because recomputing an agent's words locally is the
     # only thing that makes them mean anything — a surface that falls back to

@@ -1,0 +1,10 @@
+{
+  "body": {
+    "access_token": "<jwt>",
+    "expires_in": 900,
+    "token_type": "bearer"
+  },
+  "endpoint": "POST /oauth/token",
+  "scenario": "org private_key_jwt exchange (token redacted)",
+  "status": 200
+}

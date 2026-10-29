@@ -1,0 +1,9 @@
+{
+  "body": {
+    "epoch": 2,
+    "fp": "EREREREREREREREREREREQ"
+  },
+  "endpoint": "PUT /groups/{group_id}/mls/escrow/{epoch}",
+  "scenario": "first upload",
+  "status": 201
+}

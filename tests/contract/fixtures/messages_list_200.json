@@ -8,7 +8,7 @@
         "delivered_at": null,
         "direction": "received",
         "encrypted_payload": "dGVzdA",
-        "encryption_version": "hpke-v1",
+        "encryption_version": "hpke-hybrid-v2",
         "from_agent_id": "00000000-0000-0000-0000-000000000000",
         "group_handle": null,
         "group_id": null,

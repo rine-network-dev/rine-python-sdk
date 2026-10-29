@@ -60,7 +60,7 @@ MESSAGE = {
     "from_agent_id": KOFI_ID,
     "type": "rine.v1.task_request",
     "encrypted_payload": "x",
-    "encryption_version": "hpke-v1",
+    "encryption_version": "hpke-hybrid-v2",
     "sender_signing_kid": f"rine:{KOFI_ID}",
     "created_at": "2024-01-01T00:00:00Z",
 }
@@ -198,7 +198,7 @@ class TestARecipientThatNamesAGroup:
         # Nothing was sealed and nothing was posted — the refusal is the point.
         assert waited.branches == ()
         assert waited.body is None
-        # One org-scoped read is what the fix costs, and it is the shared
+        # One credential-scoped read is what the fix costs, and it is the shared
         # `_readable_group_by_id` — never a hand-rolled `GET /groups/` + id,
         # which would drop the answered-row-id check that read performs.
         assert waited.group_reads == [f"GET /groups/{GROUP_UUID}"]

@@ -59,6 +59,15 @@ def mls_group_id_bytes(group_id: str) -> bytes:
     return uuid.UUID(group_id).bytes
 
 
+def mls_state_path(store_dir: str, group_id: str) -> str:
+    """The file inside an MLS store root that holds one group's current state.
+
+    The native core keeps one directory per group under the store and writes the
+    group's state to ``state.bin`` inside it.
+    """
+    return os.path.join(store_dir, "groups", mls_group_id_bytes(group_id).hex(), "state.bin")
+
+
 def load_mls_group(client: MlsClient, group_id: str) -> MlsGroup | None:
     """This agent's local state for one group, or ``None`` when it holds none.
 
@@ -73,13 +82,7 @@ def load_mls_group(client: MlsClient, group_id: str) -> MlsGroup | None:
         return None
 
 
-def open_mls_group(
-    config_dir: str,
-    agent_id: str,
-    group_id: str,
-    *,
-    cipher_suite: int | None = None,
-) -> MlsGroup:
+def open_mls_group(config_dir: str, agent_id: str, group_id: str) -> MlsGroup:
     """This agent's local state for a group, or a typed refusal when it has none.
 
     The one entry point for every operation that needs an established group —
@@ -89,9 +92,7 @@ def open_mls_group(
     Raises:
         NoMlsGroupStateError: When this agent holds no state for the group.
     """
-    group = load_mls_group(
-        open_mls_client(config_dir, agent_id, cipher_suite=cipher_suite), group_id
-    )
+    group = load_mls_group(open_mls_client(config_dir, agent_id), group_id)
     if group is None:
         raise NoMlsGroupStateError(group_id)
     return group
@@ -129,12 +130,7 @@ def _state_stamp(config_dir: str, agent_id: str, group_id: str) -> _StateStamp:
     propagates, exactly as :func:`load_mls_group` refuses to let one
     masquerade as "never joined".
     """
-    path = os.path.join(
-        mls_store_dir(config_dir, agent_id),
-        "groups",
-        mls_group_id_bytes(group_id).hex(),
-        "state.bin",
-    )
+    path = mls_state_path(mls_store_dir(config_dir, agent_id), group_id)
     try:
         stat = os.stat(path)
     except (FileNotFoundError, NotADirectoryError):
@@ -194,6 +190,7 @@ __all__ = [
     "holds_mls_state",
     "load_mls_group",
     "mls_group_id_bytes",
+    "mls_state_path",
     "note_mls_state_changed",
     "open_mls_group",
 ]

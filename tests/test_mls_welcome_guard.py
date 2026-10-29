@@ -19,13 +19,12 @@ test.
 from __future__ import annotations
 
 import base64
-import os
 
 import httpx
 import pytest
 import respx
 
-from rine._crypto.keys import generate_agent_keys, save_agent_keys, signing_public_key_to_jwk
+from rine._crypto.keys import save_agent_keys
 from rine._mls import (
     DEFAULT_CIPHER_SUITE,
     load_mls_group,
@@ -33,14 +32,17 @@ from rine._mls import (
     open_mls_client,
     process_mls_welcomes,
 )
+from rine._mls.binding import credential_identity
 from rine._mls.join import join_mls_state
 from rine._mls.welcome_guard import MlsWelcomeRefusedError
 from rine._mls.welcome_spool import WelcomeSpool
+from rine.testing import WORLD
+from tests.mls_peers import FOUNDER_ID, GROUP_ID, honest_welcome, peer_client
+
+pytestmark = pytest.mark.usefixtures("mls_escrow_stub")
 
 API = "https://rine.network"
-GROUP_ID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 OTHER_GROUP_ID = "cccccccc-dddd-eeee-ffff-000000000000"
-FOUNDER_ID = "11111111-2222-3333-4444-555555555555"
 OTHER_FOUNDER_ID = "22222222-3333-4444-5555-666666666666"
 IMPOSTOR_ID = "99999999-8888-7777-6666-555555555555"
 
@@ -58,36 +60,11 @@ _GROUP_PAYLOAD = {
 }
 
 
-def _peer_client(tmp_path, agent: str):
-    """This peer's MLS client, minting its keys once and reopening them after.
-
-    Reopening matters: a peer whose keys were regenerated has a different MLS
-    identity, and the guard under test compares identities for a living.
-    """
-    peer_dir = str(tmp_path / f"peer-{agent}")
-    if not os.path.isdir(peer_dir):
-        save_agent_keys(peer_dir, agent, generate_agent_keys())
-    return open_mls_client(peer_dir, agent)
-
-
-def _honest_welcome(
-    tmp_config_dir, agent_id, tmp_path, group_id=GROUP_ID, founder_id=FOUNDER_ID
-) -> bytes:
-    """A founder seats the victim in ``group_id`` and hands over its Welcome."""
-    founder = _peer_client(tmp_path, founder_id)
-    victim = open_mls_client(tmp_config_dir, agent_id)
-    group = founder.create_group_with_members(
-        mls_group_id_bytes(group_id), [victim.generate_key_package()]
-    )
-    group.save()
-    bundle = group.last_commit()
-    assert bundle is not None
-    return bundle.welcomes[0]
-
-
 def _substituted_welcome(tmp_config_dir, agent_id, tmp_path, group_id=GROUP_ID) -> bytes:
     """The server founds its OWN group under ``group_id`` and seals a Welcome."""
-    impostor = _peer_client(tmp_path, IMPOSTOR_ID)
+    impostor = peer_client(tmp_path, IMPOSTOR_ID, agent_id)
+    # The victim's client has to know the impostor's leaf key to adopt the tree.
+    save_agent_keys(tmp_config_dir, IMPOSTOR_ID, WORLD.keys(IMPOSTOR_ID))
     victim = open_mls_client(tmp_config_dir, agent_id)
     group = impostor.create_group_with_members(
         mls_group_id_bytes(group_id), [victim.generate_key_package()]
@@ -103,7 +80,6 @@ def _mock_server(
     deliveries: list[tuple[str, bytes]],
     *,
     roster: dict[str, list[str]] | None = None,
-    identities: dict[str, bytes] | None = None,
     roster_readable: bool = True,
 ) -> None:
     """The welcome fetch, the roster reads and the key map a join makes."""
@@ -154,13 +130,7 @@ def _mock_server(
         wanted = (request.url.params.get("ids") or "").split(",")
         return httpx.Response(
             200,
-            json={
-                "keys": {
-                    agent: {"signing_public_key": signing_public_key_to_jwk(identity)}
-                    for agent, identity in (identities or {}).items()
-                    if agent in wanted
-                }
-            },
+            json={"keys": {agent: WORLD.keys_response(agent) for agent in wanted if agent}},
         )
 
     respx.get(f"{API}/agents/keys").mock(side_effect=_keys)
@@ -172,11 +142,11 @@ def _reinvitation_welcome(tmp_config_dir, agent_id, tmp_path) -> bytes:
     This is the flow the guard used to wedge: the victim still holds live state
     for the group, and this second Welcome is the only way back into it.
     """
-    founder = _peer_client(tmp_path, FOUNDER_ID)
+    founder = peer_client(tmp_path, FOUNDER_ID, agent_id)
     group = founder.load_group(mls_group_id_bytes(GROUP_ID))
-    victim = open_mls_client(tmp_config_dir, agent_id)
-    group.remove_member(group.member_index(victim.public_key()))
+    group.remove_member(group.member_index(credential_identity(agent_id)))
     group.save()
+    victim = open_mls_client(tmp_config_dir, agent_id)
     bundle = group.add_member(victim.generate_key_package())
     group.save()
     return bundle.welcomes[0]
@@ -190,19 +160,14 @@ def _spooled(tmp_config_dir, agent_id) -> int:
     return len(WelcomeSpool(tmp_config_dir, agent_id).pending())
 
 
-def _founder_identity(tmp_path, founder_id=FOUNDER_ID) -> bytes:
-    return _peer_client(tmp_path, founder_id).public_key()
-
-
 class TestProcessMlsWelcomes:
     @staticmethod
     def _install_first_welcome(sync_client, tmp_config_dir, agent_id, tmp_path, group_id=GROUP_ID):
         """Seat the victim honestly, so a later Welcome has state to contend with."""
         _mock_server(
             agent_id,
-            [(group_id, _honest_welcome(tmp_config_dir, agent_id, tmp_path, group_id))],
+            [(group_id, honest_welcome(tmp_config_dir, agent_id, tmp_path, group_id))],
             roster={group_id: [FOUNDER_ID, agent_id]},
-            identities={FOUNDER_ID: _founder_identity(tmp_path)},
         )
         process_mls_welcomes(sync_client._http, tmp_config_dir, agent_id)
 
@@ -210,12 +175,11 @@ class TestProcessMlsWelcomes:
     def test_install_when_a_member_of_the_named_group_minted_it_then_state_is_held(
         self, sync_client, tmp_config_dir, agent_id, tmp_path
     ):
-        welcome = _honest_welcome(tmp_config_dir, agent_id, tmp_path)
+        welcome = honest_welcome(tmp_config_dir, agent_id, tmp_path)
         _mock_server(
             agent_id,
             [(GROUP_ID, welcome)],
             roster={GROUP_ID: [FOUNDER_ID, agent_id]},
-            identities={FOUNDER_ID: _founder_identity(tmp_path)},
         )
 
         outcome = process_mls_welcomes(sync_client._http, tmp_config_dir, agent_id)
@@ -235,7 +199,6 @@ class TestProcessMlsWelcomes:
             agent_id,
             [(GROUP_ID, welcome)],
             roster={GROUP_ID: [FOUNDER_ID, agent_id]},
-            identities={FOUNDER_ID: _founder_identity(tmp_path)},
         )
 
         with pytest.raises(MlsWelcomeRefusedError) as excinfo:
@@ -255,7 +218,6 @@ class TestProcessMlsWelcomes:
             agent_id,
             [(GROUP_ID, _substituted_welcome(tmp_config_dir, agent_id, tmp_path))],
             roster={GROUP_ID: [FOUNDER_ID, agent_id]},
-            identities={FOUNDER_ID: _founder_identity(tmp_path)},
         )
 
         with pytest.raises(MlsWelcomeRefusedError) as excinfo:
@@ -306,7 +268,6 @@ class TestProcessMlsWelcomes:
             agent_id,
             [(GROUP_ID, welcome)],
             roster={GROUP_ID: [FOUNDER_ID, agent_id]},
-            identities={FOUNDER_ID: _founder_identity(tmp_path)},
         )
 
         outcome = process_mls_welcomes(sync_client._http, tmp_config_dir, agent_id)
@@ -348,7 +309,6 @@ class TestProcessMlsWelcomes:
             agent_id,
             [],
             roster={GROUP_ID: [FOUNDER_ID, agent_id]},
-            identities={FOUNDER_ID: _founder_identity(tmp_path)},
         )
 
         outcome = process_mls_welcomes(sync_client._http, tmp_config_dir, agent_id)
@@ -370,7 +330,6 @@ class TestProcessMlsWelcomes:
             agent_id,
             [(GROUP_ID, _substituted_welcome(tmp_config_dir, agent_id, tmp_path))],
             roster={GROUP_ID: [FOUNDER_ID, agent_id]},
-            identities={FOUNDER_ID: _founder_identity(tmp_path)},
         )
         with pytest.raises(MlsWelcomeRefusedError):
             process_mls_welcomes(sync_client._http, tmp_config_dir, agent_id)
@@ -380,7 +339,6 @@ class TestProcessMlsWelcomes:
             agent_id,
             [],
             roster={GROUP_ID: [FOUNDER_ID, agent_id]},
-            identities={FOUNDER_ID: _founder_identity(tmp_path)},
         )
 
         outcome = process_mls_welcomes(sync_client._http, tmp_config_dir, agent_id)
@@ -392,12 +350,11 @@ class TestProcessMlsWelcomes:
     def test_install_when_the_welcome_joins_another_group_then_it_is_discarded(
         self, sync_client, tmp_config_dir, agent_id, tmp_path
     ):
-        welcome = _honest_welcome(tmp_config_dir, agent_id, tmp_path)
+        welcome = honest_welcome(tmp_config_dir, agent_id, tmp_path)
         _mock_server(
             agent_id,
             [(OTHER_GROUP_ID, welcome)],
             roster={OTHER_GROUP_ID: [FOUNDER_ID, agent_id]},
-            identities={FOUNDER_ID: _founder_identity(tmp_path)},
         )
 
         with pytest.raises(MlsWelcomeRefusedError) as excinfo:
@@ -428,7 +385,7 @@ class TestInstallMlsStateScopesTheRefusal:
                 (GROUP_ID, _substituted_welcome(tmp_config_dir, agent_id, tmp_path)),
                 (
                     OTHER_GROUP_ID,
-                    _honest_welcome(
+                    honest_welcome(
                         tmp_config_dir, agent_id, tmp_path, OTHER_GROUP_ID, OTHER_FOUNDER_ID
                     ),
                 ),
@@ -436,10 +393,6 @@ class TestInstallMlsStateScopesTheRefusal:
             roster={
                 GROUP_ID: [FOUNDER_ID, agent_id],
                 OTHER_GROUP_ID: [OTHER_FOUNDER_ID, agent_id],
-            },
-            identities={
-                FOUNDER_ID: _founder_identity(tmp_path),
-                OTHER_FOUNDER_ID: _founder_identity(tmp_path, OTHER_FOUNDER_ID),
             },
         )
 
@@ -477,7 +430,7 @@ class TestInstallMlsStateScopesTheRefusal:
                 (GROUP_ID, _substituted_welcome(tmp_config_dir, agent_id, tmp_path)),
                 (
                     OTHER_GROUP_ID,
-                    _honest_welcome(
+                    honest_welcome(
                         tmp_config_dir, agent_id, tmp_path, OTHER_GROUP_ID, OTHER_FOUNDER_ID
                     ),
                 ),
@@ -485,10 +438,6 @@ class TestInstallMlsStateScopesTheRefusal:
             roster={
                 GROUP_ID: [FOUNDER_ID, agent_id],
                 OTHER_GROUP_ID: [OTHER_FOUNDER_ID, agent_id],
-            },
-            identities={
-                FOUNDER_ID: _founder_identity(tmp_path),
-                OTHER_FOUNDER_ID: _founder_identity(tmp_path, OTHER_FOUNDER_ID),
             },
         )
 
@@ -521,10 +470,6 @@ class TestInstallMlsStateScopesTheRefusal:
                 GROUP_ID: [FOUNDER_ID, agent_id],
                 OTHER_GROUP_ID: [OTHER_FOUNDER_ID, agent_id],
             },
-            identities={
-                FOUNDER_ID: _founder_identity(tmp_path),
-                OTHER_FOUNDER_ID: _founder_identity(tmp_path, OTHER_FOUNDER_ID),
-            },
         )
 
         with pytest.raises(MlsWelcomeRefusedError) as excinfo:
@@ -544,7 +489,6 @@ class TestInstallMlsStateScopesTheRefusal:
             agent_id,
             [(GROUP_ID, _substituted_welcome(tmp_config_dir, agent_id, tmp_path))],
             roster={GROUP_ID: [FOUNDER_ID, agent_id]},
-            identities={FOUNDER_ID: _founder_identity(tmp_path)},
         )
         with pytest.raises(MlsWelcomeRefusedError):
             process_mls_welcomes(sync_client._http, tmp_config_dir, agent_id)
@@ -556,7 +500,6 @@ class TestInstallMlsStateScopesTheRefusal:
             agent_id,
             [],
             roster={GROUP_ID: [FOUNDER_ID, agent_id]},
-            identities={FOUNDER_ID: _founder_identity(tmp_path)},
         )
         assert process_mls_welcomes(sync_client._http, tmp_config_dir, agent_id).group_ids == ()
 

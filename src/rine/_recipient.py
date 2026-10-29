@@ -55,7 +55,7 @@ def classify_reference(value: str) -> RefClass:
     everything else. The order is the contract, not an implementation detail:
     the twin (``classifyReference``, ``rine-core``) tests the same five in the
     same sequence, and the server's own discriminator is the same first
-    question (``to_handle.startswith("#")``, ``src/rine/api/messages.py``,
+    question (``to_handle.startswith("#")``, ``src/rine/api/messages_send_direct.py``,
     before any DB access).
 
     🔴 ``id`` is tested BEFORE ``@`` and after ``#``. A UUID carries no ``@``,

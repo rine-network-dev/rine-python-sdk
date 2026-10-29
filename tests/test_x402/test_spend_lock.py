@@ -47,6 +47,14 @@ def test_spend_lock_when_uncontended_acquires_and_releases(tmp_path) -> None:
     assert not os.path.exists(path)  # released in finally
 
 
+def test_spend_lock_when_stolen_while_held_then_release_leaves_the_new_lock(tmp_path) -> None:
+    """A holder that overran the stale age leaves the lock of the process that stole it."""
+    agent_id = str(uuid4())
+    with sl.spend_lock(str(tmp_path), agent_id):
+        path = _plant_lock(str(tmp_path), agent_id, int(time.time() * 1000))
+    assert json.loads(_read(path))["pid"] == 999999
+
+
 def test_spend_lock_when_fresh_lock_held_times_out_wallet_busy(tmp_path, monkeypatch) -> None:
     """A fresh sibling lock blocks; the acquire deadline surfaces WALLET_BUSY."""
     monkeypatch.setattr(sl, "ACQUIRE_TIMEOUT_MS", 80)  # keep the test sub-second

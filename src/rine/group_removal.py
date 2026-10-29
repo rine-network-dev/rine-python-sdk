@@ -134,11 +134,9 @@ def removal_message(
     if epoch is not None:
         return (
             f"Removed {agent_id} from group {group_name}. The commit at epoch {epoch} "
-            f"declared the removal, but no leaf in the ratchet tree carries the signing "
-            f"key they publish now — nothing was removed from the tree, so what keeps "
-            f"them out is the server declining to hand them the group's traffic. If "
-            f"they rotated their signing key, their old leaf is still there: have them "
-            f"rejoin, or re-invite them, so a Remove commit can name it."
+            f"declared the removal, but no leaf in the ratchet tree is theirs — "
+            f"nothing was removed from the tree, so what keeps them out is this server "
+            f"declining to hand them the group's traffic."
         )
     if encryption is None:
         # A kick this client could not attribute: it never learned which agent

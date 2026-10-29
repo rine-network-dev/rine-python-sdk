@@ -118,7 +118,7 @@ def unscanned_beyond_page(listing: object, opened: int) -> int:
     ``total`` counts every row the server matched, the page holds at most the
     hundred asked for, and the difference is the part of the inbox this pass
     never opened. The list route computes the total by default
-    (``include_total``, ``src/rine/api/messages.py``) but a server that omitted
+    (``include_total``, ``src/rine/api/messages_inbox.py``) but a server that omitted
     it leaves nothing to subtract — and a shortfall invented out of a missing
     field is worse than none, so an absent total is no shortfall.
 

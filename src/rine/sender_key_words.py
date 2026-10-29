@@ -190,7 +190,7 @@ SENDER_KEY_UNAVAILABLE_PREVIEW = "[no sender key: ask the sender to post to the 
 #: written only by ``get_conversation_messages()``, and tiering that list needs
 #: the very refusal that decrypted it — which no reader in this package holds
 #: after ``thread()`` started recovering. The one surface that still prints this
-#: marker is ``rine-mcp``'s inbox page (``rine-mcp/src/tools/messaging.ts``,
+#: marker is ``rine-mcp``'s inbox page (``rine-mcp/src/tools/messaging-inbox.ts``,
 #: re-exported verbatim by OpenClaw), which opens each row with the plain
 #: ``decryptGroupMessage`` because a round trip per row does not pay on a page.
 #: ``rine-ts-sdk`` does NOT: both of its many-row group reads set

@@ -4,8 +4,7 @@ Two questions, both of which an admission has to answer before it commits
 anything:
 
 * **Is this agent already seated?** A leaf is found by the member's basic
-  credential identity, which is its raw Ed25519 public key — the same key rine
-  publishes as ``signing_public_key`` and the same one that signs its envelopes.
+  credential identity, which is the ASCII of its canonical agent id.
   Adding an agent that already holds a leaf mints a **second** leaf for it, and
   the two are not distinguishable by identity, so this check is what makes the
   admission loop a resume rather than a duplicator.
@@ -22,36 +21,66 @@ from dataclasses import dataclass
 from typing import Any
 
 from rine._constants import MLS_CLAIM_AGENTS_MAX
-from rine._crypto.keys import jwk_to_public_key
+from rine._crypto.certs import ChainError, VerifiedAgentKeys, verify_agent_chain
 from rine._logging import logger
-from rine._mls.binding import GroupInactiveError, MlsCoreError, MlsGroup
+from rine._mls.binding import GroupInactiveError, MlsCoreError, MlsGroup, credential_identity
 
 
-def fetch_agent_identities(client: Any, agent_ids: list[str]) -> dict[str, bytes]:
-    """The MLS credential identity of each agent, chunked at the server's cap.
+def fetch_verified_batch_keys(
+    client: Any, agent_ids: list[str], extra_headers: dict[str, str] | None = None
+) -> dict[str, VerifiedAgentKeys]:
+    """The chain-verified keys of each agent, chunked at the server's cap.
 
     ``GET /agents/keys`` refuses more than :data:`MLS_CLAIM_AGENTS_MAX` ids in
     one call, so this chunks rather than trusting the server to take whatever it
     is sent — the same discipline the batch KeyPackage claim follows, and the
     live defect it exists to avoid on the sender-key side.
 
-    An agent the server does not return (revoked, erased, unknown) is absent
-    from the map rather than an error: it cannot be seated either way, and the
-    admission reports it per member.
+    Every entry goes through the key-chain check and the client's pins before it
+    is returned. An agent the server does not return (revoked,
+    erased, unknown) or whose chain does not verify is absent from the map rather
+    than an error: it cannot be seated either way, and the admission reports it
+    per member.
+
+    Args:
+        client: Sync HTTP client carrying the pins.
+        agent_ids: The agents to read, in any case.
+        extra_headers: Acting-agent headers, when the read is made as one of the caller's agents.
 
     Returns:
-        Agent id (lower-cased) to its raw 32-byte Ed25519 public key.
+        Agent id (lower-cased) to its verified keys.
     """
-    identities: dict[str, bytes] = {}
+    verified: dict[str, VerifiedAgentKeys] = {}
     for start in range(0, len(agent_ids), MLS_CLAIM_AGENTS_MAX):
         chunk = agent_ids[start : start + MLS_CLAIM_AGENTS_MAX]
-        data = client.get("/agents/keys", params={"ids": ",".join(chunk)})
-        for agent_id, keys in (data.get("keys") or {}).items():
-            jwk = keys.get("signing_public_key")
-            if not jwk:
+        as_agent = {"extra_headers": extra_headers} if extra_headers else {}
+        data = client.get("/agents/keys", params={"ids": ",".join(chunk)}, **as_agent)
+        for agent_id, entry in (data.get("keys") or {}).items():
+            canonical = str(agent_id).lower()
+            try:
+                keys = verify_agent_chain(entry, canonical)
+                client.key_pins.admit(keys)
+            except ChainError:
+                logger.warning("Refused the keys of agent %s: chain invalid", canonical)
                 continue
-            identities[str(agent_id).lower()] = jwk_to_public_key(jwk, expected_crv="Ed25519")
-    return identities
+            verified[canonical] = keys
+    return verified
+
+
+def fetch_agent_identities(client: Any, agent_ids: list[str]) -> dict[str, bytes]:
+    """The MLS credential identity of each agent, chunked at the server's cap.
+
+    See :func:`fetch_verified_batch_keys` for the read and its refusals; this is
+    the identity projection of it, which is what tells a seated invitee from an
+    unseated one.
+
+    Returns:
+        Agent id (lower-cased) to its credential identity.
+    """
+    return {
+        agent_id: credential_identity(agent_id)
+        for agent_id in fetch_verified_batch_keys(client, agent_ids)
+    }
 
 
 def leaf_index(group: MlsGroup, identity: bytes) -> int | None:
@@ -196,4 +225,10 @@ def read_group_tree(client: Any, group_id: str, extra_headers: dict[str, str]) -
     )
 
 
-__all__ = ["GroupTree", "fetch_agent_identities", "leaf_index", "read_group_tree"]
+__all__ = [
+    "GroupTree",
+    "fetch_agent_identities",
+    "fetch_verified_batch_keys",
+    "leaf_index",
+    "read_group_tree",
+]

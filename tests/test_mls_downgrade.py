@@ -18,8 +18,7 @@ from pathlib import Path
 import pytest
 
 import rine
-from rine._crypto._key_cache import KeyCache
-from rine._crypto.keys import generate_agent_keys, public_keys_body, save_agent_keys
+from rine._crypto.keys import save_agent_keys
 from rine._crypto.message import (
     decrypt_group_message_async,
     decrypt_group_message_sync,
@@ -52,6 +51,10 @@ from rine.errors import (
     MlsDowngradeError,
     NoMlsGroupStateError,
 )
+from rine.testing import WORLD
+from tests.test_crypto.world import AsyncKeyServer, KeyServer
+
+pytestmark = pytest.mark.usefixtures("mls_escrow_stub")
 
 SENDER_B = "11111111-1111-1111-1111-111111111111"
 READER_V = "22222222-2222-2222-2222-222222222222"
@@ -60,24 +63,8 @@ OTHER_GROUP_ID = "44444444-4444-4444-4444-444444444444"
 PAYLOAD = {"announcement": "open enrolment, all welcome"}
 
 
-class _KeyServer:
-    """A stand-in HTTP client that serves one agent's published signing key."""
-
-    def __init__(self, keys) -> None:
-        self._keys_cache = KeyCache(600.0, 256)
-        self._body = public_keys_body(keys)
-
-    def get(self, _path: str, **_kwargs: object) -> dict:
-        return self._body
-
-
-class _AsyncKeyServer(_KeyServer):
-    async def get(self, _path: str, **_kwargs: object) -> dict:  # type: ignore[override]
-        return self._body
-
-
 def _agent(config_dir: str, agent_id: str):
-    keys = generate_agent_keys()
+    keys = WORLD.keys(agent_id)
     save_agent_keys(config_dir, agent_id, keys)
     return keys
 
@@ -93,9 +80,9 @@ def _plant_mls_state(config_dir: str, agent_id: str, group_id: str = GROUP_ID) -
     note_mls_state_changed(config_dir, agent_id, group_id)
 
 
-def _sender_key_row(config_dir: str, payload: object = PAYLOAD) -> tuple[str, object]:
+def _sender_key_row(config_dir: str, payload: object = PAYLOAD) -> str:
     """One sender-key group row from B, with B's key already ingested by V."""
-    sender_keys = _agent(config_dir, SENDER_B)
+    _agent(config_dir, SENDER_B)
     state = generate_sender_key(GROUP_ID, SENDER_B)
     save_sender_key_state(
         config_dir,
@@ -116,7 +103,7 @@ def _sender_key_row(config_dir: str, payload: object = PAYLOAD) -> tuple[str, ob
     # state that is on no disk at all rather than discarding the advance.
     save_sender_key_state(config_dir, SENDER_B, GROUP_ID, [state])
     sealed, _ = encrypt_group_message(config_dir, SENDER_B, GROUP_ID, state, payload)
-    return sealed.encrypted_payload, sender_keys
+    return sealed.encrypted_payload
 
 
 def _count_store_opens(monkeypatch) -> list[int]:
@@ -271,10 +258,10 @@ class TestGroupRead:
     ):
         """The converse: a billboard group holds no MLS state and keeps reading."""
         _agent(tmp_config_dir, READER_V)
-        payload, sender_keys = _sender_key_row(tmp_config_dir)
+        payload = _sender_key_row(tmp_config_dir)
 
         result = decrypt_group_message_sync(
-            tmp_config_dir, READER_V, GROUP_ID, payload, _KeyServer(sender_keys), SENDER_B
+            tmp_config_dir, READER_V, GROUP_ID, payload, KeyServer(), SENDER_B
         )
 
         assert json.loads(result.plaintext) == PAYLOAD
@@ -282,10 +269,10 @@ class TestGroupRead:
 
     async def test_decrypt_group_message_async_when_no_mls_state_decrypts(self, tmp_config_dir):
         _agent(tmp_config_dir, READER_V)
-        payload, sender_keys = _sender_key_row(tmp_config_dir)
+        payload = _sender_key_row(tmp_config_dir)
 
         result = await decrypt_group_message_async(
-            tmp_config_dir, READER_V, GROUP_ID, payload, _AsyncKeyServer(sender_keys), SENDER_B
+            tmp_config_dir, READER_V, GROUP_ID, payload, AsyncKeyServer(), SENDER_B
         )
 
         assert json.loads(result.plaintext) == PAYLOAD
@@ -294,13 +281,13 @@ class TestGroupRead:
         self, tmp_config_dir
     ):
         _agent(tmp_config_dir, READER_V)
-        payload, sender_keys = _sender_key_row(tmp_config_dir)
+        payload = _sender_key_row(tmp_config_dir)
         _plant_mls_state(tmp_config_dir, READER_V)
         before = _persisted_index(tmp_config_dir)
 
         with pytest.raises(MlsDowngradeError) as caught:
             decrypt_group_message_sync(
-                tmp_config_dir, READER_V, GROUP_ID, payload, _KeyServer(sender_keys), SENDER_B
+                tmp_config_dir, READER_V, GROUP_ID, payload, KeyServer(), SENDER_B
             )
 
         assert caught.value.code == DOWNGRADE_REFUSED_CODE
@@ -309,7 +296,7 @@ class TestGroupRead:
 
     async def test_decrypt_group_message_async_when_local_mls_state_refuses(self, tmp_config_dir):
         _agent(tmp_config_dir, READER_V)
-        payload, sender_keys = _sender_key_row(tmp_config_dir)
+        payload = _sender_key_row(tmp_config_dir)
         _plant_mls_state(tmp_config_dir, READER_V)
         before = _persisted_index(tmp_config_dir)
 
@@ -319,7 +306,7 @@ class TestGroupRead:
                 READER_V,
                 GROUP_ID,
                 payload,
-                _AsyncKeyServer(sender_keys),
+                AsyncKeyServer(),
                 SENDER_B,
             )
 
@@ -329,11 +316,11 @@ class TestGroupRead:
         self, tmp_config_dir
     ):
         _agent(tmp_config_dir, READER_V)
-        payload, sender_keys = _sender_key_row(tmp_config_dir)
+        payload = _sender_key_row(tmp_config_dir)
         _plant_mls_state(tmp_config_dir, READER_V, OTHER_GROUP_ID)
 
         result = decrypt_group_message_sync(
-            tmp_config_dir, READER_V, GROUP_ID, payload, _KeyServer(sender_keys), SENDER_B
+            tmp_config_dir, READER_V, GROUP_ID, payload, KeyServer(), SENDER_B
         )
 
         assert json.loads(result.plaintext) == PAYLOAD
@@ -349,10 +336,18 @@ def _patch(monkeypatch, module_path: str, **replacements) -> None:
         monkeypatch.setattr(f"{module_path}.{name}", value)
 
 
-def _peer_group(tmp_path, key_packages: list[bytes]):
-    """A real group founded by a peer, optionally admitting the given KeyPackages."""
+def _peer_group(tmp_path, key_packages: list[bytes], *known_agent_ids: str):
+    """A real group founded by a peer, optionally admitting the given KeyPackages.
+
+    The peer's config dir also holds the keys of every agent it is asked to seat
+    (``known_agent_ids``), because the core refuses a leaf whose ``(agent id, leaf
+    key)`` pair is outside the client's allowed set — the same chain-verified set
+    production passes.
+    """
     peer_dir = str(tmp_path / "peer")
-    save_agent_keys(peer_dir, SENDER_B, generate_agent_keys())
+    save_agent_keys(peer_dir, SENDER_B, WORLD.keys(SENDER_B))
+    for known in known_agent_ids:
+        save_agent_keys(peer_dir, known, WORLD.keys(known))
     group = open_mls_client(peer_dir, SENDER_B).create_group_with_members(
         mls_group_id_bytes(GROUP_ID), key_packages
     )
@@ -362,8 +357,10 @@ def _peer_group(tmp_path, key_packages: list[bytes]):
 
 def _join_by_welcome(monkeypatch, config_dir: str, agent_id: str, tmp_path) -> None:
     """Drive the real Welcome establisher, with only the server stubbed out."""
+    # The victim's client has to know the founder's leaf key to adopt the tree.
+    save_agent_keys(config_dir, SENDER_B, WORLD.keys(SENDER_B))
     key_package = open_mls_client(config_dir, agent_id).generate_key_package()
-    group = _peer_group(tmp_path, [key_package])
+    group = _peer_group(tmp_path, [key_package], agent_id)
     delivery = MlsWelcomeDelivery(
         id="77777777-8888-9999-aaaa-bbbbbbbbbbbb",
         group_id=GROUP_ID,
@@ -427,6 +424,8 @@ class TestMemoAcrossAStateChange:
         _agent(tmp_config_dir, READER_V)
         assert_no_mls_downgrade(tmp_config_dir, READER_V, GROUP_ID, False)
 
+        # The joiner's client has to know the founder's leaf key to adopt the tree.
+        save_agent_keys(tmp_config_dir, SENDER_B, WORLD.keys(SENDER_B))
         group = _peer_group(tmp_path, [])
         _patch(
             monkeypatch,
@@ -583,7 +582,7 @@ _STATE_MUTATORS = (
     ".delete_group_state(",
 )
 
-_INVALIDATOR = "note_mls_state_changed"
+_INVALIDATOR = "note_mls_state_changed("  # the call, not the import
 
 _SRC_ROOT = Path(rine.__file__).parent
 
@@ -619,5 +618,5 @@ class TestEveryMlsStateWriterInvalidatesTheMemo:
             "_mls/admission_state.py",
             "_mls/external_join.py",
             "_mls/leave.py",
-            "_mls/welcomes.py",
+            "_mls/welcome_install.py",
         ]

@@ -1,0 +1,9 @@
+{
+  "body": {
+    "handshakes": [],
+    "pending_commit": "confirmed"
+  },
+  "endpoint": "GET /groups/{group_id}/mls/handshakes",
+  "scenario": "own commit confirmed by a peer",
+  "status": 200
+}

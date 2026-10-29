@@ -25,7 +25,7 @@ import pytest
 import respx
 
 from rine import RineClient
-from rine._config import save_credentials
+from rine.testing import write_agent_identity
 from rine.x402.errors import X402Error, X402ErrorCode
 from rine.x402.quote_ref import load_referenced_quote
 from rine.x402.types import X402_QUOTE_REF_KEY
@@ -54,7 +54,7 @@ def payee_client(tmp_config_dir, saved_agent_keys):
     client makes on its own account would otherwise be counted against the guard
     and make a passing test meaningless.
     """
-    save_credentials(tmp_config_dir, {"default": {"client_id": "cid", "client_secret": "sec"}})
+    write_agent_identity(tmp_config_dir, PAYEE_AGENT_ID)
     return RineClient(config_dir=tmp_config_dir, api_url=API, agent=PAYEE_AGENT_ID)
 
 

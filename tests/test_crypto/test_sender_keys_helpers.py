@@ -65,9 +65,7 @@ class TestSenderKeyPersistence:
         state = generate_sender_key(GROUP_ID, AGENT_ID)
         save_sender_key_state(tmp_config_dir, AGENT_ID, GROUP_ID, [state])
 
-        path = os.path.join(
-            tmp_config_dir, "keys", AGENT_ID, "sender_keys", f"{GROUP_ID}.json"
-        )
+        path = os.path.join(tmp_config_dir, "keys", AGENT_ID, "sender_keys", f"{GROUP_ID}.json")
         stat = os.stat(path)
         assert stat.st_mode & 0o777 == 0o600
 
@@ -81,6 +79,7 @@ class TestSenderKeyPersistence:
 
     def test_invalid_agent_id_raises(self, tmp_config_dir):
         from rine.errors import CryptoError
+
         state = generate_sender_key(GROUP_ID, AGENT_ID)
         with pytest.raises(CryptoError):
             save_sender_key_state(tmp_config_dir, "bad-id", GROUP_ID, [state])

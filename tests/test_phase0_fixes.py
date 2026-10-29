@@ -14,8 +14,8 @@ Covers four small fixes for the crewai-rine integration:
   (like ``mls_group_id``) means MLS, and must never reach the sender-key path.
 
 All HTTP is mocked with respx; no DB. Server contract verified against
-``src/rine/api/messages.py`` (mark-delivered handler + ``_status_filter``) and
-``src/rine/api/group_schemas.py`` / ``src/rine/api/schemas.py``:
+``src/rine/api/messages_inbox.py`` (mark-delivered handler + ``_status_filter``) and
+``src/rine/api/group_schemas.py`` / ``src/rine/api/schemas_message.py``:
 - mark-delivered request body field is ``message_ids`` (list of UUIDs);
   response is ``{"marked": int}``.
 - the ``/groups`` payload carries a top-level boolean ``mls_pending``.
@@ -29,17 +29,13 @@ import httpx
 import pytest
 import respx
 
-from rine._config import save_credentials
 from rine._constants import EncryptionVersion, MessageType
-from rine._crypto.keys import (
-    encryption_public_key_to_jwk,
-    load_agent_keys,
-    signing_public_key_to_jwk,
-)
+from rine._crypto.keys import load_agent_keys, make_kid
 from rine._crypto.message import encrypt_message
 from rine._group_send import encrypt_for_group_sync
 from rine._http import SyncHttpClient
 from rine.errors import CryptoError
+from rine.testing import WORLD, write_agent_identity
 from tests.conftest import recipient_view
 
 AGENT_ID = "00000000-1111-2222-3333-444444444444"
@@ -76,18 +72,7 @@ def _mock_agents() -> None:
 def _mock_own_signing_keys() -> None:
     """Mock the agent's own signing-key fetch used during read() verification."""
     respx.get(f"https://rine.network/agents/{AGENT_ID}/keys").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "agent_id": AGENT_ID,
-                "encryption_public_key": encryption_public_key_to_jwk(
-                    load_agent_keys(_CONFIG_DIR_HOLDER["dir"], AGENT_ID).encryption.public_key
-                ),
-                "signing_public_key": signing_public_key_to_jwk(
-                    load_agent_keys(_CONFIG_DIR_HOLDER["dir"], AGENT_ID).signing.public_key
-                ),
-            },
-        )
+        return_value=httpx.Response(200, json=WORLD.keys_response(AGENT_ID))
     )
 
 
@@ -108,7 +93,7 @@ def _build_message_payload(
         "type": MessageType.TASK_REQUEST,
         "encrypted_payload": encrypted_payload,
         "encryption_version": encryption_version,
-        "sender_signing_kid": f"rine:{AGENT_ID}",
+        "sender_signing_kid": make_kid(AGENT_ID, 0),
         "created_at": "2024-01-01T00:00:00Z",
     }
 
@@ -139,7 +124,7 @@ def _mock_unreachable_mls_group() -> None:
 
 def _self_encrypt(config_dir: str, payload: dict) -> str:
     """Encrypt ``payload`` from AGENT_ID to AGENT_ID (self-readable)."""
-    own = recipient_view(load_agent_keys(config_dir, AGENT_ID))
+    own = recipient_view(load_agent_keys(config_dir, AGENT_ID), AGENT_ID)
     result = encrypt_message(config_dir, AGENT_ID, own, payload)
     return result.encrypted_payload
 
@@ -297,9 +282,8 @@ class TestMarkDeliveredAsync:
 # decrypt_error on unknown encryption_version (no silent passthrough)
 # =====================================================================
 
-#: A version this SDK has never heard of. It used to be `hpke-hybrid-v1`, which
-#: the SDK now decrypts — the row this pins is one from a FUTURE scheme, which
-#: must still fail loud rather than arrive as empty plaintext.
+#: A version this SDK has never heard of: a row from a FUTURE scheme must still
+#: fail loud rather than arrive as empty plaintext.
 _UNKNOWN_VERSION = "hpke-from-the-future-v9"
 
 
@@ -357,7 +341,7 @@ class TestUnknownEncryptionVersionSync:
         ciphertext = _self_encrypt(tmp_config_dir, {"text": "hello world"})
         respx.get(f"https://rine.network/messages/{MESSAGE_ID}").mock(
             return_value=httpx.Response(
-                200, json=_build_message_payload(EncryptionVersion.HPKE_V1, ciphertext)
+                200, json=_build_message_payload(EncryptionVersion.HPKE_HYBRID_V2, ciphertext)
             )
         )
 
@@ -420,7 +404,7 @@ class TestUnknownEncryptionVersionAsync:
         ciphertext = _self_encrypt(tmp_config_dir, {"text": "hello world"})
         respx.get(f"https://rine.network/messages/{MESSAGE_ID}").mock(
             return_value=httpx.Response(
-                200, json=_build_message_payload(EncryptionVersion.HPKE_V1, ciphertext)
+                200, json=_build_message_payload(EncryptionVersion.HPKE_HYBRID_V2, ciphertext)
             )
         )
 
@@ -464,7 +448,7 @@ class TestVersionConsistency:
 
 
 def _make_http_client(tmp_config_dir: str) -> SyncHttpClient:
-    save_credentials(tmp_config_dir, {"default": {"client_id": "cid", "client_secret": "csecret"}})
+    write_agent_identity(tmp_config_dir, AGENT_ID)
     return SyncHttpClient(config_dir=tmp_config_dir, api_url="https://rine.network")
 
 

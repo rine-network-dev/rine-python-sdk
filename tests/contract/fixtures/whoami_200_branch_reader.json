@@ -1,0 +1,51 @@
+{
+  "body": {
+    "agents": [
+      {
+        "agent_id": "00000000-0000-0000-0000-000000000000",
+        "created_at": "2020-01-01T00:00:00Z",
+        "encryption_public_key": {
+          "crv": "X25519",
+          "kty": "OKP",
+          "x": "2td2idV-KtXwDQYC-CpBbaHjLozEtaJ1jBtd3WkD86M"
+        },
+        "handle": "contract-agent@corg-root.rine.network",
+        "human_oversight": true,
+        "id": "00000000-0000-0000-0000-000000000000",
+        "incoming_policy": "accept_all",
+        "name": "contract-agent",
+        "operator_seat": false,
+        "org_id": "00000000-0000-0000-0000-000000000000",
+        "outgoing_policy": "send_all",
+        "provisioned_by": null,
+        "revoked_at": null,
+        "signing_public_key": {
+          "crv": "Ed25519",
+          "kty": "OKP",
+          "x": "q5bBRff1hpEsy0zqlgi7mccVpqGtggp_dVn5hlU5-AM"
+        },
+        "verification_words": null,
+        "warnings": null
+      }
+    ],
+    "org": {
+      "agent_count": 1,
+      "contact_email": null,
+      "country_code": "EU",
+      "created_at": "2020-01-01T00:00:00Z",
+      "id": "00000000-0000-0000-0000-000000000000",
+      "name": "Contract Org",
+      "slug": "corg-root",
+      "trust_tier": 1,
+      "verification_method": "none"
+    },
+    "principal": {
+      "agent_id": null,
+      "branch": "main",
+      "kind": "branch_reader"
+    }
+  },
+  "endpoint": "GET /whoami",
+  "scenario": "branch reader, its own branch's agents",
+  "status": 200
+}

@@ -119,7 +119,7 @@ def group_ladder(
             see :func:`rine._group_ref.group_row_by_local_name`.
 
     Raises:
-        NotFoundError: No group of this org answers to the reference.
+        NotFoundError: No group in the key's scope answers to the reference.
         ConfigError: More than one does.
         GroupIdentityMismatchError: The id read's body named another group —
             raised by the read itself, and named here because it reaches every
@@ -172,7 +172,7 @@ def recipient_ladder(
     one spends :class:`~rine._recipient_reads.OwnGroups` and RAISES on a miss,
     which here would refuse every agent id in the product. The JOIN ladder's
     UUID rung is a third question again — it passes an id through unread,
-    because a joiner holds no seat this org-scoped route would answer for — and
+    because a joiner holds no seat this key-scoped route would answer for — and
     the three must not be unified.
 
     🔴 There is no ambiguity arm and none may be added. Both id spaces are

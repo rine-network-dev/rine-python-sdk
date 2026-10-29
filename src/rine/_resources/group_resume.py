@@ -51,10 +51,10 @@ def _resume(
     no state to continue from and is founded, a latched one is continued. Either
     way the answer is the same shape.
 
-    Reclamation runs **after** admission, never before, so an agent that rotated
-    its signing key is re-seated under the new key before its stale leaf is
-    dropped. A group being founded here has no orphans to reclaim: every leaf in
-    it was minted by the founding commits themselves.
+    Reclamation runs **after** admission, never before, so every entitled agent is
+    seated before the leaves nobody entitles are dropped. A group being founded
+    here has no orphans to reclaim: every leaf in it was minted by the founding
+    commits themselves.
     """
     from dataclasses import replace
 

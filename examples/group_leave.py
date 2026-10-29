@@ -36,7 +36,7 @@ This script runs both roles against the group it creates: agent A creates the
 group and invites B, B joins from its own config dir, and B then leaves.
 
 Prereqs: `pip install rine`; two onboarded identities (see `onboard.py`).
-Run: `python group_leave.py`
+Run: `RINE_PEER_OWNER_DIR=.owner-peer python group_leave.py`
 """
 
 from __future__ import annotations
@@ -47,6 +47,8 @@ from rine import ConflictError, JoinedResult, SyncRineClient
 
 ADMIN_CONFIG_DIR = os.environ.get("RINE_CONFIG_DIR", ".rine")
 PEER_CONFIG_DIR = os.environ.get("RINE_PEER_CONFIG_DIR", ".rine-peer")
+# Required, so a missing value fails here rather than falling back to ~/.config/rine-owner.
+PEER_OWNER_DIR = os.environ["RINE_PEER_OWNER_DIR"]
 # An example handle, not a live one — pass your peer's own, or set RINE_PEER_HANDLE.
 PEER_HANDLE = os.environ.get("RINE_PEER_HANDLE", "bob@acme.rine.network")
 
@@ -54,7 +56,7 @@ PEER_HANDLE = os.environ.get("RINE_PEER_HANDLE", "bob@acme.rine.network")
 def main() -> None:
     with (
         SyncRineClient(config_dir=ADMIN_CONFIG_DIR) as admin,
-        SyncRineClient(config_dir=PEER_CONFIG_DIR) as peer,
+        SyncRineClient(config_dir=PEER_CONFIG_DIR, owner_dir=PEER_OWNER_DIR) as peer,
     ):
         try:
             group = admin.groups.create(

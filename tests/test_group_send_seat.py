@@ -48,19 +48,14 @@ import httpx
 import pytest
 import respx
 
-from rine._config import save_credentials
-from rine._crypto.keys import (
-    encryption_public_key_to_jwk,
-    generate_agent_keys,
-    save_agent_keys,
-    signing_public_key_to_jwk,
-)
+from rine._crypto.keys import save_agent_keys
 from rine._group_send import encrypt_for_group_sync
 from rine._http import SyncHttpClient
 from rine._mls.binding import open_mls_client
 from rine._mls.group_access import mls_group_id_bytes, note_mls_state_changed
 from rine.errors import MlsDowngradeError, NotAGroupMemberError
 from rine.group_words import ACTING_AGENT_SPELLING, NO_OWN_AGENTS, NO_SEAT_TO_ACT_AS
+from rine.testing import WORLD, write_agent_identity
 
 API = "https://rine.network"
 SENDER = "00000000-1111-2222-3333-444444444444"
@@ -140,19 +135,9 @@ def _serve(
         )
     )
     for member in (SIBLING, PEER_ORG_MEMBER):
-        keys = generate_agent_keys()
-        save_agent_keys(config_dir, member, keys)
+        save_agent_keys(config_dir, member, WORLD.keys(member))
         respx.get(f"{API}/agents/{member}/keys").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "agent_id": member,
-                    "encryption_public_key": encryption_public_key_to_jwk(
-                        keys.encryption.public_key
-                    ),
-                    "signing_public_key": signing_public_key_to_jwk(keys.signing.public_key),
-                },
-            )
+            return_value=httpx.Response(200, json=WORLD.keys_response(member))
         )
     distributions = respx.post(f"{API}/messages").mock(
         return_value=httpx.Response(200, json={"id": "sent", "created_at": "2024-01-01T00:00:00Z"})
@@ -163,8 +148,7 @@ def _serve(
 @pytest.fixture
 def config_dir(tmp_config_dir):
     """A config dir the sender can authenticate and seal from."""
-    save_credentials(tmp_config_dir, {"default": {"client_id": "cid", "client_secret": "sec"}})
-    save_agent_keys(tmp_config_dir, SENDER, generate_agent_keys())
+    write_agent_identity(tmp_config_dir, SENDER)
     return tmp_config_dir
 
 

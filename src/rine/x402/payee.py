@@ -28,6 +28,7 @@ from rine.x402.errors import X402Error, X402ErrorCode
 from rine.x402.extract import extract_payment_payload
 from rine.x402.messages import build_receipt, receipt_from_settlement
 from rine.x402.payee_settle import MatchedQuote, resolve_payee_requirement
+from rine.x402.sender_guard import require_payable
 
 if TYPE_CHECKING:
     from rine._client import RineClient
@@ -74,9 +75,14 @@ async def fulfill(
     RECONCILED payee-owned requirement (never ``pp['accepted']``) is forwarded to
     ``/verify`` + ``/settle``. A no/forged/cross-quote ref — or a malformed payload
     — is REFUSED with a ``success=False`` receipt and no settle; pass ``expected``
-    to authorise an out-of-band quote (it wins over the ref). On a valid verification
-    ``/settle`` runs and its response is the receipt verbatim; otherwise ``/settle`` is
-    skipped and a failure receipt (``payer``/``network`` off the SIGNED payload) threads.
+    to authorise an out-of-band quote (it wins over the ref). A payment whose sender
+    did not sign it (a forged kid) is refused the same way, before anything is parsed
+    or settled. A payment whose sender could not be checked (the key lookup failed) is
+    raised as ``sender-unverifiable`` instead: no receipt goes out and the payer's
+    thread stays open, so the payment can be fulfilled once the lookup works. On a valid
+    verification ``/settle`` runs and its response is the receipt verbatim; otherwise
+    ``/settle`` is skipped and a failure receipt (``payer``/``network`` off the SIGNED
+    payload) threads.
 
     Args:
         client: Async :class:`~rine.RineClient` used to load the quote + reply.
@@ -89,13 +95,16 @@ async def fulfill(
             fulfil fails closed.
 
     Raises:
-        X402Error: If ``payment`` is the wrong type or cannot be decrypted (a
-            malformed body or a reconciliation mismatch are graceful receipts).
+        X402Error: If ``payment`` is the wrong type or cannot be decrypted, or its
+            sender could not be checked (``sender-unverifiable``, retryable; nothing
+            is sent). A malformed body, a reconciliation mismatch or a sender that
+            did not sign it are graceful receipts.
     """
     try:
+        require_payable(payment)
         pp = extract_payment_payload(payment)
     except X402Error as exc:
-        if exc.code == X402ErrorCode.MALFORMED_PAYLOAD:
+        if exc.code in (X402ErrorCode.MALFORMED_PAYLOAD, X402ErrorCode.INAUTHENTIC_SENDER):
             return await _refuse(client, payment, agent, add_marker, exc, network="", payer="")
         raise
 

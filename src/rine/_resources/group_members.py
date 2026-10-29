@@ -163,10 +163,18 @@ def remove_group_member(
     client: Any, handle_or_id: str, agent_id: str, *, agent: str | None
 ) -> GroupRemovalResult:
     """Remove a member, evicting the leaf if asked and retiring local keys (sync)."""
-    from rine._mls.leave import RetiredGroupState, retire_local_group_state
+    from rine._mls.leave import (
+        RetiredGroupState,
+        retire_local_group_state,
+        settle_escrow_before_leave,
+    )
 
     group_id = client._resolve_group_sync(handle_or_id, agent)
     extra, acting_agent_id = _actor_for_removal(client, agent)
+    if acting_agent_id is not None:
+        settle_escrow_before_leave(
+            client._http, client._config_dir, group_id, agent_id, acting_agent_id
+        )
 
     path = f"/groups/{group_id}/members/{agent_id}"
     removal: MlsRemovalCommit | None = None
@@ -196,10 +204,22 @@ async def remove_group_member_async(
     copy of the flow would be a second chance to diverge on epoch handling.
     """
     from rine._mls.bridge import with_sync_http
-    from rine._mls.leave import RetiredGroupState, retire_local_group_state
+    from rine._mls.leave import (
+        RetiredGroupState,
+        retire_local_group_state,
+        settle_escrow_before_leave,
+    )
 
     group_id = await client._resolve_group_async(handle_or_id, agent)
     extra, acting_agent_id = await _actor_for_removal_async(client, agent)
+    if acting_agent_id is not None:
+        leaver = acting_agent_id
+        await with_sync_http(
+            client,
+            lambda http: settle_escrow_before_leave(
+                http, client._config_dir, group_id, agent_id, leaver
+            ),
+        )
 
     path = f"/groups/{group_id}/members/{agent_id}"
     removal: MlsRemovalCommit | None = None

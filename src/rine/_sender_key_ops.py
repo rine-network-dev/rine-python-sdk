@@ -77,6 +77,13 @@ def distribute_sender_key_sync(
                     "to_agent_id": recipient_id,
                     "type": MessageType.SENDER_KEY_DISTRIBUTION,
                     "encrypted_payload": result.encrypted_payload,
+                    # The sender's own copy, sealed to itself. Without it the
+                    # org's reader cannot open an own agent's open-group posts:
+                    # a sender never distributes its key to itself, so the first
+                    # distribution the org sent is unreadable to it and there is
+                    # no recovery path to re-ingest. The server accepts the field
+                    # on any message create.
+                    "self_encrypted_payload": result.self_encrypted_payload,
                     "encryption_version": result.encryption_version,
                     "sender_signing_kid": result.sender_signing_kid,
                 },

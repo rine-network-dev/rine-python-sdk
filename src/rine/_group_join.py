@@ -7,22 +7,24 @@ seam ``_fetch_own_groups`` holds).
 
 🔴 **Join is the one group verb whose target is, by definition, a group the
 caller is NOT in.** Every other verb — read, send, invite, vote, leave — asks
-about a group this org already holds a seat in, so the shared ladder in
+about a group the caller already holds a seat in, so the shared ladder in
 :meth:`rine.RineClient._resolve_group_async` is right for them: it lists ``GET
-/groups``, which is org-scoped, and a stranger's handle answering nothing there
-is the server's answer rather than a defect. For join that same ladder is
-exactly backwards. It searches the one set that cannot contain the target, so a
+/groups``, which is scoped to the caller's own seats, and a stranger's handle
+answering nothing there is the server's answer rather than a defect. For join
+that same ladder is exactly backwards. It searches the one set that cannot contain the target, so a
 handle a caller had just read off ``discover_groups()`` came back ``Group not
 found`` with the server never having refused anything.
 
-**A handle walks three rungs.**
+**A handle walks four rungs.**
 
-1. ``GET /groups?handle=`` — the group this org is already seated in. It resolves
+1. ``GET /groups?handle=`` — a group the caller already holds a seat in. It resolves
    so the server can answer the honest ``409 Agent is already a member`` instead
    of a client-side "not found" about a group the caller is standing in.
 2. ``GET /groups/invites`` — the group that invited or nominated this agent. An
    invitation mints no membership row, so rung 1 structurally cannot see it.
-3. ``GET /directory/groups?q=`` — a public group with no relationship at all.
+3. ``GET /groups/org-joinable?handle=`` — an open or voted group the org owns and holds a seat in
+   (existence only); rung 1 shows an agent its own seats alone.
+4. ``GET /directory/groups?q=`` — a public group with no relationship at all.
 
 **A bare name walks one, and only one.** It is looked for among this agent's
 pending invitations and nowhere else — see
@@ -111,7 +113,7 @@ JOIN_TAKES_A_HANDLE_OR_AN_ID = (
 #: What ``join`` accepts, rendered verbatim by every surface that offers it.
 #:
 #: 🔴 **One sentence, not one per connector.** ``join``'s reference rules differ
-#: from every other group verb's — three rungs for a handle, exactly one for a
+#: from every other group verb's — four rungs for a handle, exactly one for a
 #: bare name — so each surface had to say something the shared group-reference
 #: text does not. Five hand-written copies of that is what
 #: :data:`rine.vote_words.VOTE_ELECTORATE_RULE` and ``MAX_GROUP_MEMBERS`` both
@@ -127,8 +129,9 @@ JOIN_TAKES_A_HANDLE_OR_AN_ID = (
 #: ``rine-core/src/group-join-words.ts`` restates it byte for byte.
 JOIN_REFERENCE_RULE = (
     "Join takes a group's handle or its id, and resolves either exactly: a handle "
-    "answers whether your org already holds a seat, this agent holds a pending "
-    "invitation, or the group is public in the directory. A bare name is read only "
+    "answers whether you already hold a seat, this agent holds a pending "
+    "invitation, the group is open or voted and your org owns it and holds a seat in it, or the group is "
+    "public in the directory. A bare name is read only "
     "against this agent's pending invitations, and is refused when none of them is "
     "for a group of that name — nothing wider is searched for a bare name, because "
     "a join cannot be taken back and is never aimed at a guess. Example: "
@@ -172,24 +175,25 @@ TWO_INVITATIONS_OF_THAT_NAME = (
     "mean by its whole handle:"
 )
 
-#: The handle arm, after all three rungs were searched to the end.
+#: The handle arm, after all four rungs were searched to the end.
 #:
-#: Says which three places were looked in, so a caller can tell "I typed it
-#: wrong" from "this group is in none of the three places a handle can be
+#: Says which four places were looked in, so a caller can tell "I typed it
+#: wrong" from "this group is in none of the four places a handle can be
 #: resolved from" — the second is not a spelling mistake and no amount of
 #: re-reading the directory will fix it.
 #:
 #: 🔴 It names the invitations rung as *"one this agent's pending invitations
 #: name"* rather than "one this agent was invited to", and the two are not the
 #: same claim: an OPEN group's invite mints no voucher and no request row
-#: (``src/rine/api/groups.py``), so an agent genuinely invited to an open,
-#: private-visibility group has nothing on that list. The wider sentence would be
+#: (``src/rine/api/group_routes_invite.py`` ``invite_to_group``), so an agent
+#: genuinely invited to an open, private-visibility group has nothing on that
+#: list. The wider sentence would be
 #: false to the one caller most likely to read it.
 NO_SUCH_GROUP_TO_JOIN = (
-    "No group of that handle is one this org is seated in, one this agent's pending "
-    "invitations name, or a public group in the directory. A group in none of those "
-    "three is not reachable by handle at all, and its id is the only reference that "
-    "reaches it."
+    "No group of that handle is one you hold a seat in, one this agent's pending "
+    "invitations name, an open or voted group your org owns and holds a seat in, or a public group in "
+    "the directory. A group in none of those four is not reachable by handle at all, "
+    "and its id is the only reference that reaches it."
 )
 
 #: The handle arm when the directory search hit its page budget.
@@ -206,8 +210,9 @@ NO_SUCH_GROUP_TO_JOIN = (
 #: costs no extra request. Same substitution on both stacks, which is what keeps
 #: one literal pinnable against its TypeScript twin.
 DIRECTORY_HELD_MORE_THAN_THIS_JOIN_READ = (
-    "No group of that handle is one this org is seated in or one this agent's pending "
-    "invitations name, and the public directory holds {unread} more groups matching "
+    "No group of that handle is one you hold a seat in, one this agent's pending "
+    "invitations name, or an open or voted group your org owns and holds a seat in, and the public "
+    "directory holds {unread} more groups matching "
     "that name than this join read — so this is not a report that the group is absent "
     "from it. The id the directory prints beside a handle reaches the group in one "
     "step."

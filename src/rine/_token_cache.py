@@ -45,7 +45,7 @@ class TokenCache:
     __slots__ = (
         "_config_dir",
         "_margin",
-        "_profile",
+        "_principal",
         "_time_fn",
         "_token_margin",
         "expires_at",
@@ -53,11 +53,15 @@ class TokenCache:
     )
 
     def __init__(
-        self, config_dir: str, profile: str, margin: float, time_fn: Callable[[], float]
+        self, config_dir: str, principal: str, margin: float, time_fn: Callable[[], float]
     ) -> None:
-        """Hold nothing yet, judged by *margin* seconds against *time_fn*'s clock."""
+        """Hold nothing yet, judged by *margin* seconds against *time_fn*'s clock.
+
+        *principal* keys the entry in the shared disk cache, which lives in
+        *config_dir*: one cache file serves every principal that dir signs for.
+        """
         self._config_dir = config_dir
-        self._profile = profile
+        self._principal = principal
         #: The client's own drawn margin. Never reassigned: it is what every disk
         #: lookup is filtered by, and what a cleared cache falls back to.
         self._margin = margin
@@ -88,7 +92,7 @@ class TokenCache:
         now = self._time_fn()
         if self.token and token_is_fresh(self.expires_at, self._token_margin, now):
             return self.token
-        cached = get_cached_token_entry(self._config_dir, self._profile, self._margin, now)
+        cached = get_cached_token_entry(self._config_dir, self._principal, self._margin, now)
         if cached:
             self.token = cached["access_token"]
             self.expires_at = cached["expires_at"]
@@ -121,7 +125,7 @@ class TokenCache:
         the server did not grant.
         """
         try:
-            cache_token(self._config_dir, self._profile, token, expires_in)
+            cache_token(self._config_dir, self._principal, token, expires_in)
         except Exception:
             logger.warning("Failed to cache token", exc_info=True)
         self.token = token

@@ -1,11 +1,12 @@
 """onboard() -> create_agent -> whoami — the full setup flow from a bare config dir.
 
 Registers an org (solves a proof-of-work challenge, ~30-60s), creates the
-first agent, then confirms identity with `whoami()`. Credentials and the
-agent's E2EE keys are saved to `config_dir` — every later run of any example
-in this directory picks them up automatically via the same config-dir
-precedence (`RINE_CLIENT_ID`/`RINE_CLIENT_SECRET` env vars, then
-`RINE_CONFIG_DIR`, then `~/.config/rine`, then `./.rine`).
+first agent, then confirms identity with `whoami()`. The org root and its
+recovery phrase are written to the owner dir (`RINE_OWNER_DIR`, else
+`~/.config/rine-owner`); the agent's E2EE keys and the runtime profile are
+saved to `config_dir` — every later run of any example in this directory picks
+them up automatically via the same config-dir precedence (`RINE_CONFIG_DIR`,
+then `~/.config/rine`, then `./.rine`).
 
 Set your contact address before running — registration checks that the domain
 has MX records, so it has to be an address that can actually receive mail:
@@ -47,16 +48,18 @@ def main() -> None:
         org_slug=slug,
         org_name=os.environ.get("RINE_ORG_NAME", "Example Org"),
     )
-    print(f"registered org {result.org_id} (client_id={result.client_id})")
+    print(f"registered org {result.org_id}")
+    # The 24 words are the org root: whoever holds them controls the org, so
+    # keep them offline. They were written here, and are never printed.
+    print(f"recovery phrase written to {result.phrase_path} — keep it offline")
 
-    # Step 2: create the first agent. This generates and saves the agent's
-    # E2EE keypairs (X25519 + ML-KEM-768) into `config_dir` alongside the
-    # org credentials from step 1.
+    # Step 2: create the first agent. This derives and saves the agent's E2EE
+    # keypairs (X25519 + ML-KEM-768) into `config_dir` from the org root.
     with SyncRineClient(config_dir=CONFIG_DIR) as client:
         agent = client.create_agent("assistant")
         print(f"created agent {agent.handle} (id={agent.id})")
 
-        # Step 3: confirm identity end-to-end via the credentials just saved.
+        # Step 3: confirm identity end-to-end via the profile just saved.
         me = client.whoami()
         print(f"whoami: org={me.org.slug} trust_tier={me.trust_tier}")
         for a in me.agents:

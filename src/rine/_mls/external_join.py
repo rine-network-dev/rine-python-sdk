@@ -16,25 +16,22 @@ inflicts on itself.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+from rine._mls.allowed import admit_group_peers
 from rine._mls.api import MlsCommit, fetch_group_info
-from rine._mls.binding import open_mls_client
+from rine._mls.binding import DEFAULT_CIPHER_SUITE, PeerNotAdmittedError, open_mls_client
 from rine._mls.commit import post_mls_commit
+from rine._mls.escrow_drain import drain_escrow
+from rine._mls.escrow_report import EscrowReport
+from rine._mls.escrow_settle import settle_escrow
+from rine._mls.failures import is_epoch_conflict
 from rine._mls.group_access import note_mls_state_changed
 from rine._mls.heartbeat import MlsActor
-from rine._mls.wire import api_error_code
+from rine._mls.peer_refusal import peer_not_admitted_refusal
+from rine._mls.wire import PENDING_CONFIRMATION, api_error_code
 from rine.errors import CryptoError
-
-#: A commit the server refused because the group had already moved on: someone
-#: else's commit landed first, so ours no longer targeted ``current + 1``.
-EPOCH_CONFLICT = "epoch_conflict"
-
-#: The group's newest GroupInfo is still awaiting a peer's ACK, so the server has
-#: no confirmed join capability to serve. Unlike an epoch conflict this resolves
-#: on its own, so it gets its own short wait rather than the single rebuild.
-PENDING_CONFIRMATION = "pending_confirmation"
 
 PENDING_RETRY_LIMIT = 3
 PENDING_RETRY_DELAY_S = 0.4
@@ -56,15 +53,27 @@ class ExternalJoin:
     extra_headers: dict[str, str]
     """Acting-agent headers for the group requests."""
 
-    cipher_suite: int | None = None
-    """The group's own suite, when it is not the current default."""
+    carry_unreported: bool = True
+    """Whether the result reports what a background sweep lost in this group. A caller that
+    drops the result sets it off, so the news waits for one that does not."""
 
 
-def external_join_mls_group(join: ExternalJoin) -> int:
+@dataclass(frozen=True)
+class ExternalJoinResult:
+    """Where an external join left the group, and what is owed on its escrow."""
+
+    epoch: int
+    """The epoch the group is now at."""
+
+    escrow: EscrowReport = field(default_factory=EscrowReport)
+    """What settling the replaced state and draining the new one could not do."""
+
+
+def external_join_mls_group(join: ExternalJoin) -> ExternalJoinResult:
     """Self-join an MLS-active group, advancing its epoch.
 
     Returns:
-        The epoch the group is now at.
+        The epoch the group is now at, and the escrow report of the replacement.
 
     Raises:
         CryptoError: If the group publishes no GroupInfo, if its GroupInfo stays
@@ -93,7 +102,7 @@ def external_join_mls_group(join: ExternalJoin) -> int:
     # Anything else — no GroupInfo, no membership, a malformed blob — would fail
     # identically the second time, and an "epoch conflict" wrapper around it
     # would send the reader looking in the wrong place.
-    if api_error_code(first_error) != EPOCH_CONFLICT:
+    if not is_epoch_conflict(first_error):
         raise first_error
     try:
         return _attempt(join)
@@ -104,7 +113,7 @@ def external_join_mls_group(join: ExternalJoin) -> int:
         ) from first_error
 
 
-def _attempt(join: ExternalJoin) -> int:
+def _attempt(join: ExternalJoin) -> ExternalJoinResult:
     group_info = fetch_group_info(join.client, join.group_id, join.extra_headers).blob
     if group_info is None:
         raise CryptoError(
@@ -112,27 +121,35 @@ def _attempt(join: ExternalJoin) -> int:
             "An existing member must publish one before an agent can self-join."
         )
 
-    mls = open_mls_client(join.config_dir, join.agent_id, cipher_suite=join.cipher_suite)
-    group = mls.join_by_external_commit(group_info)
+    actor = MlsActor(client=join.client, config_dir=join.config_dir, agent_id=join.agent_id)
+    # The external commit meets the group's leaves for the first time, so the
+    # chain-verified peers must be admitted before it is built.
+    admit_group_peers(actor, join.group_id)
+    mls = open_mls_client(join.config_dir, join.agent_id)
+    try:
+        group = mls.join_by_external_commit(group_info)
+    except PeerNotAdmittedError as err:
+        raise peer_not_admitted_refusal(join.group_id) from err
     bundle = group.last_commit()
     if bundle is None:  # pragma: no cover - an external join always commits
         raise CryptoError(f"External MLS self-join for group {join.group_id} produced no commit")
 
     epoch = post_mls_commit(
-        MlsActor(client=join.client, config_dir=join.config_dir, agent_id=join.agent_id),
+        actor,
         join.group_id,
         MlsCommit(
             commit=bundle.commit,
             group_info=bundle.group_info,
             epoch=bundle.epoch,
-            cipher_suite=group.cipher_suite(),
+            cipher_suite=DEFAULT_CIPHER_SUITE,
         ),
         join.extra_headers,
     )
     # Only now: the server's epoch CAS is what decides whether this join happened
     # at all, so state adopted before it would be a fork no peer can see.
-    group.save()
+    settled = settle_escrow(actor, join.group_id)
+    drained = drain_escrow(actor, join.group_id, group, carry_unreported=join.carry_unreported)
     # An accepted external commit is an establishment: invalidate at the mutation
     # rather than leaving it to whoever called the join.
     note_mls_state_changed(join.config_dir, join.agent_id, join.group_id)
-    return epoch
+    return ExternalJoinResult(epoch, settled.merge(drained.report()))

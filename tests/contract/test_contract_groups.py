@@ -136,7 +136,7 @@ class TestModelParseFloor:
         group = GroupRead.model_validate(load("groups_list_200")["body"]["items"][0])
         assert group.id is not None and group.handle
         assert group.conversation_id is None
-        # The listing is ORG-scoped, so the row has to say which of the org's
+        # The listing is credential-scoped, so the row has to say which of the org's
         # own agents hold a seat in it — the golden body carries them and the model
         # must land them as ids, not drop them the way pydantic drops any field a
         # model was never told about.
@@ -153,7 +153,7 @@ class TestModelParseFloor:
     def test_members_item_parses_group_member(self):
         member = GroupMember.model_validate(load("groups_members_200")["body"]["items"][0])
         assert member.group_id is not None and member.role
-        # The roster is authorised for the org, not for one agent, so a row
+        # The roster is authorised for the credential's scope, not for one agent, so a row
         # says whether it is one of the caller's own seats. A marker, never a
         # filter — the renderers mark this row and still print every other one.
         assert member.is_own_org is True

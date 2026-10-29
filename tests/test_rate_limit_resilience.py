@@ -10,7 +10,7 @@ import httpx
 import pytest
 import respx
 
-from rine._config import cache_token, save_credentials
+from rine._config import cache_token
 from rine._crypto._agent_keys import fetch_recipient_keys_async, fetch_recipient_keys_sync
 from rine._crypto._key_cache import KeyCache
 from rine._crypto._sender_verify import (
@@ -18,22 +18,22 @@ from rine._crypto._sender_verify import (
     verify_envelope_sender_async,
     verify_envelope_sender_sync,
 )
-from rine._crypto.keys import (
-    encryption_public_key_to_jwk,
-    generate_agent_keys,
-    make_kid,
-    signing_public_key_to_jwk,
-)
-from rine._crypto.sign import sign_payload
+from rine._crypto.certs import VerifiedAgentKeys
+from rine._crypto.keys import make_kid
+from rine._crypto.sign import MessageSig, sign_message
 from rine._http import AsyncHttpClient, SyncHttpClient
+from rine._principal import agent_principal
 from rine.errors import AuthenticationError
+from rine.testing import WORLD, write_agent_identity
 from tests.conftest import signing_fingerprint
 
 API = "https://rine.network"
 TOKEN_URL = f"{API}/oauth/token"
-_CREDS = {"default": {"client_id": "cid", "client_secret": "csecret"}}
+AGENT_ID = "00000000-1111-2222-3333-444444444444"
+PRINCIPAL = str(agent_principal(AGENT_ID))
 _TOKEN_OK = {"access_token": "tok", "expires_in": 3600}
 SENDER_ID = "11111111-2222-3333-4444-555555555555"
+FORGER_ID = "99999999-8888-7777-6666-555555555555"
 KEYS_URL = f"{API}/agents/{SENDER_ID}/keys"
 
 
@@ -41,17 +41,10 @@ def _token_ok(_request):
     return httpx.Response(200, json=_TOKEN_OK)
 
 
-def _keys_body(keys):
-    return {
-        "signing_public_key": signing_public_key_to_jwk(keys.signing.public_key),
-        "encryption_public_key": encryption_public_key_to_jwk(keys.encryption.public_key),
-    }
-
-
 class TestTokenRetry:
     @respx.mock
     def test_token_fetch_when_429_then_200_retries_and_succeeds(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         n = {"c": 0}
 
         def token_handler(_request):
@@ -69,7 +62,7 @@ class TestTokenRetry:
 
     @respx.mock
     def test_token_fetch_when_persistent_429_fails_after_max_attempts(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         n = {"c": 0}
 
         def token_handler(_request):
@@ -86,7 +79,7 @@ class TestTokenRetry:
 
     @respx.mock
     def test_token_fetch_honors_retry_after_over_jitter(self, tmp_config_dir, monkeypatch):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         slept: list[float] = []
         monkeypatch.setattr("rine._http.time.sleep", lambda d: slept.append(d))
         n = {"c": 0}
@@ -107,7 +100,7 @@ class TestTokenRetry:
 
     @respx.mock
     def test_token_fetch_caps_cumulative_backoff_at_30s(self, tmp_config_dir, monkeypatch):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         slept: list[float] = []
         monkeypatch.setattr("rine._http.time.sleep", lambda d: slept.append(d))
         n = {"c": 0}
@@ -128,7 +121,7 @@ class TestTokenRetry:
 
     @respx.mock
     def test_token_fetch_non_429_fails_fast(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         n = {"c": 0}
 
         def token_handler(_request):
@@ -145,7 +138,7 @@ class TestTokenRetry:
 
     @respx.mock
     async def test_token_fetch_async_when_429_then_200_retries(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         n = {"c": 0}
 
         def token_handler(_request):
@@ -173,9 +166,9 @@ class TestRefreshMarginJitter:
 
     @respx.mock
     def test_per_instance_margin_desyncs_refresh(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         # Disk token valid for 120s: inside a 180s margin, outside a 60s margin.
-        cache_token(tmp_config_dir, "default", "disk-tok", 120)
+        cache_token(tmp_config_dir, PRINCIPAL, "disk-tok", 120)
         posts = {"c": 0}
 
         def token_handler(_request):
@@ -197,8 +190,8 @@ class TestRefreshMarginJitter:
 
     @respx.mock
     async def test_per_instance_margin_desyncs_refresh_async(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
-        cache_token(tmp_config_dir, "default", "disk-tok", 120)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
+        cache_token(tmp_config_dir, PRINCIPAL, "disk-tok", 120)
         posts = {"c": 0}
 
         def token_handler(_request):
@@ -250,24 +243,24 @@ class TestVerifyPathCache:
 
     @respx.mock
     def test_verify_second_message_from_same_sender_within_ttl_hits_cache(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         respx.post(TOKEN_URL).mock(side_effect=_token_ok)
-        keys = generate_agent_keys()
+        keys = WORLD.keys(SENDER_ID)
         payload = b'{"text":"hi"}'
-        signature = sign_payload(keys.signing.private_key, payload)
+        signature = sign_message(keys.signing.private_key, MessageSig(SENDER_ID), payload)
         calls = {"c": 0}
 
         def keys_handler(_request):
             calls["c"] += 1
-            return httpx.Response(200, json=_keys_body(keys))
+            return httpx.Response(200, json=WORLD.keys_response(SENDER_ID))
 
         respx.get(KEYS_URL).mock(side_effect=keys_handler)
         client = SyncHttpClient(config_dir=tmp_config_dir, api_url=API)
         first = verify_envelope_sender_sync(
-            make_kid(SENDER_ID), payload, signature, client, SENDER_ID
+            make_kid(SENDER_ID, 0), payload, signature, MessageSig(SENDER_ID), client, SENDER_ID
         )
         second = verify_envelope_sender_sync(
-            make_kid(SENDER_ID), payload, signature, client, SENDER_ID
+            make_kid(SENDER_ID, 0), payload, signature, MessageSig(SENDER_ID), client, SENDER_ID
         )
         assert first.verified is True
         assert second.verified is True
@@ -276,49 +269,55 @@ class TestVerifyPathCache:
 
     @respx.mock
     def test_verify_key_refetched_after_ttl_expiry(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         respx.post(TOKEN_URL).mock(side_effect=_token_ok)
-        keys = generate_agent_keys()
+        keys = WORLD.keys(SENDER_ID)
         payload = b'{"text":"hi"}'
-        signature = sign_payload(keys.signing.private_key, payload)
+        signature = sign_message(keys.signing.private_key, MessageSig(SENDER_ID), payload)
         calls = {"c": 0}
 
         def keys_handler(_request):
             calls["c"] += 1
-            return httpx.Response(200, json=_keys_body(keys))
+            return httpx.Response(200, json=WORLD.keys_response(SENDER_ID))
 
         respx.get(KEYS_URL).mock(side_effect=keys_handler)
         client = SyncHttpClient(config_dir=tmp_config_dir, api_url=API)
         now = {"t": 1000.0}
         client._keys_cache = KeyCache(600.0, 256, time_fn=lambda: now["t"])
-        verify_envelope_sender_sync(make_kid(SENDER_ID), payload, signature, client, SENDER_ID)
-        verify_envelope_sender_sync(make_kid(SENDER_ID), payload, signature, client, SENDER_ID)
+        verify_envelope_sender_sync(
+            make_kid(SENDER_ID, 0), payload, signature, MessageSig(SENDER_ID), client, SENDER_ID
+        )
+        verify_envelope_sender_sync(
+            make_kid(SENDER_ID, 0), payload, signature, MessageSig(SENDER_ID), client, SENDER_ID
+        )
         assert calls["c"] == 1
         now["t"] = 1601.0  # past the 600s TTL
-        verify_envelope_sender_sync(make_kid(SENDER_ID), payload, signature, client, SENDER_ID)
+        verify_envelope_sender_sync(
+            make_kid(SENDER_ID, 0), payload, signature, MessageSig(SENDER_ID), client, SENDER_ID
+        )
         assert calls["c"] == 2
         client.close()
 
     @respx.mock
     async def test_verify_second_message_within_ttl_hits_cache_async(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         respx.post(TOKEN_URL).mock(side_effect=_token_ok)
-        keys = generate_agent_keys()
+        keys = WORLD.keys(SENDER_ID)
         payload = b'{"text":"hi"}'
-        signature = sign_payload(keys.signing.private_key, payload)
+        signature = sign_message(keys.signing.private_key, MessageSig(SENDER_ID), payload)
         calls = {"c": 0}
 
         def keys_handler(_request):
             calls["c"] += 1
-            return httpx.Response(200, json=_keys_body(keys))
+            return httpx.Response(200, json=WORLD.keys_response(SENDER_ID))
 
         respx.get(KEYS_URL).mock(side_effect=keys_handler)
         client = AsyncHttpClient(config_dir=tmp_config_dir, api_url=API)
         await verify_envelope_sender_async(
-            make_kid(SENDER_ID), payload, signature, client, SENDER_ID
+            make_kid(SENDER_ID, 0), payload, signature, MessageSig(SENDER_ID), client, SENDER_ID
         )
         await verify_envelope_sender_async(
-            make_kid(SENDER_ID), payload, signature, client, SENDER_ID
+            make_kid(SENDER_ID, 0), payload, signature, MessageSig(SENDER_ID), client, SENDER_ID
         )
         assert calls["c"] == 1
         await client.close()
@@ -334,53 +333,53 @@ class TestSendPathFetchesFresh:
 
     @respx.mock
     def test_send_key_fetch_after_peer_rotation_uses_current_key(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         respx.post(TOKEN_URL).mock(side_effect=_token_ok)
-        rotated_away = generate_agent_keys()
-        current = generate_agent_keys()
+        rotated_away = WORLD.verified(SENDER_ID, 0)
+        current = WORLD.keys(SENDER_ID, 1)
         calls = {"c": 0}
 
         def keys_handler(_request):
             calls["c"] += 1
-            return httpx.Response(200, json=_keys_body(current))
+            return httpx.Response(200, json=WORLD.keys_response(SENDER_ID, 1))
 
         respx.get(KEYS_URL).mock(side_effect=keys_handler)
         client = SyncHttpClient(config_dir=tmp_config_dir, api_url=API)
-        client._keys_cache.set(SENDER_ID, _keys_body(rotated_away))
+        client._keys_cache.set(SENDER_ID, rotated_away)
 
         first = fetch_recipient_keys_sync(client, SENDER_ID)
         second = fetch_recipient_keys_sync(client, SENDER_ID)
 
-        assert first.encryption == current.encryption.public_key
-        assert second.encryption == current.encryption.public_key
+        assert first.encryption_public_key == current.encryption.public_key
+        assert second.encryption_public_key == current.encryption.public_key
         assert calls["c"] == 2  # every send goes to the network
         # The seal path neither read nor wrote the cache.
-        assert client._keys_cache.get(SENDER_ID) == _keys_body(rotated_away)
+        assert client._keys_cache.get(SENDER_ID) == rotated_away
         client.close()
 
     @respx.mock
     async def test_send_key_fetch_after_peer_rotation_uses_current_key_async(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         respx.post(TOKEN_URL).mock(side_effect=_token_ok)
-        rotated_away = generate_agent_keys()
-        current = generate_agent_keys()
+        rotated_away = WORLD.verified(SENDER_ID, 0)
+        current = WORLD.keys(SENDER_ID, 1)
         calls = {"c": 0}
 
         def keys_handler(_request):
             calls["c"] += 1
-            return httpx.Response(200, json=_keys_body(current))
+            return httpx.Response(200, json=WORLD.keys_response(SENDER_ID, 1))
 
         respx.get(KEYS_URL).mock(side_effect=keys_handler)
         client = AsyncHttpClient(config_dir=tmp_config_dir, api_url=API)
-        client._keys_cache.set(SENDER_ID, _keys_body(rotated_away))
+        client._keys_cache.set(SENDER_ID, rotated_away)
 
         first = await fetch_recipient_keys_async(client, SENDER_ID)
         second = await fetch_recipient_keys_async(client, SENDER_ID)
 
-        assert first.encryption == current.encryption.public_key
-        assert second.encryption == current.encryption.public_key
+        assert first.encryption_public_key == current.encryption.public_key
+        assert second.encryption_public_key == current.encryption.public_key
         assert calls["c"] == 2
-        assert client._keys_cache.get(SENDER_ID) == _keys_body(rotated_away)
+        assert client._keys_cache.get(SENDER_ID) == rotated_away
         await client.close()
 
 
@@ -389,8 +388,17 @@ class TestSigningKeyFingerprint:
         # Hex SHA-256 over the raw 32-byte Ed25519 key. The expected digest is
         # the one the TypeScript stack produces for the same JWK, so a peer's
         # key reads as the same fingerprint whichever client reports it.
-        jwk = {"kty": "OKP", "crv": "Ed25519", "x": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"}
-        assert signing_key_fingerprint({"signing_public_key": jwk}) == (
+        keys = VerifiedAgentKeys(
+            agent_id=SENDER_ID,
+            org_id=WORLD.org_id,
+            branch="main",
+            key_gen=0,
+            signing_public_key=bytes(range(32)),
+            encryption_public_key=b"",
+            pq_encryption_public_key=b"",
+            mls_public_key=b"",
+        )
+        assert signing_key_fingerprint(keys) == (
             "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd"
         )
 
@@ -398,23 +406,23 @@ class TestSigningKeyFingerprint:
 class TestVerifyFailRefetch:
     @respx.mock
     def test_verify_fail_triggers_one_bypass_refetch_then_verifies(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         respx.post(TOKEN_URL).mock(side_effect=_token_ok)
-        new = generate_agent_keys()
-        old = generate_agent_keys()
+        new = WORLD.keys(SENDER_ID, 1)
+        old = WORLD.keys(SENDER_ID, 0)
         payload = b'{"text":"hi"}'
-        signature = sign_payload(new.signing.private_key, payload)
+        signature = sign_message(new.signing.private_key, MessageSig(SENDER_ID), payload)
         calls = {"c": 0}
 
         def keys_handler(_request):
             calls["c"] += 1
-            return httpx.Response(200, json=_keys_body(new))
+            return httpx.Response(200, json=WORLD.keys_response(SENDER_ID, 1))
 
         respx.get(KEYS_URL).mock(side_effect=keys_handler)
         client = SyncHttpClient(config_dir=tmp_config_dir, api_url=API)
-        client._keys_cache.set(SENDER_ID, _keys_body(old))  # stale, rotated-away key
+        client._keys_cache.set(SENDER_ID, WORLD.verified(SENDER_ID, 0))  # stale, rotated-away key
         result = verify_envelope_sender_sync(
-            make_kid(SENDER_ID), payload, signature, client, SENDER_ID
+            make_kid(SENDER_ID, 0), payload, signature, MessageSig(SENDER_ID), client, SENDER_ID
         )
         assert result.verified is True
         assert result.verification_status == "verified"
@@ -429,19 +437,21 @@ class TestVerifyFailRefetch:
     def test_verify_fail_when_rotated_key_also_fails_reports_the_change(self, tmp_config_dir):
         # The rotation is reported even though it does not rescue the signature:
         # the signal is about the key, not about the verdict.
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         respx.post(TOKEN_URL).mock(side_effect=_token_ok)
-        old = generate_agent_keys()
-        current = generate_agent_keys()
-        forger = generate_agent_keys()
+        old = WORLD.keys(SENDER_ID, 0)
+        current = WORLD.keys(SENDER_ID, 1)
+        forger = WORLD.keys(FORGER_ID)
         payload = b'{"text":"hi"}'
-        signature = sign_payload(forger.signing.private_key, payload)
+        signature = sign_message(forger.signing.private_key, MessageSig(SENDER_ID), payload)
 
-        respx.get(KEYS_URL).mock(return_value=httpx.Response(200, json=_keys_body(current)))
+        respx.get(KEYS_URL).mock(
+            return_value=httpx.Response(200, json=WORLD.keys_response(SENDER_ID, 1))
+        )
         client = SyncHttpClient(config_dir=tmp_config_dir, api_url=API)
-        client._keys_cache.set(SENDER_ID, _keys_body(old))
+        client._keys_cache.set(SENDER_ID, WORLD.verified(SENDER_ID, 0))
         result = verify_envelope_sender_sync(
-            make_kid(SENDER_ID), payload, signature, client, SENDER_ID
+            make_kid(SENDER_ID, 0), payload, signature, MessageSig(SENDER_ID), client, SENDER_ID
         )
         assert result.verified is False
         assert result.verification_status == "invalid"
@@ -454,23 +464,22 @@ class TestVerifyFailRefetch:
     def test_verify_fail_when_refetch_returns_same_key_reports_no_change(self, tmp_config_dir):
         # A bounded retry, not an oracle: the same key back means one refetch and
         # a plain failure, with nothing to report and no second verification.
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         respx.post(TOKEN_URL).mock(side_effect=_token_ok)
-        real = generate_agent_keys()
-        forger = generate_agent_keys()
+        forger = WORLD.keys(FORGER_ID)
         payload = b'{"text":"hi"}'
-        signature = sign_payload(forger.signing.private_key, payload)
+        signature = sign_message(forger.signing.private_key, MessageSig(SENDER_ID), payload)
         calls = {"c": 0}
 
         def keys_handler(_request):
             calls["c"] += 1
-            return httpx.Response(200, json=_keys_body(real))
+            return httpx.Response(200, json=WORLD.keys_response(SENDER_ID, 0))
 
         respx.get(KEYS_URL).mock(side_effect=keys_handler)
         client = SyncHttpClient(config_dir=tmp_config_dir, api_url=API)
-        client._keys_cache.set(SENDER_ID, _keys_body(real))
+        client._keys_cache.set(SENDER_ID, WORLD.verified(SENDER_ID, 0))
         result = verify_envelope_sender_sync(
-            make_kid(SENDER_ID), payload, signature, client, SENDER_ID
+            make_kid(SENDER_ID, 0), payload, signature, MessageSig(SENDER_ID), client, SENDER_ID
         )
         assert result.verified is False
         assert result.verification_status == "invalid"
@@ -482,22 +491,21 @@ class TestVerifyFailRefetch:
     def test_verify_fail_forged_signature_cold_cache_fetches_once(self, tmp_config_dir):
         # A forged signature against a NON-cached (cold) sender must fetch keys
         # exactly once: a fresh miss is not re-fetched, only a stale cache hit is.
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         respx.post(TOKEN_URL).mock(side_effect=_token_ok)
-        real = generate_agent_keys()
-        forger = generate_agent_keys()
+        forger = WORLD.keys(FORGER_ID)
         payload = b'{"text":"hi"}'
-        signature = sign_payload(forger.signing.private_key, payload)
+        signature = sign_message(forger.signing.private_key, MessageSig(SENDER_ID), payload)
         calls = {"c": 0}
 
         def keys_handler(_request):
             calls["c"] += 1
-            return httpx.Response(200, json=_keys_body(real))
+            return httpx.Response(200, json=WORLD.keys_response(SENDER_ID, 0))
 
         respx.get(KEYS_URL).mock(side_effect=keys_handler)
         client = SyncHttpClient(config_dir=tmp_config_dir, api_url=API)
         result = verify_envelope_sender_sync(
-            make_kid(SENDER_ID), payload, signature, client, SENDER_ID
+            make_kid(SENDER_ID, 0), payload, signature, MessageSig(SENDER_ID), client, SENDER_ID
         )
         assert result.verified is False
         assert result.verification_status == "invalid"
@@ -507,23 +515,23 @@ class TestVerifyFailRefetch:
 
     @respx.mock
     async def test_verify_fail_bypass_refetch_then_verifies_async(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         respx.post(TOKEN_URL).mock(side_effect=_token_ok)
-        new = generate_agent_keys()
-        old = generate_agent_keys()
+        new = WORLD.keys(SENDER_ID, 1)
+        old = WORLD.keys(SENDER_ID, 0)
         payload = b'{"text":"hi"}'
-        signature = sign_payload(new.signing.private_key, payload)
+        signature = sign_message(new.signing.private_key, MessageSig(SENDER_ID), payload)
         calls = {"c": 0}
 
         def keys_handler(_request):
             calls["c"] += 1
-            return httpx.Response(200, json=_keys_body(new))
+            return httpx.Response(200, json=WORLD.keys_response(SENDER_ID, 1))
 
         respx.get(KEYS_URL).mock(side_effect=keys_handler)
         client = AsyncHttpClient(config_dir=tmp_config_dir, api_url=API)
-        client._keys_cache.set(SENDER_ID, _keys_body(old))
+        client._keys_cache.set(SENDER_ID, WORLD.verified(SENDER_ID, 0))
         result = await verify_envelope_sender_async(
-            make_kid(SENDER_ID), payload, signature, client, SENDER_ID
+            make_kid(SENDER_ID, 0), payload, signature, MessageSig(SENDER_ID), client, SENDER_ID
         )
         assert result.verified is True
         assert result.verification_status == "verified"
@@ -537,23 +545,22 @@ class TestVerifyFailRefetch:
     async def test_verify_fail_when_refetch_returns_same_key_reports_no_change_async(
         self, tmp_config_dir
     ):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         respx.post(TOKEN_URL).mock(side_effect=_token_ok)
-        real = generate_agent_keys()
-        forger = generate_agent_keys()
+        forger = WORLD.keys(FORGER_ID)
         payload = b'{"text":"hi"}'
-        signature = sign_payload(forger.signing.private_key, payload)
+        signature = sign_message(forger.signing.private_key, MessageSig(SENDER_ID), payload)
         calls = {"c": 0}
 
         def keys_handler(_request):
             calls["c"] += 1
-            return httpx.Response(200, json=_keys_body(real))
+            return httpx.Response(200, json=WORLD.keys_response(SENDER_ID, 0))
 
         respx.get(KEYS_URL).mock(side_effect=keys_handler)
         client = AsyncHttpClient(config_dir=tmp_config_dir, api_url=API)
-        client._keys_cache.set(SENDER_ID, _keys_body(real))
+        client._keys_cache.set(SENDER_ID, WORLD.verified(SENDER_ID, 0))
         result = await verify_envelope_sender_async(
-            make_kid(SENDER_ID), payload, signature, client, SENDER_ID
+            make_kid(SENDER_ID, 0), payload, signature, MessageSig(SENDER_ID), client, SENDER_ID
         )
         assert result.verified is False
         assert result.key_changed is None

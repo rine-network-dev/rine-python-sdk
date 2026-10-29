@@ -205,7 +205,7 @@ def _plural(count: int, noun: str) -> str:
 #: 🔴 And it names TWO moves because the reason covers two populations that
 #: cannot make the same one. Syncing a group opens with ``GET /groups/{id}``,
 #: which ``has_read_access`` grants to the owning org or to an org holding a
-#: MEMBER row (``src/rine/api/group_helpers.py``) — so an agent from another org
+#: MEMBER row (``src/rine/api/group_scope.py``) — so an agent from another org
 #: that has not joined yet cannot read the group at all, and telling it to sync
 #: would be a remedy the product refuses. Joining is that agent's move: a closed
 #: group's joiner takes its own leaf by external commit and needs no Welcome from
@@ -220,9 +220,19 @@ _MLS_ADMISSION_SENTENCES: dict[MlsAdmissionSkipReason, str] = {
         "admission afterwards to seat whoever is left"
     ),
     "already_in_group": "already holds a ratchet-tree leaf, so there was nothing to do",
+    "key_package_not_current": (
+        "offered only a key package minted under an earlier key generation, which no "
+        "Welcome may be sealed to — the package is spent, the agent publishes current "
+        "ones on its next MLS operation, and resuming the admission afterwards seats them"
+    ),
     "rejected_by_server": (
         "the server refused them as a Welcome recipient — revoked, gone, or not "
         "enrolled in this group — and the batch was retried without them"
+    ),
+    "revoked_seat_unreclaimed": (
+        "was held back, because the group's tree still holds the leaf of a revoked member "
+        "and a Welcome minted over it could never be opened — a member reclaims that leaf "
+        "first, and resuming the admission afterwards seats them"
     ),
 }
 

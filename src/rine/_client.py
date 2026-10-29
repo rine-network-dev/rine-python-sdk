@@ -7,6 +7,7 @@ proper connection lifecycle management.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
@@ -20,6 +21,8 @@ if TYPE_CHECKING:
 
 
 from rine._actor import AGENT_HEADER, ResolvedActor, normalize_actor, refuse_if_not_addressee
+from rine._agent_provision import create_agent as _create_agent
+from rine._agent_rotate_seats import RotatedAgent, rotate_agent_with_seats
 from rine._base_client import BaseRineClient
 from rine._constants import NOT_GIVEN, EncryptionVersion, MessageType, NotGiven
 from rine._crypto._agent_keys import fetch_recipient_keys_async
@@ -51,7 +54,8 @@ from rine._group_ref import (
 )
 from rine._http import AsyncHttpClient
 from rine._logging import logger
-from rine._onboard import create_agent as _create_agent
+from rine._mls.bridge import with_sync_http
+from rine._mls.escrow_sweep import agents_with_escrow_work, startup_escrow_sweep
 from rine._recipient import (
     REF_CLASS_GROUP,
     REF_CLASS_ID,
@@ -75,6 +79,7 @@ from rine._resolve import (
     normalize_handle,
     resolve_agent,
     resolve_to_uuid_async,
+    warn_if_handle_moved,
 )
 from rine._resources.group_ops import unwrap_items
 from rine._resources.groups import AsyncGroups
@@ -82,8 +87,9 @@ from rine._resources.webhooks import AsyncWebhooks
 from rine._thread import to_thread_entry
 from rine._utils import apply_cleartext_fields
 from rine._verify import async_verify_identity as _async_verify_identity
+from rine._whoami import parse_whoami
+from rine.a2a_cleartext import is_a2a_cleartext, read_a2a_cleartext
 from rine.errors import (
-    ConfigError,
     CryptoError,
     NoSenderKeyStateError,
     NotFoundError,
@@ -120,7 +126,7 @@ from rine.types import (
     WhoAmI,
 )
 
-# Inbox delivery-status filter values (server: messages.py ``_status_filter``).
+# Inbox delivery-status filter values (server: messages_inbox.py ``list_messages``' ``status``).
 InboxStatus = Literal["new", "delivered", "read"]
 
 
@@ -137,6 +143,11 @@ class RineClient(BaseRineClient):
         timeout: HTTP request timeout in seconds.
         max_retries: Maximum retry attempts for rate limiting.
         http_client: Optional custom ``httpx.AsyncClient``.
+        owner_dir: Owner directory holding ``root.key``; ``RINE_OWNER_DIR`` or
+            ``~/.config/rine-owner`` when omitted.
+        profile: Named profile to act as; the default profile when omitted.
+        agent_only: Act only as an agent whose leaf keys are in ``config_dir``; the
+            owner dir is never read, so ``root.key`` cannot make this client the org.
 
     Example::
 
@@ -153,6 +164,9 @@ class RineClient(BaseRineClient):
         timeout: float = 30.0,
         max_retries: int = 2,
         http_client: httpx.AsyncClient | None = None,
+        owner_dir: str | None = None,
+        profile: str | None = None,
+        agent_only: bool = False,
     ) -> None:
         super().__init__(
             config_dir=config_dir,
@@ -160,6 +174,9 @@ class RineClient(BaseRineClient):
             agent=agent,
             timeout=timeout,
             max_retries=max_retries,
+            owner_dir=owner_dir,
+            profile=profile,
+            agent_only=agent_only,
         )
         self._http = AsyncHttpClient(
             config_dir=self._config_dir,
@@ -167,11 +184,21 @@ class RineClient(BaseRineClient):
             timeout=timeout,
             max_retries=max_retries,
             http_client=http_client,
+            owner_dir=self._owner_dir,
+            profile=self._profile,
+            agent_only=self._agent_only,
         )
         self.groups = AsyncGroups(self)
         self.webhooks = AsyncWebhooks(self)
 
     async def __aenter__(self) -> RineClient:
+        # Escrow files a previous process left behind are cleared now, on the
+        # worker thread every MLS flow of this client runs on.
+        only = self._escrow_sweep_agent()
+        if agents_with_escrow_work(self._config_dir, only):
+            await with_sync_http(
+                self, lambda http: startup_escrow_sweep(http, self._config_dir, only)
+            )
         return self
 
     async def __aexit__(self, *args: Any) -> None:
@@ -282,7 +309,7 @@ class RineClient(BaseRineClient):
         return self._agents_cache
 
     async def _fetch_own_groups(self, agent: str | None) -> list[dict[str, Any]]:
-        """Every group this org belongs to, unfiltered — the one rung the server cannot take.
+        """Every group the key can see, unfiltered — the one rung the server cannot take.
 
         ``GET /groups?handle=`` matches a FULL ``#name@org`` handle only, so both
         callers that start from a bare name have to list and decide locally. What
@@ -291,7 +318,7 @@ class RineClient(BaseRineClient):
         (``rine-core/src/resolve-group.ts``) holds on the TypeScript side.
 
         ``agent`` becomes the ``X-Rine-Agent`` attribution header. It does not
-        select whose list comes back: the route is org-scoped either way.
+        select whose list comes back: the route follows the key either way.
         """
         extra = await self._agent_header(agent)
         return list(unwrap_items(await self._http.get("/groups", extra_headers=extra)))
@@ -369,11 +396,12 @@ class RineClient(BaseRineClient):
         synchronous one cannot answer the same reference differently.
 
         ``agent`` is sent as the ``X-Rine-Agent`` attribution header. It does not
-        select whose list is searched: ``GET /groups`` is org-scoped, so a bare
-        name resolves against every group an agent of the org belongs to.
+        select whose list is searched: ``GET /groups`` follows the key, so a bare
+        name resolves against the same groups either way (an org key's: every
+        group an agent of the org belongs to).
 
         Raises:
-            NotFoundError: No group of this org answers to the reference.
+            NotFoundError: No group in the key's scope answers to the reference.
             ConfigError: More than one does.
         """
         return await walk_async(group_ladder(reference), self._reference_reads(agent))
@@ -426,10 +454,11 @@ class RineClient(BaseRineClient):
     async def _seated_group_row_by_handle(self, handle_or_id: str) -> dict[str, Any] | None:
         """The group ``GET /groups?handle=`` answers with, or ``None``.
 
-        🔴 **Org-scoped, and that is the whole point of naming it so.** The route
-        joins ``GroupMember`` to this org's agents, so it answers for a group
-        this org already holds a seat in and for no other. Every group verb but
-        one wants exactly that. :meth:`_resolve_group_for_join_async` is the one
+        🔴 **Seat-scoped, and that is the whole point of naming it so.** The route
+        joins ``GroupMember`` to the caller's scope (its own seats for an agent,
+        its branch's for a branch, the org's for the org), so it answers for a
+        group the caller already holds a seat in and for no other. Every group
+        verb but one wants exactly that. :meth:`_resolve_group_for_join_async` is the one
         that does not, which is why it takes this as a rung rather than as the
         answer.
 
@@ -451,12 +480,25 @@ class RineClient(BaseRineClient):
     async def _seated_group_id_by_handle(self, handle_or_id: str) -> str | None:
         """The id that filter answered with — :meth:`_seated_group_row_by_handle`'s.
 
-        The join ladder's first rung, which wants to know only WHETHER this org
+        The join ladder's first rung, which wants to know only WHETHER the caller
         is already seated. Kept as its own name because that is the question it
         asks; it is one line and holds no lookup of its own.
         """
         row = await self._seated_group_row_by_handle(handle_or_id)
         return str(row["id"]) if row is not None else None
+
+    async def _org_joinable_group_id_by_handle(self, handle_or_id: str) -> str | None:
+        """The id of the OPEN or VOTED group of that handle this org holds a seat in, or ``None``.
+
+        The join ladder's third rung: ``GET /groups/org-joinable`` answers
+        existence only, because an agent's own ``GET /groups`` is scoped to its
+        own seats and cannot see an own-org open or voted group a sibling sits in. The
+        id it returns is the ordinary join's.
+        """
+        data = await self._http.get(
+            "/groups/org-joinable", params={"handle": sigiled_group_ref(handle_or_id)}
+        )
+        return str(data["id"]) if data.get("id") else None
 
     async def _scan_public_directory(self, handle: str) -> DirectoryHandleScan:
         """Walk the public directory for that handle, within one join's budget.
@@ -531,8 +573,8 @@ class RineClient(BaseRineClient):
         """Resolve a group reference for JOIN — the one verb aimed outside the org.
 
         🔴 Deliberately **not** :meth:`_resolve_group_async`. That ladder searches
-        the groups this org is already in, which for a join is the one set the
-        target cannot be in; a handle read straight off ``discover_groups()``
+        the groups the caller is already seated in, which for a join is the one set
+        the target cannot be in; a handle read straight off ``discover_groups()``
         came back ``Group not found`` there with the server never refusing
         anything. The rungs, the bounds and every refusal are
         :mod:`rine._group_join`'s, and its module docstring is where the reasons
@@ -551,6 +593,9 @@ class RineClient(BaseRineClient):
         for invite in await self.groups.list_invites(agent=agent):
             if is_exact_group_handle(invite.group_handle, handle_or_id):
                 return str(invite.group_id)
+        org_joinable = await self._org_joinable_group_id_by_handle(handle_or_id)
+        if org_joinable is not None:
+            return org_joinable
         scan = await self._scan_public_directory(handle_or_id)
         if scan.found is not None:
             return scan.found
@@ -609,12 +654,12 @@ class RineClient(BaseRineClient):
         test is load-bearing: a UUID is the single spelling that reaches BOTH
         namespaces, and it has been a legitimate agent id for as long as the
         product has existed. So the ladder's group probe runs first — ``GET
-        /groups/{id}`` is org-scoped where ``GET /agents/{id}/keys`` is global,
+        /groups/{id}`` is key-scoped where ``GET /agents/{id}/keys`` is global,
         so asking the agent side first would prefer a stranger's namespace over
         the caller's own org's — and a 404 or 403 falls through to the agent
         rung, which returns the id it was given without a request. An agent id
         therefore reaches :meth:`_encrypt_dm` exactly as it always has, and the
-        widening costs one org-scoped read. A read that fails any other way is
+        widening costs one key-scoped read. A read that fails any other way is
         not an answer about the reference and propagates
         (:func:`rine._recipient_reads.group_read_refused`).
 
@@ -650,7 +695,7 @@ class RineClient(BaseRineClient):
         """Send an encrypted message (1:1 or group).
 
         Auto-detects encryption: recipients starting with ``#`` use Sender Keys
-        (group encryption); all others use HPKE (1:1 encryption).
+        (group encryption); all others use hpke-hybrid-v2 (1:1 encryption).
 
         A recipient that is neither a UUID nor a handle is a **group name**:
         the agent namespace refuses a bare word before any request
@@ -669,7 +714,7 @@ class RineClient(BaseRineClient):
         Args:
             to: Recipient handle, agent UUID, group UUID, group handle
                 (``#logistics@acme.rine.network``), ``#name`` without the org,
-                or the bare name of a group this org is in.
+                or the bare name of a group you hold a seat in.
             payload: JSON-serializable message payload.
             message_type: Message type (default: ``rine.v1.task_request``).
             agent: Agent to send as (for multi-agent orgs).
@@ -699,16 +744,28 @@ class RineClient(BaseRineClient):
         elif classify_reference(to) == REF_CLASS_ID:
             to = await self._group_handle_for_id_recipient(to, agent)
 
-        is_group = to.startswith("#")
-
-        if is_group:
-            result, body = await self._encrypt_group(agent_id, to, payload, message_type)
+        escrow_group_id: str | None = None
+        if to.startswith("#"):
+            result, body, group = await self._encrypt_group(agent_id, to, payload, message_type)
+            if result.escrow_fp is not None:
+                escrow_group_id = str(group.id)
         else:
-            result, body = await self._encrypt_dm(agent_id, to, payload, message_type)
+            _, body = await self._encrypt_dm(agent_id, to, payload, message_type)
 
         apply_cleartext_fields(body, metadata, content_type)
-        data = await self._http.post("/messages", json_body=body, extra_headers=headers or None)
-        return MessageRead.model_validate(data)
+
+        async def post() -> Any:
+            return await self._http.post(
+                "/messages", json_body=body, extra_headers=headers or None
+            )
+
+        if escrow_group_id is None:
+            return MessageRead.model_validate(await post())
+        from rine._mls.escrow_send import async_post_with_escrow_retry
+
+        return MessageRead.model_validate(
+            await async_post_with_escrow_retry(self, agent_id, escrow_group_id, post)
+        )
 
     async def _encrypt_dm(
         self, agent_id: str, to: str, payload: object, msg_type: str
@@ -716,6 +773,7 @@ class RineClient(BaseRineClient):
         """Encrypt and build body for 1:1 message."""
         recipient_id = await resolve_to_uuid_async(self._api_url, to)
         recipient = await fetch_recipient_keys_async(self._http, recipient_id)
+        warn_if_handle_moved(self._http.key_pins, to, recipient)
         result = encrypt_message(self._config_dir, agent_id, recipient, payload)
         body: dict[str, Any] = {
             "to_agent_id": recipient_id,
@@ -733,7 +791,7 @@ class RineClient(BaseRineClient):
 
     async def _encrypt_group(
         self, agent_id: str, to: str, payload: object, msg_type: str
-    ) -> tuple[Any, dict[str, Any]]:
+    ) -> tuple[Any, dict[str, Any], Any]:
         """Encrypt and build body for group message.
 
         ``agent_id`` is the acting agent ``send()`` already resolved. The sender
@@ -747,20 +805,14 @@ class RineClient(BaseRineClient):
         🔴 ``to_handle`` is the RESOLVED group's handle, never ``to``. See
         :meth:`rine.SyncRineClient._encrypt_group`, which carries the reason.
         """
-        from rine._group_send import encrypt_for_group_sync
+        from rine._group_send import encrypt_for_group_sync, group_message_body
         from rine._mls.bridge import with_sync_http
 
         result, group = await with_sync_http(
             self,
             lambda http: encrypt_for_group_sync(http, self._config_dir, agent_id, to, payload),
         )
-        return result, {
-            "to_handle": group.handle,
-            "type": msg_type,
-            "encrypted_payload": result.encrypted_payload,
-            "encryption_version": result.encryption_version,
-            "sender_signing_kid": result.sender_signing_kid,
-        }
+        return result, group_message_body(result, group, msg_type), group
 
     async def inbox(
         self,
@@ -810,7 +862,7 @@ class RineClient(BaseRineClient):
 
         messages: list[DecryptedMessage] = []
         for raw in raw_items:
-            msg = DecryptedMessage.model_validate(raw)
+            msg = DecryptedMessage.from_wire(raw)
             try:
                 msg = await self._decrypt_message(agent_id, msg)
             except CryptoError as e:
@@ -900,7 +952,7 @@ class RineClient(BaseRineClient):
         agent_id = await self._resolve_agent_id(agent)
         extra = self._with_peek(await self._agent_header(agent), peek=peek)
         data = await self._http.get(f"/messages/{message_id}", extra_headers=extra)
-        msg = DecryptedMessage.model_validate(data)
+        msg = DecryptedMessage.from_wire(data)
         try:
             return await self._decrypt_message(agent_id, msg)
         except CryptoError as e:
@@ -916,12 +968,15 @@ class RineClient(BaseRineClient):
         verified content from an agent that did not write it.
         """
         sender = self._expected_sender(agent_id, msg)
-        if msg.encryption_version in (
-            EncryptionVersion.HPKE_V1,
-            EncryptionVersion.HPKE_HYBRID_V1,
-        ):
+        if msg.encryption_version == EncryptionVersion.HPKE_HYBRID_V2:
             result = await decrypt_message_async(
-                self._config_dir, agent_id, msg.encrypted_payload, self._http, sender
+                self._config_dir,
+                agent_id,
+                msg.encrypted_payload,
+                self._http,
+                sender,
+                self._signed_for(msg),
+                msg.created_at,
             )
         elif msg.encryption_version == EncryptionVersion.SENDER_KEY_V1 and msg.group_id:
             result = await self._memoized_group_decrypt(
@@ -935,6 +990,7 @@ class RineClient(BaseRineClient):
                     msg.encrypted_payload,
                     self._http,
                     sender,
+                    msg.created_at,
                 ),
             )
         elif msg.encryption_version == EncryptionVersion.MLS_V1:
@@ -961,9 +1017,12 @@ class RineClient(BaseRineClient):
                         group_id,
                         msg.encrypted_payload,
                         sender,
+                        msg.created_at,
                     ),
                 ),
             )
+        elif is_a2a_cleartext(msg):
+            return read_a2a_cleartext(msg)
         else:
             # An encryption_version this SDK does not know. Mark it explicitly so
             # it is never mistaken for a successfully-decrypted message with
@@ -1113,6 +1172,7 @@ class RineClient(BaseRineClient):
                     full["encrypted_payload"],
                     self._http,
                     str(full["from_agent_id"]),
+                    created_at=datetime.fromisoformat(full["created_at"]),
                 )
                 if not result.verified:
                     continue
@@ -1267,7 +1327,7 @@ class RineClient(BaseRineClient):
           ``#ops`` with no org half is refused here exactly as
           ``#ops@acme.rine.network`` is;
         * a **UUID this org may read a group of**, which costs the one
-          org-scoped :meth:`_readable_group_by_id` the same id already costs on
+          key-scoped :meth:`_readable_group_by_id` the same id already costs on
           :meth:`send`.
 
         🔴 **The UUID probe is EAGER, and the lazy variant is rejected rather
@@ -1367,7 +1427,7 @@ class RineClient(BaseRineClient):
         sent = MessageRead.model_validate(data["message"])
         raw_reply = data.get("reply")
         if raw_reply is not None:
-            reply_msg = DecryptedMessage.model_validate(raw_reply)
+            reply_msg = DecryptedMessage.from_wire(raw_reply)
             # The same degrade every other receive surface runs: the send has
             # already happened and the reply is already on the wire, so raising
             # here would take the whole call down over one unreadable answer and
@@ -1519,22 +1579,19 @@ class RineClient(BaseRineClient):
     # --- Identity ---
 
     async def whoami(self) -> WhoAmI:
-        """Get current org and agent identity information.
+        """Get the caller's identity: its org, principal and visible agents.
+
+        Works for every principal kind; a branch, agent or reader sees only the agents
+        it may read.
 
         Returns:
-            WhoAmI with org details and agent list.
+            WhoAmI with org details, the principal and the agent list.
+
+        Raises:
+            OrgMismatchError: The server names a different org than this profile's.
+            ConfigError: The caller can see no agent.
         """
-        data = await self._http.get("/agents")
-        agents = data.get("items", data) if isinstance(data, dict) else data
-        # Also fetch org info
-        if agents:
-            org_data = await self._http.get("/org")
-            return WhoAmI(
-                org=OrgRead.model_validate(org_data),
-                agents=[AgentRead.model_validate(a) for a in agents],
-                trust_tier=org_data.get("trust_tier", 0),
-            )
-        raise ConfigError("No agents found. Create one: client.create_agent('my-agent')")
+        return parse_whoami(await self._http.get("/whoami"), local_org_id=self._local_org_id())
 
     async def poll(self) -> int:
         """Get undelivered message count (unauthenticated).
@@ -1542,14 +1599,7 @@ class RineClient(BaseRineClient):
         Returns:
             Number of undelivered messages.
         """
-        from rine._config import load_credentials
-
-        creds = load_credentials(self._config_dir)
-        entry = creds.get("default")
-        poll_url = entry.get("poll_url") if entry else None
-        if not poll_url:
-            raise ConfigError("No poll URL. Create an agent first.")
-        data = await self._http.get(poll_url, authenticated=False)
+        data = await self._http.get(self._poll_url(), authenticated=False)
         return int(data.get("count", 0)) if isinstance(data, dict) else 0
 
     async def create_agent(
@@ -1575,26 +1625,22 @@ class RineClient(BaseRineClient):
             ``identity_error`` (failure) is populated; a verify failure never
             undoes creation.
         """
-        # Use sync http for key upload (crypto is sync)
-        from rine._http import SyncHttpClient
+        # Key derivation and the certificate are sync work: run them off the loop.
+        from rine._mls.bridge import with_sync_http
 
-        sync_http = SyncHttpClient(
-            config_dir=self._config_dir,
-            api_url=self._api_url,
-            timeout=self._timeout,
-        )
-        try:
-            return _create_agent(
-                sync_http,
+        return await with_sync_http(
+            self,
+            lambda http: _create_agent(
+                http,
                 self._config_dir,
+                self._owner_dir,
                 name,
                 human_oversight,
                 unlisted,
                 verify_identity=verify_identity,
                 svid=svid,
-            )
-        finally:
-            sync_http.close()
+            ),
+        )
 
     async def verify_identity(
         self,
@@ -1818,9 +1864,8 @@ class RineClient(BaseRineClient):
         ``decrypt_error`` set and ``plaintext is None`` — this method never
         raises on a single bad row.
 
-        Post-quantum (``hpke-hybrid-v1``) rows read like any other: the sender's
-        self-blob is sealed to the sender's own keys, hybrid when it has an
-        ML-KEM key, and the reader dispatches on the blob's own version byte.
+        The sender's self-blob is sealed ``hpke-hybrid-v2`` to the sender's own
+        keys, so a sent row reads like a received one.
 
         A conversation is fetched, never recovered: unlike :meth:`inbox`,
         :meth:`read` and :meth:`thread`, no row here triggers a distribution
@@ -1896,7 +1941,7 @@ class RineClient(BaseRineClient):
 
         messages: list[DecryptedMessage] = []
         for raw in raw_items:
-            msg = DecryptedMessage.model_validate(raw)
+            msg = DecryptedMessage.from_wire(raw)
             messages.append(
                 await self._decrypt_thread_row(agent_id, msg, refusal, recovery=recovery)
             )
@@ -1952,15 +1997,10 @@ class RineClient(BaseRineClient):
                 msg.decrypt_error = "No self-seal blob for this sent message."
                 return msg
             # The caller can only open the self-sealed copy of its own send, and
-            # the self-blob is sealed to the SENDER's keys — so its scheme
-            # follows the sender's own PQ capability, not the row's
-            # ``encryption_version`` (which records the *recipient*
-            # negotiation). Route it to the 1:1 branch; that branch dispatches
-            # on the blob's own version byte, so a classical and a hybrid
-            # self-blob are both read correctly and neither degrades into the
-            # unsupported-version branch.
+            # the self-blob is sealed to the SENDER's keys, so it is read as a
+            # 1:1 payload whatever the row's ``encryption_version`` records.
             msg.encrypted_payload = msg.self_encrypted_payload
-            msg.encryption_version = EncryptionVersion.HPKE_V1
+            msg.encryption_version = EncryptionVersion.HPKE_HYBRID_V2
         try:
             return await self._decrypt_message(agent_id, msg)
         except Exception as e:  # noqa: BLE001 — degrade, never raise (inbox pattern)
@@ -2122,35 +2162,28 @@ class RineClient(BaseRineClient):
 
     # --- Key Rotation ---
 
-    async def rotate_keys(self, agent_id: str) -> AgentRead:
+    async def rotate_keys(self, agent_id: str) -> RotatedAgent:
         """Rotate an agent's signing and encryption keypairs.
 
-        Generates new Ed25519 + X25519 + ML-KEM-768 keypairs locally, uploads
-        the public halves, and saves the new private keys to the config
-        directory. An agent that predates post-quantum DM keys gains one here,
-        after which peers seal ``hpke-hybrid-v1`` to it.
+        Derives the next generation of the agent's keys, uploads the public
+        halves, and saves the new private keys to the config directory.
 
         Args:
             agent_id: Agent UUID.
 
         Returns:
-            AgentRead with updated ``verification_words``.
+            RotatedAgent, with ``key_packages`` and ``group_seats`` added.
 
         Raises:
             ConflictError: If agent is revoked.
             NotFoundError: If agent not found.
         """
-        from rine._crypto.keys import (
-            generate_agent_keys,
-            public_keys_body,
-            save_agent_keys,
-        )
+        from rine._mls.bridge import with_sync_http
 
-        keys = generate_agent_keys()
-        body = public_keys_body(keys)
-        data = await self._http.post(f"/agents/{agent_id}/keys", json_body=body)
-        save_agent_keys(self._config_dir, agent_id, keys)
-        return AgentRead.model_validate(data)
+        return await with_sync_http(
+            self,
+            lambda h: rotate_agent_with_seats(h, self._config_dir, self._owner_dir, agent_id),
+        )
 
     # --- MLS ---
 

@@ -34,14 +34,18 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
+import pytest
 import respx
 
 from rine.errors import ConfigError, InternalServerError, RineError
 
 from ._recipient_server import API, mocked_server
+
+pytestmark = pytest.mark.usefixtures("mls_escrow_stub")
 
 GROUP_UUID = "11111111-1111-1111-1111-111111111111"
 KOFI_ID = "44444444-4444-4444-4444-444444444444"
@@ -106,16 +110,16 @@ def _record_the_branch(client: Any, seen: list[tuple[str, str]]) -> None:
     below is still about what ``send()`` addressed.
     """
 
-    def _record(branch: str, to: str, msg_type: str) -> tuple[None, dict[str, Any]]:
+    def _body(branch: str, to: str, msg_type: str) -> dict[str, Any]:
         seen.append((branch, to))
         addressed = "to_handle" if branch == "group" else "to_agent_id"
-        return None, {addressed: to, "type": msg_type, "encrypted_payload": "x"}
+        return {addressed: to, "type": msg_type, "encrypted_payload": "x"}
 
     def _group(agent_id: str, to: str, payload: object, msg_type: str) -> Any:
-        return _record("group", to, msg_type)
+        return SimpleNamespace(escrow_fp=None), _body("group", to, msg_type), None
 
     def _dm(agent_id: str, to: str, payload: object, msg_type: str) -> Any:
-        return _record("agent", to, msg_type)
+        return None, _body("agent", to, msg_type)
 
     async def _group_async(agent_id: str, to: str, payload: object, msg_type: str) -> Any:
         return _group(agent_id, to, payload, msg_type)
@@ -185,7 +189,7 @@ class TestAUuidRecipient:
         assert sent.body is not None
         assert sent.body["to_handle"] == OPS["handle"]
         assert "to_agent_id" not in sent.body
-        # One org-scoped read is what the widening costs, and it is the
+        # One credential-scoped read is what the widening costs, and it is the
         # ladder's — never a hand-rolled ``GET /groups/`` + id, which would drop
         # the answered-row-id check the shared read performs.
         assert sent.group_reads == [f"GET /groups/{GROUP_UUID}"]

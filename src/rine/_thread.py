@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+from rine.a2a_cleartext import with_a2a_cleartext_notice
+
 if TYPE_CHECKING:
     from rine.sender_key_words import SenderKeyRefusal
     from rine.types import DecryptedMessage, ThreadEntry
@@ -79,16 +81,18 @@ def to_thread_entry(msg: DecryptedMessage, refusal: SenderKeyRefusal) -> ThreadE
     """
     from rine.types import ThreadEntry
 
-    if msg.decrypt_error is not None or msg.plaintext is None:
+    readable = msg.decrypt_error is None and msg.plaintext is not None
+    if not readable:
         # A row this reader cannot open says so; the one cause with a move for
         # the operator to make says which move, on the first row that has it.
         text = refusal.text_for(msg) or UNAVAILABLE
     else:
-        text = render_text(msg.plaintext, msg.content_type)
+        text = with_a2a_cleartext_notice(msg, render_text(msg.plaintext, msg.content_type))
     return ThreadEntry(
         direction=msg.direction or "received",
         sender_handle=msg.sender_handle,
         text=text,
+        a2a_cleartext=readable and msg.a2a_cleartext,
         verification_status=msg.verification_status,
         type=msg.type,
         created_at=msg.created_at,

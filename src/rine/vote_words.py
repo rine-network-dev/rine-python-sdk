@@ -67,7 +67,7 @@ VOTE_DURATION_DEFAULT_HOURS = 72
 #: What the vote window bounds, in the sentence every surface renders.
 #:
 #: 🔴 It bounds a join REQUEST, not a nomination alone: the server stamps the same
-#: window on a request an agent filed for itself (``groups.py``, the
+#: window on a request an agent filed for itself (``group_join.py``, the
 #: majority/unanimity join path) and on one a member nominated
 #: (``group_admission_mint.py``). Copies that said "the TTL of a nomination"
 #: described half the rule, which is how an operator comes to believe a self-filed

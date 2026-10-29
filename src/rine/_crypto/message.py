@@ -1,6 +1,6 @@
 """High-level message encrypt/decrypt orchestration.
 
-Wires together key loading, signing, envelope encoding, and HPKE/Sender Key
+Wires together key loading, signing, envelope encoding, and hpke-hybrid-v2/Sender Key
 encryption, then hands each decrypted envelope to
 :mod:`rine._crypto._sender_verify` and persists the sender key state.
 """
@@ -13,18 +13,18 @@ from typing import TYPE_CHECKING, Any
 from rine._constants import EncryptionVersion
 from rine._crypto._sender_verify import (
     refuse_if_inauthentic,
+    refuse_if_state_not_owned_by,
     verify_envelope_sender_async,
     verify_envelope_sender_sync,
 )
 from rine._crypto.dm_envelope import (
-    RecipientKeys,
     open_dm,
     seal_to_recipient,
     seal_to_self,
 )
 from rine._crypto.envelope import decode_envelope, encode_envelope
 from rine._crypto.group_read_cache import lookup_group_read, record_group_read
-from rine._crypto.keys import load_agent_keys, make_kid, public_keys_body
+from rine._crypto.keys import load_agent_keys, make_kid
 from rine._crypto.sender_keys import (
     SenderKeyState,
     derive_message_key,
@@ -42,11 +42,14 @@ from rine._crypto.sender_keys_store import (
     with_sender_key_states,
     with_sender_key_states_sync,
 )
-from rine._crypto.sign import sign_payload
+from rine._crypto.sign import GroupSig, MessageSig, sign_message
 from rine._utils import from_base64url, to_base64url
 from rine.errors import UnpersistedSenderKeyStateError
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
+    from rine._crypto.certs import VerifiedAgentKeys
     from rine._http import AsyncHttpClient, SyncHttpClient
     from rine._mls.sync import MlsSyncResult
     from rine.types import SenderKeyChange, VerificationStatus
@@ -59,9 +62,10 @@ class EncryptResult:
     to the SENDER's own key, set only for 1:1 sends (``encrypt_message``) so the
     sender can later self-read its own message via ``thread()``. It is ``None``
     for group sends (groups self-read via the sender-key cache, not a self-blob).
-    The self-blob follows the SENDER's own post-quantum capability — hybrid when
-    the sender has an ML-KEM key, classical otherwise — independent of the
-    version negotiated for the recipient.
+    The self-blob is sealed ``hpke-hybrid-v2`` to the sender's own keys.
+
+    ``escrow_fp`` is the base64url fork fingerprint of the sender's current epoch,
+    set only for ``mls-v1`` group sends; the server refuses such a post without it.
     """
 
     __slots__ = (
@@ -69,6 +73,7 @@ class EncryptResult:
         "encryption_version",
         "sender_signing_kid",
         "self_encrypted_payload",
+        "escrow_fp",
     )
 
     def __init__(
@@ -77,11 +82,13 @@ class EncryptResult:
         encryption_version: str,
         kid: str,
         self_encrypted_payload: str | None = None,
+        escrow_fp: str | None = None,
     ) -> None:
         self.encrypted_payload = encrypted_payload
         self.encryption_version = encryption_version
         self.sender_signing_kid = kid
         self.self_encrypted_payload = self_encrypted_payload
+        self.escrow_fp = escrow_fp
 
 
 class DecryptResult:
@@ -147,7 +154,7 @@ class DecryptResult:
 def encrypt_message(
     config_dir: str,
     sender_agent_id: str,
-    recipient: RecipientKeys,
+    recipient: VerifiedAgentKeys,
     payload: object,
 ) -> EncryptResult:
     """Encrypt a 1:1 message, post-quantum when the recipient allows it.
@@ -155,9 +162,8 @@ def encrypt_message(
     Args:
         config_dir: Config directory path.
         sender_agent_id: Sender agent UUID.
-        recipient: Recipient's published encryption keys. A recipient that
-            publishes an ML-KEM key gets ``hpke-hybrid-v1``; one that does not
-            gets ``hpke-v1``.
+        recipient: Recipient's chain-verified keys; the message is sealed
+            ``hpke-hybrid-v2`` to them and signed for this recipient alone.
         payload: JSON-serializable message payload.
 
     Returns:
@@ -167,12 +173,12 @@ def encrypt_message(
     """
     keys = load_agent_keys(config_dir, sender_agent_id)
     plaintext = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    kid = make_kid(sender_agent_id)
-    signature = sign_payload(keys.signing.private_key, plaintext)
+    kid = make_kid(sender_agent_id, keys.key_gen)
+    signature = sign_message(keys.signing.private_key, MessageSig(recipient.agent_id), plaintext)
     envelope = encode_envelope(kid, signature, plaintext)
 
     encrypted, version = seal_to_recipient(recipient, envelope)
-    self_sealed = seal_to_self(keys, envelope)
+    self_sealed = seal_to_self(keys, sender_agent_id, envelope)
 
     return EncryptResult(
         encrypted_payload=to_base64url(encrypted),
@@ -188,11 +194,10 @@ def decrypt_message_sync(
     encrypted_payload_b64: str,
     client: SyncHttpClient,
     from_agent_id: str,
+    scope_agent_id: str | None = None,
+    created_at: datetime | None = None,
 ) -> DecryptResult:
-    """Decrypt a 1:1 message, classical or post-quantum (sync).
-
-    The payload's own version byte picks the envelope, so the same call reads
-    ``hpke-v1`` and ``hpke-hybrid-v1``.
+    """Decrypt a 1:1 message (sync).
 
     Args:
         config_dir: Config directory path.
@@ -202,6 +207,12 @@ def decrypt_message_sync(
         from_agent_id: The sender the server authenticated for this message
             (its ``from_agent_id``). The envelope's own key id is refused unless
             it names this agent.
+        scope_agent_id: The recipient the sender signed for, when it is not
+            ``recipient_agent_id`` — a sender reading its own copy of a send.
+        created_at: The message's server ``created_at``. A signature under a
+            sender key generation since rotated away verifies only for a row
+            stamped before the rotation; without it such a message is
+            refused.
 
     Returns:
         DecryptResult with plaintext and verification status.
@@ -212,12 +223,18 @@ def decrypt_message_sync(
     """
     keys = load_agent_keys(config_dir, recipient_agent_id)
     encrypted = from_base64url(encrypted_payload_b64)
-    envelope_bytes = open_dm(keys, encrypted)
+    envelope_bytes = open_dm(keys, recipient_agent_id, encrypted)
     decoded = decode_envelope(envelope_bytes)
     plaintext = decoded.payload.decode("utf-8")
 
     verification = verify_envelope_sender_sync(
-        decoded.kid, decoded.payload, decoded.signature, client, from_agent_id
+        decoded.kid,
+        decoded.payload,
+        decoded.signature,
+        MessageSig(scope_agent_id or recipient_agent_id),
+        client,
+        from_agent_id,
+        created_at,
     )
     refuse_if_inauthentic(verification)
     return DecryptResult(
@@ -235,8 +252,10 @@ async def decrypt_message_async(
     encrypted_payload_b64: str,
     client: AsyncHttpClient,
     from_agent_id: str,
+    scope_agent_id: str | None = None,
+    created_at: datetime | None = None,
 ) -> DecryptResult:
-    """Decrypt a 1:1 message, classical or post-quantum (async).
+    """Decrypt a 1:1 message (async).
 
     Mirrors :func:`decrypt_message_sync`, including the version-byte dispatch and
     the sender comparison.
@@ -249,6 +268,12 @@ async def decrypt_message_async(
         from_agent_id: The sender the server authenticated for this message
             (its ``from_agent_id``). The envelope's own key id is refused unless
             it names this agent.
+        scope_agent_id: The recipient the sender signed for, when it is not
+            ``recipient_agent_id`` — a sender reading its own copy of a send.
+        created_at: The message's server ``created_at``. A signature under a
+            sender key generation since rotated away verifies only for a row
+            stamped before the rotation; without it such a message is
+            refused.
 
     Returns:
         DecryptResult with plaintext and verification status.
@@ -259,12 +284,18 @@ async def decrypt_message_async(
     """
     keys = load_agent_keys(config_dir, recipient_agent_id)
     encrypted = from_base64url(encrypted_payload_b64)
-    envelope_bytes = open_dm(keys, encrypted)
+    envelope_bytes = open_dm(keys, recipient_agent_id, encrypted)
     decoded = decode_envelope(envelope_bytes)
     plaintext = decoded.payload.decode("utf-8")
 
     verification = await verify_envelope_sender_async(
-        decoded.kid, decoded.payload, decoded.signature, client, from_agent_id
+        decoded.kid,
+        decoded.payload,
+        decoded.signature,
+        MessageSig(scope_agent_id or recipient_agent_id),
+        client,
+        from_agent_id,
+        created_at,
     )
     refuse_if_inauthentic(verification)
     return DecryptResult(
@@ -299,7 +330,7 @@ def encrypt_group_message(
     """
     keys = load_agent_keys(config_dir, sender_agent_id)
     plaintext = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    kid = make_kid(sender_agent_id)
+    kid = make_kid(sender_agent_id, keys.key_gen)
 
     # Pre-derive message key for self-read cache
     self_read_key, _ = derive_message_key(sender_key_state.chain_key)
@@ -356,9 +387,8 @@ def encrypt_group_message(
     # This is the shape
     # :func:`rine._crypto.sender_keys_store.merge_sender_key_states` takes for an
     # own row too — it skips one whose (sender, key) pair is not already on disk,
-    # for exactly this reason. The two agree only since that fix; the merge used
-    # to re-add.
-    # Twin: ``crypto/message.ts``, which carried the identical defect.
+    # for exactly this reason.
+    # Twin: ``crypto/sender-key-seal.ts``.
     #
     # 🔴 "Absent means retired" is a claim about WHICH absence, and the three
     # cases are told apart rather than collapsed. A row gone from a file that
@@ -459,6 +489,7 @@ def _replay_result_sync(
     encrypted_payload_b64: str,
     client: SyncHttpClient,
     from_agent_id: str,
+    created_at: datetime | None,
 ) -> DecryptResult | None:
     """The cached answer for a row this agent already opened, or ``None`` (sync).
 
@@ -471,7 +502,13 @@ def _replay_result_sync(
     if replay is None:
         return None
     verification = verify_envelope_sender_sync(
-        replay.kid, replay.payload, replay.signature, client, from_agent_id
+        replay.kid,
+        replay.payload,
+        replay.signature,
+        GroupSig(group_id),
+        client,
+        from_agent_id,
+        created_at,
     )
     refuse_if_inauthentic(verification)
     return _group_result(replay, verification)
@@ -484,6 +521,7 @@ async def _replay_result_async(
     encrypted_payload_b64: str,
     client: AsyncHttpClient,
     from_agent_id: str,
+    created_at: datetime | None,
 ) -> DecryptResult | None:
     """The cached answer for a row this agent already opened, or ``None``.
 
@@ -496,7 +534,13 @@ async def _replay_result_async(
     if replay is None:
         return None
     verification = await verify_envelope_sender_async(
-        replay.kid, replay.payload, replay.signature, client, from_agent_id
+        replay.kid,
+        replay.payload,
+        replay.signature,
+        GroupSig(group_id),
+        client,
+        from_agent_id,
+        created_at,
     )
     refuse_if_inauthentic(verification)
     return _group_result(replay, verification)
@@ -559,6 +603,11 @@ def _decrypt_group_core(
     *from_agent_id* is already this path's trusted authority — it is what the
     envelope's own kid is refused against — and a reader's own posts name the
     reader, so self-read is unaffected.
+
+    The opened state must be *from_agent_id*'s own: a member who holds a peer's
+    chain key could otherwise post under it and make this read persist, as
+    advanced, a ratchet that is not the poster's. That is refused here, before
+    any key is read or any state saved.
     """
     on_disk = load_sender_key_states(config_dir, recipient_agent_id, group_id)
     state_map = {s.sender_key_id: s for s in on_disk}
@@ -566,6 +615,7 @@ def _decrypt_group_core(
 
     encrypted = from_base64url(encrypted_payload_b64)
     inner_envelope, sender_key_id, message_index, updated = open_group(state_map, encrypted)
+    refuse_if_state_not_owned_by(updated.sender_agent_id, from_agent_id)
     decoded = decode_envelope(inner_envelope)
 
     return decoded, sender_key_id, message_index, updated
@@ -578,6 +628,7 @@ def decrypt_group_message_sync(
     encrypted_payload_b64: str,
     client: SyncHttpClient,
     from_agent_id: str,
+    created_at: datetime | None = None,
 ) -> DecryptResult:
     """Decrypt a group message (sync).
 
@@ -593,6 +644,10 @@ def decrypt_group_message_sync(
         from_agent_id: The sender the server authenticated for this message
             (its ``from_agent_id``). The envelope's own key id is refused unless
             it names this agent.
+        created_at: The message's server ``created_at``. A signature under a
+            sender key generation since rotated away verifies only for a row
+            stamped before the rotation; without it such a message is
+            refused.
 
     Returns:
         DecryptResult with plaintext and verification status.
@@ -607,7 +662,13 @@ def decrypt_group_message_sync(
     # the ratchet spends the message key at the first decrypt and cannot be
     # asked twice. The envelope is verified here exactly as a first read is.
     replayed = _replay_result_sync(
-        config_dir, recipient_agent_id, group_id, encrypted_payload_b64, client, from_agent_id
+        config_dir,
+        recipient_agent_id,
+        group_id,
+        encrypted_payload_b64,
+        client,
+        from_agent_id,
+        created_at,
     )
     if replayed is not None:
         return replayed
@@ -624,7 +685,13 @@ def decrypt_group_message_sync(
     # than a spent-key ``CryptoError`` the render path does not recover.
     with with_sender_key_states_sync(config_dir, recipient_agent_id, group_id):
         replayed = _replay_result_sync(
-            config_dir, recipient_agent_id, group_id, encrypted_payload_b64, client, from_agent_id
+            config_dir,
+            recipient_agent_id,
+            group_id,
+            encrypted_payload_b64,
+            client,
+            from_agent_id,
+            created_at,
         )
         if replayed is not None:
             return replayed
@@ -634,7 +701,13 @@ def decrypt_group_message_sync(
         )
 
         verification = verify_envelope_sender_sync(
-            decoded.kid, decoded.payload, decoded.signature, client, from_agent_id
+            decoded.kid,
+            decoded.payload,
+            decoded.signature,
+            GroupSig(group_id),
+            client,
+            from_agent_id,
+            created_at,
         )
 
         refuse_if_inauthentic(verification)
@@ -648,10 +721,10 @@ def decrypt_group_message_sync(
                     updated.skipped_keys[message_index] = cached
 
         # Merge rather than assert an array built from a pre-network read, exactly
-        # as the async twin below and ``crypto/message.ts`` do. The map this path
-        # used to write back was keyed by sender key id over the WHOLE file, so a
-        # second row legitimately sharing an id — see :func:`_decrypt_group_core` —
-        # was collapsed away by the load and then deleted by the save. The merge
+        # as the async twin below and ``message-group.ts`` do. A map keyed by
+        # sender key id over the WHOLE file would collapse a second row that
+        # legitimately shares an id — see :func:`_decrypt_group_core` — on load
+        # and delete it on save. The merge
         # asserts the one row this decrypt knows about and says nothing about the
         # rest of the file, which also stops an ingest that landed during the
         # verify from being rolled back.
@@ -667,6 +740,7 @@ async def decrypt_group_message_async(
     encrypted_payload_b64: str,
     client: AsyncHttpClient,
     from_agent_id: str,
+    created_at: datetime | None = None,
 ) -> DecryptResult:
     """Decrypt a group message (async).
 
@@ -682,6 +756,10 @@ async def decrypt_group_message_async(
         from_agent_id: The sender the server authenticated for this message
             (its ``from_agent_id``). The envelope's own key id is refused unless
             it names this agent.
+        created_at: The message's server ``created_at``. A signature under a
+            sender key generation since rotated away verifies only for a row
+            stamped before the rotation; without it such a message is
+            refused.
 
     Returns:
         DecryptResult with plaintext and verification status.
@@ -693,7 +771,13 @@ async def decrypt_group_message_async(
     _assert_sender_key_regime(config_dir, recipient_agent_id, group_id)
 
     replayed = await _replay_result_async(
-        config_dir, recipient_agent_id, group_id, encrypted_payload_b64, client, from_agent_id
+        config_dir,
+        recipient_agent_id,
+        group_id,
+        encrypted_payload_b64,
+        client,
+        from_agent_id,
+        created_at,
     )
     if replayed is not None:
         return replayed
@@ -725,7 +809,13 @@ async def decrypt_group_message_async(
         # refusal — the very symptom the lock is here to remove. The winner records
         # its read inside this region, so the loser is guaranteed to see it.
         replayed = await _replay_result_async(
-            config_dir, recipient_agent_id, group_id, encrypted_payload_b64, client, from_agent_id
+            config_dir,
+            recipient_agent_id,
+            group_id,
+            encrypted_payload_b64,
+            client,
+            from_agent_id,
+            created_at,
         )
         if replayed is not None:
             return replayed
@@ -735,7 +825,13 @@ async def decrypt_group_message_async(
         )
 
         verification = await verify_envelope_sender_async(
-            decoded.kid, decoded.payload, decoded.signature, client, from_agent_id
+            decoded.kid,
+            decoded.payload,
+            decoded.signature,
+            GroupSig(group_id),
+            client,
+            from_agent_id,
+            created_at,
         )
 
         refuse_if_inauthentic(verification)
@@ -755,17 +851,3 @@ async def decrypt_group_message_async(
         merge_sender_key_states(config_dir, recipient_agent_id, group_id, [updated])
         _record_read(config_dir, recipient_agent_id, group_id, encrypted_payload_b64, decoded)
         return _group_result(decoded, verification)
-
-
-def get_agent_public_keys(config_dir: str, agent_id: str) -> dict[str, dict[str, str]]:
-    """Get an agent's public keys in their published form.
-
-    Args:
-        config_dir: Config directory path.
-        agent_id: Agent UUID.
-
-    Returns:
-        Dict with ``signing_public_key`` and ``encryption_public_key``, plus
-        ``pq_encryption_public_key`` when the agent has a post-quantum key.
-    """
-    return public_keys_body(load_agent_keys(config_dir, agent_id))

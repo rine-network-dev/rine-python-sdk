@@ -26,13 +26,13 @@ from typing import Any
 import httpx
 import respx
 
-from rine._config import save_credentials
 from rine._http import AsyncHttpClient, SyncHttpClient
+from rine.testing import write_agent_identity
 
 API = "https://rine.network"
 TOKEN_URL = f"{API}/oauth/token"
 AGENTS_URL = f"{API}/agents"
-_CREDS = {"default": {"client_id": "cid", "client_secret": "csecret"}}
+AGENT_ID = "00000000-1111-2222-3333-444444444444"
 _TTL = 900  # the server's token lifetime; a security control, it does not move
 
 
@@ -88,7 +88,7 @@ class TestOneClientAcrossAnExpiry:
 
     @respx.mock
     def test_sync_client_refreshes_without_a_401(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         rig = _Rig()
         rig.install()
         client = _sync_client(rig, tmp_config_dir)
@@ -103,7 +103,7 @@ class TestOneClientAcrossAnExpiry:
 
     @respx.mock
     async def test_async_client_refreshes_without_a_401(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         rig = _Rig()
         rig.install()
         client = _async_client(rig, tmp_config_dir)
@@ -127,7 +127,7 @@ class TestWarmStartFromDisk:
 
     @respx.mock
     def test_sync_warm_started_client_refreshes_without_a_401(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         rig = _Rig()
         rig.install()
         primer = _sync_client(rig, tmp_config_dir)
@@ -146,7 +146,7 @@ class TestWarmStartFromDisk:
 
     @respx.mock
     async def test_async_warm_started_client_refreshes_without_a_401(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         rig = _Rig()
         rig.install()
         primer = _async_client(rig, tmp_config_dir)
@@ -168,7 +168,7 @@ class TestWarmStartFromDisk:
         # Seeding the deadline is what makes the in-memory token usable at all
         # for a warm-started client. Without it every request falls back to the
         # file, so a co-located process clearing it costs a needless token mint.
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         rig = _Rig()
         rig.install()
         primer = _sync_client(rig, tmp_config_dir)
@@ -186,7 +186,7 @@ class TestWarmStartFromDisk:
 
     @respx.mock
     async def test_async_warm_start_survives_the_disk_cache_vanishing(self, tmp_config_dir):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         rig = _Rig()
         rig.install()
         primer = _async_client(rig, tmp_config_dir)
@@ -208,7 +208,7 @@ class TestA401IsNowUnexpected:
 
     @respx.mock
     def test_revocation_mid_life_is_retried_and_logged_at_warning(self, tmp_config_dir, caplog):
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         rig = _Rig()
         rig.install()
         client = _sync_client(rig, tmp_config_dir)
@@ -237,7 +237,7 @@ class TestA401IsNowUnexpected:
         distinguishes a revoked token from a merely stale one, which is the
         distinction the whole proactive refresh was built to make legible.
         """
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         rig = _Rig()
         rig.install()
         client = _async_client(rig, tmp_config_dir)
@@ -256,23 +256,24 @@ class TestA401IsNowUnexpected:
 
         🔴 No behavioural assertion is available here and it would be misleading
         to dress this up as one. ``TokenCache.fresh_token`` requires
-        ``self._tokens.token`` to be truthy, so a deadline an invalidation left
-        behind is never read, and the fetch that follows overwrites it
+        ``self._auth.tokens.token`` to be truthy, so a deadline an invalidation
+        left behind is never read, and the fetch that follows overwrites it
         unconditionally. What this pins is that the two fields are cleared
         TOGETHER: reorder that fast path to consult the deadline first and a
         stale one becomes reachable. Delete it deliberately if the shape changes,
         rather than letting it quietly outlive its reason.
         """
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         rig = _Rig()
         sync_client = _sync_client(rig, tmp_config_dir)
         async_client = _async_client(rig, tmp_config_dir)
         try:
             for client in (sync_client, async_client):
-                client._tokens.token = "stale"
-                client._tokens.expires_at = rig.now + _TTL
+                client._auth.tokens.token = "stale"
+                client._auth.tokens.expires_at = rig.now + _TTL
                 client._invalidate_token()
-                assert client._tokens.token is None
-                assert client._tokens.expires_at == 0.0
+                assert client._auth.tokens.token is None
+                assert client._auth.tokens.expires_at == 0.0
         finally:
             # Both were left open before, which leaks an httpx transport per run
             # and — for the async one — draws an "unclosed client" warning that
@@ -303,7 +304,7 @@ class TestAShortLivedTokenIsNotBornStale:
         self, tmp_config_dir
     ):
         """Two calls, one token — with a lifetime well inside the 180 s margin."""
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         rig = _Rig(ttl=120)
         rig.install()
         # rng() == 1.0 draws the widest margin, 60 + 120 = 180 s: longer than the
@@ -324,7 +325,7 @@ class TestAShortLivedTokenIsNotBornStale:
         self, tmp_config_dir
     ):
         """The async client shares the cache, so this is the same code path twice."""
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         rig = _Rig(ttl=120)
         rig.install()
         client = AsyncHttpClient(
@@ -349,7 +350,7 @@ class TestAShortLivedTokenIsNotBornStale:
         a round-trip. At 70 s into a 120 s token the clamped 60 s margin has been
         crossed, so the next call refreshes rather than presenting it.
         """
-        save_credentials(tmp_config_dir, _CREDS)
+        write_agent_identity(tmp_config_dir, AGENT_ID)
         rig = _Rig(ttl=120)
         rig.install()
         client = SyncHttpClient(

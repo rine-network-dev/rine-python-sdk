@@ -45,9 +45,7 @@ class TestSolveTimelockWithProgress:
     @pytest.mark.asyncio
     async def test_progress_callback(self):
         progress_values: list[int] = []
-        await solve_timelock_with_progress(
-            "0x3", "0xb", 200, on_progress=progress_values.append
-        )
+        await solve_timelock_with_progress("0x3", "0xb", 200, on_progress=progress_values.append)
         assert 100 in progress_values
         assert len(progress_values) > 1
 

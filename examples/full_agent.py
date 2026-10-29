@@ -18,7 +18,9 @@ Run it
 ------
     RINE_ORG_EMAIL=you@your-domain.example python full_agent.py
 
-Credentials are written to (and reused from) the Rine config directory
+The org root and its recovery phrase are written to the owner dir
+(`RINE_OWNER_DIR`, else ~/.config/rine-owner); the runtime profile and the
+agent's E2EE keys are written to (and reused from) the Rine config directory
 (`RINE_CONFIG_DIR`, else ~/.config/rine, else ./.rine). Re-running the script
 reuses the identity it created on the first run instead of onboarding again.
 
@@ -43,6 +45,7 @@ import json
 import os
 
 from rine import (
+    ConfigError,
     ConflictError,
     MessageType,
     RineClient,
@@ -62,7 +65,7 @@ AGENT_NAME = os.environ.get("RINE_AGENT_NAME", "concierge")
 
 # Registration does a live MX lookup on the email domain, so there is no
 # placeholder that works: supply an address that can receive mail. Only read on
-# the first run — a second run reuses the credentials already in the config dir.
+# the first run — a second run reuses the identity already in the config dir.
 ORG_EMAIL = os.environ.get("RINE_ORG_EMAIL")
 
 # Set to a facilitator preset ("payai", "cdp", "x402-rs") or an https base URL
@@ -73,18 +76,19 @@ X402_FACILITATOR = os.environ.get("RINE_X402_FACILITATOR")
 async def ensure_identity(client: RineClient) -> AgentRead:
     """Return this org's working agent, onboarding + creating it on first run.
 
-    Onboarding solves a proof-of-work challenge and saves org credentials to the
-    config dir. A second run finds the credentials already present: `async_onboard`
-    then raises `ConflictError` (slug/email already registered), so we fall through
-    to the existing identity instead of registering twice. Without
-    `RINE_ORG_EMAIL` there is nothing to register with, so this run goes straight
-    to the saved credentials.
+    Onboarding solves a proof-of-work challenge, mints the org root and writes it
+    (with the recovery phrase) to the owner dir. A second run finds the root
+    already present: `async_onboard` then raises `ConfigError` (one org per owner
+    dir) or `ConflictError` (slug/email already registered), so we fall through to
+    the existing identity instead of registering twice. Without `RINE_ORG_EMAIL`
+    there is nothing to register with, so this run goes straight to the saved
+    identity.
     """
     api_url = resolve_api_url()
     config_dir = resolve_config_dir()
 
     if not ORG_EMAIL:
-        print("RINE_ORG_EMAIL is unset — using the credentials already in the config dir")
+        print("RINE_ORG_EMAIL is unset — using the identity already in the config dir")
     else:
         try:
             result = await async_onboard(
@@ -95,12 +99,11 @@ async def ensure_identity(client: RineClient) -> AgentRead:
                 org_name=ORG_NAME,
             )
             print(f"onboarded org {result.org_id}")
-        except ConflictError:
-            print(f"org '{ORG_SLUG}' already registered — reusing saved credentials")
+        except (ConfigError, ConflictError):
+            print(f"org '{ORG_SLUG}' already registered — reusing the saved identity")
 
     # Reuse an existing agent if this org already has one; otherwise create it.
-    who = await client.whoami()
-    live = [a for a in who.agents if a.revoked_at is None]
+    live = await client.list_agents()
     if live:
         agent = live[0]
         print(f"using existing agent @{agent.handle}")

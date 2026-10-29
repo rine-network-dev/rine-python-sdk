@@ -33,24 +33,22 @@ them. ``live`` is ``pending`` plus ``invited``, so a **nomination** is entitled
 by the same read that entitles an invitation, and is never reclaimed while the
 electorate still owes it an answer.
 
-🔴 **The subtraction is keyed by the signing key each entitled agent publishes
-right now, and that is a narrower instrument than it looks.** Two populations
-break it, and only one of them is detectable from here:
+🔴 **The subtraction is keyed by each entitled agent's id, and that is a
+narrower instrument than it looks.** Two populations break it, and only one of
+them is detectable from here:
 
-* An entitled agent whose published key occupies no leaf — a key rotation is the
-  ordinary cause. Detectable, and :func:`reclaim_orphan_leaves` declines the
-  whole pass and names them rather than reclaiming a seated member's leaf.
+* An entitled agent whose id occupies no leaf. Detectable, and
+  :func:`reclaim_orphan_leaves` declines the whole pass and names them rather
+  than reclaiming a seated member's leaf.
 * A **revoked** member. ``DELETE /agents/{id}`` sets ``revoked_at`` and leaves
   both the group-membership row and the ratchet-tree leaf where they are, and
   the row is then invisible to every read this pass has: ``GET
   /groups/{id}/members`` filters revoked agents out, and so does ``GET
   /agents/keys``. So a revoked member enters neither the entitled set nor the
-  unreadable set, and its leaf is reclaimed as an orphan. That leaves a member
-  row with no leaf — recoverable, because the path-only rescue can still
-  declare and remove it, but it costs an O(N) commit nobody asked for. Closing
-  it needs a server view of membership that includes revoked agents; no
-  client-side read distinguishes the two today, and no surface may claim this
-  pass covers the revoked case.
+  unreadable set, and its leaf is reclaimed as an orphan, with its id declared
+  so the server can close the seat. No client-side read tells a revoked member
+  from a lapsed invitee, and no surface may claim this pass covers the revoked
+  case.
 
 The TypeScript twin is ``rine-core/src/mls-orphans.ts``, function for function.
 """
@@ -62,9 +60,14 @@ from typing import TYPE_CHECKING, Any
 
 from rine._actor import AGENT_HEADER
 from rine._mls.admission import MlsReclamation, MlsReclamationDecline
-from rine._mls.api import MlsCommit, read_group
+from rine._mls.allowed import admit_group_peers
+from rine._mls.api import MlsCommit
+from rine._mls.binding import DEFAULT_CIPHER_SUITE
 from rine._mls.commit import post_mls_commit
-from rine._mls.failures import is_epoch_conflict
+from rine._mls.commit_admission import admit_refused_peers, agent_id_of_identity
+from rine._mls.escrow_drain import drain_escrow
+from rine._mls.escrow_report import EscrowReport
+from rine._mls.failures import group_failures, is_epoch_conflict
 from rine._mls.group_access import open_mls_group
 from rine._mls.heartbeat import MlsActor
 from rine._mls.sync import sync_mls_group
@@ -84,7 +87,7 @@ class OrphanLeaf:
     """The leaf's index at the epoch it was enumerated at."""
 
     identity: bytes
-    """Its occupant's MLS basic-credential identity — a raw Ed25519 key."""
+    """Its occupant's MLS basic-credential identity — the agent id."""
 
 
 def orphan_leaves(group: MlsGroup, entitled: Iterable[bytes]) -> list[OrphanLeaf]:
@@ -135,28 +138,22 @@ def _unreadable_detail(unreadable: list[str]) -> str:
 
 
 def _unseated_detail(unseated: list[str]) -> str:
-    """The sentence a member whose published key occupies no leaf earns.
+    """The sentence a member whose id occupies no leaf earns.
 
     A member always holds a leaf — that is what admission committed. So a member
-    whose published signing key matches none of them means the two have come
-    apart, and the ordinary cause is a key rotation: ``POST /agents/{id}/keys``
-    has no MLS guard, so a rotation changes what this pass subtracts while the
-    leaf keeps carrying the credential the group was founded on. Reclaiming then
-    evicts a seated member — the epoch advances, the group stops opening for
-    them, their member row is untouched, and the pass reports only a count.
+    whose id matches none of them means the roster and the tree have come apart,
+    and the pass cannot tell which of the two is right.
 
     So the pass declines and names them, exactly as :func:`_unreadable_detail`
     does, and for the same reason: an ambiguity between a member's leaf and an
     orphan's is not a licence to remove either.
     """
     return (
-        f"Reclaimed nothing: {len(unseated)} member(s) of this group publish a signing "
-        f"key that occupies no leaf in its ratchet tree ({_named_few(unseated)}), so "
-        "this group's membership and its tree have come apart and no leaf can be "
-        "attributed. A member that rotated its signing key looks exactly like this; "
-        "its leaf still carries the key it published before, and removing that leaf "
-        "would evict a seated member. Have them rejoin the group, or remove them and "
-        "invite them again, and run this pass afterwards."
+        f"Reclaimed nothing: {len(unseated)} member(s) of this group occupy no leaf "
+        f"in its ratchet tree ({_named_few(unseated)}), so this group's membership "
+        "and its tree have come apart and no leaf can be attributed. Have them "
+        "rejoin the group, or remove them and invite them again, and run this pass "
+        "afterwards."
     )
 
 
@@ -166,41 +163,42 @@ def _commit_orphan_removal(
     agent_id: str,
     group_id: str,
     identity: bytes,
-    suite: int | None,
     headers: dict[str, str],
-) -> int | None:
+) -> tuple[int, EscrowReport] | None:
     """Post one Remove commit for the leaf ``identity`` holds right now.
 
-    ``None`` when that identity holds no leaf any more. State and leaf index are
-    both re-read here rather than carried in: a leaf index is only true of the
-    epoch it was read at, and each removal in a pass moves the epoch.
+    Returns the epoch it landed at and its escrow drain's report, or ``None`` when that identity
+    holds no leaf now. State and leaf index are re-read here, not carried in: an index is only true
+    of the epoch it was read at, and each removal moves the epoch.
 
-    Deliberately declares nothing. ``removes`` names **agent ids**, and an
-    orphan's leaf is precisely the one no server route can name — it holds no
-    member row and no live voucher, and there is no identity → agent lookup. A
-    commit that declares nothing can authorise no ``DELETE``, which is the
-    correct answer here: an orphan has no member row to delete.
+    The commit declares the agent whose leaf it takes, because the server closes a seat span
+    only by a declared removal. An orphan holds no member row, so nothing is deleted by it.
     """
-    group = open_mls_group(config_dir, agent_id, group_id, cipher_suite=suite)
+    actor = MlsActor(client=client, config_dir=config_dir, agent_id=agent_id)
+    admit_group_peers(actor, group_id)
+    group = open_mls_group(config_dir, agent_id, group_id)
     leaf = leaf_index(group, identity)
     if leaf is None:
         return None
-    bundle = group.remove_member(leaf)
+    with group_failures(group_id):
+        bundle = admit_refused_peers(actor, group, lambda: group.remove_member(leaf))
+    target = agent_id_of_identity(identity)
+    removes = () if target is None else (target,)
     epoch = post_mls_commit(
-        MlsActor(client=client, config_dir=config_dir, agent_id=agent_id),
+        actor,
         group_id,
         MlsCommit(
             commit=bundle.commit,
             group_info=bundle.group_info,
             epoch=bundle.epoch,
-            cipher_suite=group.cipher_suite(),
+            cipher_suite=DEFAULT_CIPHER_SUITE,
+            removes=removes,
         ),
         headers,
     )
     # Adopted only after the server accepted it, so a refused commit leaves no
     # forked local state for the next leaf in the pass to build on.
-    group.save()
-    return epoch
+    return epoch, drain_escrow(actor, group_id, group, carry_unreported=True).report()
 
 
 def reclaim_orphan_leaves(
@@ -247,9 +245,8 @@ def reclaim_orphan_leaves(
         What the pass found, what it retired, and what it cost.
     """
     headers = dict(extra_headers or {AGENT_HEADER: agent_id})
-    suite = read_group(client, agent_id, group_id).mls_cipher_suite
     tree = read_group_tree(client, group_id, headers)
-    group = open_mls_group(config_dir, agent_id, group_id, cipher_suite=suite)
+    group = open_mls_group(config_dir, agent_id, group_id)
     if not tree.outstanding_known:
         return MlsReclamation(
             found=0,
@@ -309,18 +306,23 @@ def reclaim_orphan_leaves(
     epoch = group.epoch()
     commits = 0
     reclaimed = 0
+    escrow = EscrowReport()
     for orphan in orphans:
         try:
             landed = _commit_orphan_removal(
-                client, config_dir, agent_id, group_id, orphan.identity, suite, headers
+                client, config_dir, agent_id, group_id, orphan.identity, headers
             )
         except Exception as err:
             if not is_epoch_conflict(err):
                 raise
-            sync_mls_group(client, config_dir, agent_id, group_id)
+            escrow = escrow.advance(
+                sync_mls_group(
+                    client, config_dir, agent_id, group_id, carry_unreported=True
+                ).escrow
+            )
             try:
                 landed = _commit_orphan_removal(
-                    client, config_dir, agent_id, group_id, orphan.identity, suite, headers
+                    client, config_dir, agent_id, group_id, orphan.identity, headers
                 )
             except Exception as retry_err:
                 if not is_epoch_conflict(retry_err):
@@ -330,10 +332,13 @@ def reclaim_orphan_leaves(
         # not a failure, and the pass simply owes one fewer commit.
         if landed is None:
             continue
-        epoch = landed
+        epoch, drained = landed
+        escrow = escrow.advance(drained)
         commits += 1
         reclaimed += 1
-    return MlsReclamation(found=len(orphans), reclaimed=reclaimed, commits=commits, epoch=epoch)
+    return MlsReclamation(
+        found=len(orphans), reclaimed=reclaimed, commits=commits, epoch=epoch, escrow=escrow
+    )
 
 
 __all__ = ["OrphanLeaf", "orphan_leaves", "reclaim_orphan_leaves"]

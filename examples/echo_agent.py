@@ -82,8 +82,8 @@ def handle(client: SyncRineClient, msg: DecryptedMessage) -> bool:
 
 def main() -> None:
     with SyncRineClient(config_dir=".rine") as client:
-        me = client.whoami()
-        print(f"echo_agent listening as {me.agents[0].handle} (Ctrl+C to stop)")
+        me = client.list_agents()[0]
+        print(f"echo_agent listening as {me.handle} (Ctrl+C to stop)")
 
         try:
             while True:

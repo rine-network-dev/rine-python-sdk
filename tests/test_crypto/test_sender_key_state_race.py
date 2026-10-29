@@ -27,7 +27,8 @@ import threading
 import time
 
 from rine._crypto import message, sender_keys_store, sender_keys_thread_lock
-from rine._crypto.keys import generate_agent_keys, public_keys_body, save_agent_keys
+from rine._crypto._key_pins import KeyPins
+from rine._crypto.keys import save_agent_keys
 from rine._crypto.message import (
     decrypt_group_message_async,
     decrypt_group_message_sync,
@@ -41,7 +42,9 @@ from rine._crypto.sender_keys_helpers import (
 )
 from rine._crypto.sender_keys_store import merge_sender_key_states
 from rine._sender_key_ops import delete_sender_key
+from rine.testing import WORLD
 from tests.conftest import sender_key_region_is_held_here
+from tests.test_crypto.world import KeyServer
 
 READER_ID = "11111111-1111-4111-8111-111111111111"
 PEER_A_ID = "22222222-2222-4222-8222-222222222222"
@@ -64,7 +67,11 @@ class _AlwaysCold:
     second row hit the cache would close the very window under test.
     """
 
-    def get(self, _agent_id: str) -> None:
+    def __init__(self) -> None:
+        """Hold the pins every read through this server is admitted to."""
+        self.pins = KeyPins()
+
+    def get(self, _agent_id: str, *, created_at: object = None) -> None:
         """Never answer from cache."""
         return None
 
@@ -72,7 +79,7 @@ class _AlwaysCold:
         """Keep nothing."""
 
 
-class ReverseOrderKeyServer:
+class ReverseOrderKeyServer(KeyServer):
     """Answers ``GET /agents/{id}/keys``, running ``on_fetch`` while callers wait.
 
     🔴 Concurrent callers are answered in REVERSE arrival order, and that is what
@@ -90,9 +97,9 @@ class ReverseOrderKeyServer:
     the first one is answered, and the ordering is the same on every machine.
     """
 
-    def __init__(self, published: dict[str, dict], on_fetch=None) -> None:
-        """Serve the given agents' published keys, from cold."""
-        self._published = published
+    def __init__(self, on_fetch=None) -> None:
+        """Serve every agent of :data:`WORLD`, from cold."""
+        super().__init__()
         self._on_fetch = on_fetch
         self._arrived = 0
         self._keys_cache = _AlwaysCold()
@@ -100,7 +107,7 @@ class ReverseOrderKeyServer:
     async def get(self, path: str, **_kwargs: object) -> dict:
         """Answer one key read after a wait that shortens with each arrival."""
         match = _KEYS_PATH.match(path)
-        if match is None or match.group(1) not in self._published:
+        if match is None:
             raise AssertionError(f"unexpected GET {path}")
         # The window this whole file is about: real work lands between a decrypt's
         # load and its save because the decrypt goes to the network in between.
@@ -110,18 +117,14 @@ class ReverseOrderKeyServer:
         self._arrived += 1
         for _ in range(rounds):
             await asyncio.sleep(0)
-        return self._published[match.group(1)]
+        return self.world.keys_response(match.group(1))
 
 
-def _peers(config_dir: str) -> dict[str, dict]:
-    """Both peers plus the reader on disk, and the peers' keys as published."""
-    published = {}
+def _peers(config_dir: str) -> None:
+    """Both peers plus the reader on disk, each with its own derived keys."""
     for peer_id in (PEER_A_ID, PEER_B_ID):
-        keys = generate_agent_keys()
-        save_agent_keys(config_dir, peer_id, keys)
-        published[peer_id] = public_keys_body(keys)
-    save_agent_keys(config_dir, READER_ID, generate_agent_keys())
-    return published
+        save_agent_keys(config_dir, peer_id, WORLD.keys(peer_id))
+    save_agent_keys(config_dir, READER_ID, WORLD.keys(READER_ID))
 
 
 def _backlog(config_dir: str, peer_id: str, count: int) -> tuple[SenderKeyState, list[str]]:
@@ -191,7 +194,7 @@ class TestConcurrentWriters:
         self, tmp_config_dir
     ):
         """Three posts per sender were opened, so each sender's ratchet stands at 3."""
-        published = _peers(tmp_config_dir)
+        _peers(tmp_config_dir)
         a_state, a_posts = _backlog(tmp_config_dir, PEER_A_ID, 3)
         b_state, b_posts = _backlog(tmp_config_dir, PEER_B_ID, 3)
         save_sender_key_state(
@@ -200,7 +203,7 @@ class TestConcurrentWriters:
             GROUP_ID,
             [_reader_view(a_state), _reader_view(b_state)],
         )
-        server = ReverseOrderKeyServer(published)
+        server = ReverseOrderKeyServer()
 
         # The shape a render has: both keys are loaded by every row before any row
         # saves. That is forced, not lucky — the load is synchronous and the first
@@ -224,7 +227,7 @@ class TestConcurrentWriters:
         self, tmp_config_dir
     ):
         """A key the decrypt never had an opinion about must not be written away."""
-        published = _peers(tmp_config_dir)
+        _peers(tmp_config_dir)
         a_state, a_posts = _backlog(tmp_config_dir, PEER_A_ID, 1)
         b_state, b_posts = _backlog(tmp_config_dir, PEER_B_ID, 1)
         # The reader starts holding A's key only. B's arrives as its distribution
@@ -240,7 +243,7 @@ class TestConcurrentWriters:
             ingested.append(True)
             _ingest_peer_key(tmp_config_dir, b_state)
 
-        server = ReverseOrderKeyServer(published, _ingest_once)
+        server = ReverseOrderKeyServer(_ingest_once)
 
         await decrypt_group_message_async(
             tmp_config_dir, READER_ID, GROUP_ID, a_posts[0], server, PEER_A_ID
@@ -260,7 +263,7 @@ class TestConcurrentWriters:
         self, tmp_config_dir
     ):
         """A leave that lands mid-decrypt is not undone by whatever was in flight."""
-        published = _peers(tmp_config_dir)
+        _peers(tmp_config_dir)
         a_state, a_posts = _backlog(tmp_config_dir, PEER_A_ID, 1)
         save_sender_key_state(tmp_config_dir, READER_ID, GROUP_ID, [_reader_view(a_state)])
 
@@ -270,7 +273,7 @@ class TestConcurrentWriters:
         # material back on disk — the retirement marker does not stop it, because
         # the marker only refuses INGESTS.
         server = ReverseOrderKeyServer(
-            published, lambda: delete_sender_key(tmp_config_dir, READER_ID, GROUP_ID)
+            lambda: delete_sender_key(tmp_config_dir, READER_ID, GROUP_ID)
         )
 
         await decrypt_group_message_async(
@@ -296,10 +299,10 @@ class TestConcurrentWriters:
         the fix for it. The winner records its read INSIDE the exclusion, so the
         loser is answered from that cache.
         """
-        published = _peers(tmp_config_dir)
+        _peers(tmp_config_dir)
         a_state, a_posts = _backlog(tmp_config_dir, PEER_A_ID, 1)
         save_sender_key_state(tmp_config_dir, READER_ID, GROUP_ID, [_reader_view(a_state)])
-        server = ReverseOrderKeyServer(published)
+        server = ReverseOrderKeyServer()
 
         first, second = await asyncio.gather(
             *(
@@ -335,10 +338,10 @@ class TestAcrossEventLoops:
         dropped when its last holder leaves, so a finished run leaves nothing to
         carry. The test below is the one that isolates the per-loop key.
         """
-        published = _peers(tmp_config_dir)
+        _peers(tmp_config_dir)
         a_state, a_posts = _backlog(tmp_config_dir, PEER_A_ID, 4)
         save_sender_key_state(tmp_config_dir, READER_ID, GROUP_ID, [_reader_view(a_state)])
-        server = ReverseOrderKeyServer(published)
+        server = ReverseOrderKeyServer()
 
         async def _read_pair(payloads: list[str]):
             return await asyncio.gather(
@@ -398,7 +401,7 @@ class TestAcrossEventLoops:
         The two decrypts are of different senders, so nothing here asserts what
         the file ends up holding — only that both readers got their plaintext.
         """
-        published = _peers(tmp_config_dir)
+        _peers(tmp_config_dir)
         a_state, a_posts = _backlog(tmp_config_dir, PEER_A_ID, 1)
         b_state, b_posts = _backlog(tmp_config_dir, PEER_B_ID, 1)
         save_sender_key_state(
@@ -421,7 +424,7 @@ class TestAcrossEventLoops:
         failed: dict[str, BaseException] = {}
 
         def _read(peer_id: str, payload: str) -> None:
-            server = ReverseOrderKeyServer(published, _offer_to_meet)
+            server = ReverseOrderKeyServer(_offer_to_meet)
             try:
                 result = asyncio.run(
                     decrypt_group_message_async(
@@ -477,7 +480,7 @@ class TestTwoSynchronousReadersOfOneRow:
         shows as the sealed-message refusal — the defect, produced by the fix
         for it.
         """
-        published = _peers(tmp_config_dir)
+        _peers(tmp_config_dir)
         a_state, a_posts = _backlog(tmp_config_dir, PEER_A_ID, 1)
         save_sender_key_state(tmp_config_dir, READER_ID, GROUP_ID, [_reader_view(a_state)])
         start_second = threading.Event()
@@ -504,12 +507,12 @@ class TestTwoSynchronousReadersOfOneRow:
         loser = threading.Thread(
             target=lambda: (
                 start_second.wait(timeout=5),
-                _read("loser", _SyncKeyServer(published)),
+                _read("loser", _SyncKeyServer()),
             ),
             daemon=True,
         )
         loser.start()
-        _read("winner", _SyncKeyServer(published, _let_the_loser_in))
+        _read("winner", _SyncKeyServer(_let_the_loser_in))
         loser.join(timeout=20)
 
         assert loser.is_alive() is False
@@ -524,7 +527,7 @@ class TestTwoSynchronousReadersOfOneRow:
         self, tmp_config_dir, monkeypatch
     ):
         """The fourth synchronous region, asked from inside its own merge."""
-        published = _peers(tmp_config_dir)
+        _peers(tmp_config_dir)
         a_state, a_posts = _backlog(tmp_config_dir, PEER_A_ID, 1)
         save_sender_key_state(tmp_config_dir, READER_ID, GROUP_ID, [_reader_view(a_state)])
         held: list[bool] = []
@@ -537,7 +540,7 @@ class TestTwoSynchronousReadersOfOneRow:
         monkeypatch.setattr(message, "merge_sender_key_states", watched)
 
         result = decrypt_group_message_sync(
-            tmp_config_dir, READER_ID, GROUP_ID, a_posts[0], _SyncKeyServer(published), PEER_A_ID
+            tmp_config_dir, READER_ID, GROUP_ID, a_posts[0], _SyncKeyServer(), PEER_A_ID
         )
 
         assert held == [True]
@@ -580,7 +583,7 @@ class TestRetiredGroupRefusal:
         assert not os.path.exists(upper_path)
 
 
-class _SyncKeyServer:
+class _SyncKeyServer(KeyServer):
     """The sync twin of :class:`ReverseOrderKeyServer`, with an optional interleave.
 
     ``on_fetch`` fires inside the key read, which is inside the holder's region —
@@ -589,20 +592,20 @@ class _SyncKeyServer:
     and get the plain server.
     """
 
-    def __init__(self, published: dict[str, dict], on_fetch=None) -> None:
-        """Serve the given agents' published keys, from cold."""
-        self._published = published
+    def __init__(self, on_fetch=None) -> None:
+        """Serve every agent of :data:`WORLD`, from cold."""
+        super().__init__()
         self._keys_cache = _AlwaysCold()
         self._on_fetch = on_fetch
 
     def get(self, path: str, **_kwargs: object) -> dict:
         """Answer one key read."""
         match = _KEYS_PATH.match(path)
-        if match is None or match.group(1) not in self._published:
+        if match is None:
             raise AssertionError(f"unexpected GET {path}")
         if self._on_fetch is not None:
             self._on_fetch()
-        return self._published[match.group(1)]
+        return self.world.keys_response(match.group(1))
 
 
 def _sync_region_holders(config_dir: str) -> int:
@@ -629,7 +632,7 @@ def _row(sender_id: str, key_id: str, chain_key: bytes) -> SenderKeyState:
     )
 
 
-def _collision(config_dir: str, squatter_last: bool) -> tuple[str, dict[str, dict]]:
+def _collision(config_dir: str, squatter_last: bool) -> str:
     """One post from A, and a row from B claiming A's key id, on the reader's disk.
 
     Two rows sharing one ``sender_key_id`` is the state the per-sender ingest check
@@ -638,9 +641,8 @@ def _collision(config_dir: str, squatter_last: bool) -> tuple[str, dict[str, dic
     good. What the reader holds afterwards is exactly this — the honest peer's key,
     and another agent's key filed under the same name.
     """
-    keys_a = generate_agent_keys()
-    save_agent_keys(config_dir, PEER_A_ID, keys_a)
-    save_agent_keys(config_dir, READER_ID, generate_agent_keys())
+    save_agent_keys(config_dir, PEER_A_ID, WORLD.keys(PEER_A_ID))
+    save_agent_keys(config_dir, READER_ID, WORLD.keys(READER_ID))
 
     genuine = _row(PEER_A_ID, SHARED_KEY_ID, generate_sender_key(GROUP_ID, PEER_A_ID).chain_key)
     save_sender_key_state(config_dir, PEER_A_ID, GROUP_ID, [genuine])
@@ -654,7 +656,7 @@ def _collision(config_dir: str, squatter_last: bool) -> tuple[str, dict[str, dic
     reader_view = _reader_view(genuine)
     rows = [reader_view, squat] if squatter_last else [squat, reader_view]
     save_sender_key_state(config_dir, READER_ID, GROUP_ID, rows)
-    return result.encrypted_payload, {PEER_A_ID: public_keys_body(keys_a)}
+    return result.encrypted_payload
 
 
 def _rows_by_sender(config_dir: str) -> dict[str, str]:
@@ -680,12 +682,12 @@ class TestCollidingSenderKeyIds:
         nothing raised anywhere. Asserting only the returned plaintext passes with
         the deletion still in place.
         """
-        payload, published = _collision(tmp_config_dir, squatter_last=False)
+        payload = _collision(tmp_config_dir, squatter_last=False)
         before = _rows_by_sender(tmp_config_dir)
         assert before == {PEER_A_ID: SHARED_KEY_ID, PEER_B_ID: SHARED_KEY_ID}
 
         opened = decrypt_group_message_sync(
-            tmp_config_dir, READER_ID, GROUP_ID, payload, _SyncKeyServer(published), PEER_A_ID
+            tmp_config_dir, READER_ID, GROUP_ID, payload, _SyncKeyServer(), PEER_A_ID
         )
         assert json.loads(opened.plaintext) == {"text": "from the honest peer"}
 
@@ -693,10 +695,10 @@ class TestCollidingSenderKeyIds:
 
     def test_honest_post_when_a_squatted_row_landed_last_then_it_still_opens(self, tmp_config_dir):
         """A row from the sender the SERVER named wins the id it shares."""
-        payload, published = _collision(tmp_config_dir, squatter_last=True)
+        payload = _collision(tmp_config_dir, squatter_last=True)
 
         opened = decrypt_group_message_sync(
-            tmp_config_dir, READER_ID, GROUP_ID, payload, _SyncKeyServer(published), PEER_A_ID
+            tmp_config_dir, READER_ID, GROUP_ID, payload, _SyncKeyServer(), PEER_A_ID
         )
         assert json.loads(opened.plaintext) == {"text": "from the honest peer"}
         assert _rows_by_sender(tmp_config_dir) == {
@@ -708,14 +710,14 @@ class TestCollidingSenderKeyIds:
         self, tmp_config_dir
     ):
         """The async twin prefers the same row, and its merge keeps the other one."""
-        payload, published = _collision(tmp_config_dir, squatter_last=True)
+        payload = _collision(tmp_config_dir, squatter_last=True)
 
         opened = await decrypt_group_message_async(
             tmp_config_dir,
             READER_ID,
             GROUP_ID,
             payload,
-            ReverseOrderKeyServer(published),
+            ReverseOrderKeyServer(),
             PEER_A_ID,
         )
         assert json.loads(opened.plaintext) == {"text": "from the honest peer"}
@@ -730,9 +732,9 @@ class TestCollidingSenderKeyIds:
         self, tmp_config_dir
     ):
         """The advance belongs to the row it came from, not to whoever shares its id."""
-        payload, published = _collision(tmp_config_dir, squatter_last=True)
+        payload = _collision(tmp_config_dir, squatter_last=True)
         decrypt_group_message_sync(
-            tmp_config_dir, READER_ID, GROUP_ID, payload, _SyncKeyServer(published), PEER_A_ID
+            tmp_config_dir, READER_ID, GROUP_ID, payload, _SyncKeyServer(), PEER_A_ID
         )
 
         advanced = {
@@ -817,8 +819,7 @@ class TestMergeOrdering:
         ``test_peer_key_when_ingested_during_a_decrypts_verify_then_it_survives``
         above holds it to that.
         """
-        keys = generate_agent_keys()
-        save_agent_keys(tmp_config_dir, READER_ID, keys)
+        save_agent_keys(tmp_config_dir, READER_ID, WORLD.keys(READER_ID))
         own = generate_sender_key(GROUP_ID, READER_ID)
         save_sender_key_state(tmp_config_dir, READER_ID, GROUP_ID, [own])
         result, _ = encrypt_group_message(
@@ -840,7 +841,7 @@ class TestMergeOrdering:
             save_sender_key_state(tmp_config_dir, READER_ID, GROUP_ID, [own, first])
             save_sender_key_state(tmp_config_dir, READER_ID, GROUP_ID, [first, second])
 
-        server = ReverseOrderKeyServer({READER_ID: public_keys_body(keys)}, _rotate_once)
+        server = ReverseOrderKeyServer(_rotate_once)
 
         opened = await decrypt_group_message_async(
             tmp_config_dir, READER_ID, GROUP_ID, result.encrypted_payload, server, READER_ID

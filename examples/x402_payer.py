@@ -53,7 +53,9 @@ async def pay_quote(client: RineClient, config_dir: str, agent_id: str, quote_me
     payment_required = parse_x402_payload(quote.plaintext)
 
     try:
-        # Selects the first accepts[] entry the policy allows, signs it, and
+        # Refuses a quote whose sender is not verified (inauthentic-sender, or the
+        # retryable sender-unverifiable when the key lookup failed), then
+        # selects the first accepts[] entry the policy allows, signs it, and
         # reserves the spend — the reservation stands even if the send below
         # fails, so a retry of the same quote is an idempotent no-op unless
         # force=True.
@@ -61,6 +63,7 @@ async def pay_quote(client: RineClient, config_dir: str, agent_id: str, quote_me
             config_dir,
             agent_id,
             payment_required,
+            quote=quote,
             message_id=quote_message_id,
         )
     except X402Error as exc:

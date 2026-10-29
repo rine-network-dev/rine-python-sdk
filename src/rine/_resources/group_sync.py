@@ -25,7 +25,8 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from rine._group_recovery import SenderKeyRecoveryResult
 from rine._mls.heartbeat import MlsActor
-from rine._mls.resync import recover_mls_group
+from rine._mls.self_update import self_update_group
+from rine._mls.stranded_seat import recover_mls_group_or_reseat
 from rine._mls.topup import top_up_key_packages
 from rine.errors import MlsResyncUnavailableError
 from rine.format import (
@@ -103,8 +104,6 @@ def _recover_mls_with_top_up(
     config_dir: str,
     acting: str,
     group_id: str,
-    *,
-    cipher_suite: int | None,
 ) -> MlsRecoveryResult:
     """Publish this agent's key packages, then catch its MLS state up.
 
@@ -131,23 +130,25 @@ def _recover_mls_with_top_up(
         config_dir: Config directory path.
         acting: The recovering agent's UUID.
         group_id: The rine group UUID.
-        cipher_suite: The group's own suite, when it is not the current default.
 
     Returns:
-        What the ladder did, carrying what the top-up did.
+        What the ladder did, carrying what the top-up did and where the agent's
+        leaf stands after its own self-update.
 
     Raises:
         MlsResyncUnavailableError: This agent's local state will not load at all,
             now naming the top-up that just ran.
     """
-    top_up = top_up_key_packages(MlsActor(client=http, config_dir=config_dir, agent_id=acting))
+    actor = MlsActor(client=http, config_dir=config_dir, agent_id=acting)
+    top_up = top_up_key_packages(actor)
     try:
-        recovered = recover_mls_group(
-            http, config_dir, acting, group_id, cipher_suite=cipher_suite
-        )
+        recovered = recover_mls_group_or_reseat(http, config_dir, acting, group_id)
     except MlsResyncUnavailableError as err:
         raise MlsResyncUnavailableError(group_id, key_packages=top_up) from err
-    return replace(recovered, key_packages=_top_up_field(top_up))
+    # Only a recovery that kept the agent in the group has a leaf to move. The
+    # implicit sync behind every read and send never builds a self-update.
+    seat = None if recovered.evicted else self_update_group(actor, group_id)
+    return replace(recovered, key_packages=_top_up_field(top_up), seat=seat)
 
 
 def _top_up_field(top_up: KeyPackageTopUp) -> KeyPackageTopUp | None:
@@ -188,7 +189,6 @@ def sync_group_state(
             client._config_dir,
             acting,
             group_id,
-            cipher_suite=group.mls_cipher_suite,
         )
     note = _never_founded_note(group, repair)
     # ⚠️ Not optional, and not what the TypeScript stack does. There the gate
@@ -241,7 +241,6 @@ async def sync_group_state_async(
                 client._config_dir,
                 acting,
                 group_id,
-                cipher_suite=group.mls_cipher_suite,
             ),
         )
     note = _never_founded_note(group, repair)

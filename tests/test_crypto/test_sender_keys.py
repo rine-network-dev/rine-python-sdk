@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from rine._crypto.envelope import decode_envelope
-from rine._crypto.keys import generate_signing_keypair
+from rine._crypto.keys import make_kid
 from rine._crypto.sender_keys import (
     VERSION_SENDER_KEY,
     derive_message_key,
@@ -15,9 +15,20 @@ from rine._crypto.sender_keys import (
     seal_group,
 )
 from rine.errors import CryptoError, NoSenderKeyStateError
+from rine.testing import WORLD
 
 GROUP_ID = "00000000-0000-0000-0000-000000000001"
 AGENT_ID = "00000000-0000-0000-0000-000000000002"
+
+
+def _signing_key() -> bytes:
+    """The derived Ed25519 signing key of the fixed agent."""
+    return WORLD.keys(AGENT_ID).signing.private_key
+
+
+def _kid() -> str:
+    """The key id a group send by the fixed agent carries."""
+    return make_kid(AGENT_ID, 0)
 
 
 class TestDeriveMessageKey:
@@ -41,11 +52,11 @@ class TestDeriveMessageKey:
 
 class TestSealOpenGroup:
     def test_round_trip(self):
-        sk = generate_signing_keypair()
+        sk = _signing_key()
         state = generate_sender_key(GROUP_ID, AGENT_ID)
         original_index = state.message_index
 
-        ct, updated = seal_group(sk.private_key, "rine:test", state, b"hello group")
+        ct, updated = seal_group(sk, _kid(), state, b"hello group")
         assert updated.message_index == original_index + 1
 
         states = {state.sender_key_id: state}
@@ -55,26 +66,26 @@ class TestSealOpenGroup:
         assert idx == original_index
 
     def test_wire_format_version(self):
-        sk = generate_signing_keypair()
+        sk = _signing_key()
         state = generate_sender_key(GROUP_ID, AGENT_ID)
-        ct, _ = seal_group(sk.private_key, "rine:test", state, b"test")
+        ct, _ = seal_group(sk, _kid(), state, b"test")
         assert ct[0] == VERSION_SENDER_KEY
 
     def test_multiple_messages_advance_chain(self):
-        sk = generate_signing_keypair()
+        sk = _signing_key()
         state = generate_sender_key(GROUP_ID, AGENT_ID)
 
-        ct1, state = seal_group(sk.private_key, "rine:test", state, b"msg1")
-        ct2, state = seal_group(sk.private_key, "rine:test", state, b"msg2")
+        ct1, state = seal_group(sk, _kid(), state, b"msg1")
+        ct2, state = seal_group(sk, _kid(), state, b"msg2")
         assert state.message_index == 2
 
     def test_out_of_order_decryption(self):
         """Decrypt messages received out of order."""
-        sk = generate_signing_keypair()
+        sk = _signing_key()
 
         state_orig = generate_sender_key(GROUP_ID, AGENT_ID)
-        ct_a, state_a = seal_group(sk.private_key, "rine:test", state_orig, b"msg-a")
-        ct_b, state_b = seal_group(sk.private_key, "rine:test", state_a, b"msg-b")
+        ct_a, state_a = seal_group(sk, _kid(), state_orig, b"msg-a")
+        ct_b, state_b = seal_group(sk, _kid(), state_a, b"msg-b")
 
         # Decrypt msg-b first (index 1, receiver at index 0)
         recv = generate_sender_key(GROUP_ID, AGENT_ID)
@@ -95,9 +106,9 @@ class TestSealOpenGroup:
 
     def test_open_group_when_no_state_is_held_then_refuses_with_a_way_out(self):
         """The refusal names the cause and something the reader can do."""
-        sk = generate_signing_keypair()
+        sk = _signing_key()
         state = generate_sender_key(GROUP_ID, AGENT_ID)
-        ct, _ = seal_group(sk.private_key, "rine:test", state, b"test")
+        ct, _ = seal_group(sk, _kid(), state, b"test")
 
         with pytest.raises(NoSenderKeyStateError) as excinfo:
             open_group({}, ct)

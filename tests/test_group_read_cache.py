@@ -17,8 +17,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import pathlib
-import re
 import stat
 
 import pytest
@@ -30,7 +28,7 @@ from rine._crypto.group_read_cache import (
     lookup_group_read,
     record_group_read,
 )
-from rine._crypto.keys import generate_agent_keys, save_agent_keys
+from rine._crypto.keys import save_agent_keys
 from rine._crypto.message import (
     decrypt_group_message_async,
     decrypt_group_message_sync,
@@ -40,16 +38,18 @@ from rine._crypto.sender_keys import SenderKeyState, generate_sender_key
 from rine._crypto.sender_keys_helpers import save_sender_key_state
 from rine._utils import from_base64url, to_base64url
 from rine.errors import CryptoError, SenderMismatchError
-from tests.test_sender_binding import GROUP_ID, PAYLOAD, SENDER_B, VICTIM_V, KeyServer
+from rine.testing import WORLD
+from tests._twin import core_source, ts_number
+from tests.test_crypto.world import AsyncKeyServer, KeyServer
+from tests.test_sender_binding import GROUP_ID, PAYLOAD, SENDER_B, VICTIM_V
 
 IMPOSTOR = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 
 
-def _group_message(config_dir: str) -> tuple[str, object]:
+def _group_message(config_dir: str) -> str:
     """One sender-key group message from B, with B's key ingested by the victim."""
-    sender_keys = generate_agent_keys()
-    save_agent_keys(config_dir, SENDER_B, sender_keys)
-    save_agent_keys(config_dir, VICTIM_V, generate_agent_keys())
+    save_agent_keys(config_dir, SENDER_B, WORLD.keys(SENDER_B))
+    save_agent_keys(config_dir, VICTIM_V, WORLD.keys(VICTIM_V))
     state = generate_sender_key(GROUP_ID, SENDER_B)
     save_sender_key_state(
         config_dir,
@@ -70,7 +70,7 @@ def _group_message(config_dir: str) -> tuple[str, object]:
     # state that is on no disk at all rather than discarding the advance.
     save_sender_key_state(config_dir, SENDER_B, GROUP_ID, [state])
     sealed, _ = encrypt_group_message(config_dir, SENDER_B, GROUP_ID, state, PAYLOAD)
-    return sealed.encrypted_payload, sender_keys
+    return sealed.encrypted_payload
 
 
 def _cache_file(config_dir: str) -> str:
@@ -84,8 +84,8 @@ class TestReadingTwice:
         self, tmp_config_dir
     ):
         """The ordinary thing an operator does with an inbox stops being an error."""
-        payload, sender_keys = _group_message(tmp_config_dir)
-        server = KeyServer(sender_keys)
+        payload = _group_message(tmp_config_dir)
+        server = KeyServer()
 
         first = decrypt_group_message_sync(
             tmp_config_dir, VICTIM_V, GROUP_ID, payload, server, SENDER_B
@@ -100,8 +100,8 @@ class TestReadingTwice:
 
     def test_second_read_when_the_cache_is_removed_then_the_key_is_gone(self, tmp_config_dir):
         """The control arm: one variable changes and the old refusal comes back."""
-        payload, sender_keys = _group_message(tmp_config_dir)
-        server = KeyServer(sender_keys)
+        payload = _group_message(tmp_config_dir)
+        server = KeyServer()
         decrypt_group_message_sync(tmp_config_dir, VICTIM_V, GROUP_ID, payload, server, SENDER_B)
 
         delete_group_read_cache(tmp_config_dir, VICTIM_V, GROUP_ID)
@@ -113,8 +113,8 @@ class TestReadingTwice:
 
     def test_replay_when_the_row_names_a_different_sender_then_refuses(self, tmp_config_dir):
         """A replay is verified against the sender the server names on THIS read."""
-        payload, sender_keys = _group_message(tmp_config_dir)
-        server = KeyServer(sender_keys)
+        payload = _group_message(tmp_config_dir)
+        server = KeyServer()
         decrypt_group_message_sync(tmp_config_dir, VICTIM_V, GROUP_ID, payload, server, SENDER_B)
 
         with pytest.raises(SenderMismatchError):
@@ -126,10 +126,8 @@ class TestReadingTwice:
         self, tmp_config_dir
     ):
         """The twin, because a fix on one client and not the other is not a fix."""
-        from tests.test_sender_binding import AsyncKeyServer
-
-        payload, sender_keys = _group_message(tmp_config_dir)
-        server = AsyncKeyServer(sender_keys)
+        payload = _group_message(tmp_config_dir)
+        server = AsyncKeyServer()
 
         await decrypt_group_message_async(
             tmp_config_dir, VICTIM_V, GROUP_ID, payload, server, SENDER_B
@@ -144,8 +142,8 @@ class TestReadingTwice:
         """The marker a leave writes has to be re-armable."""
         from rine._crypto.sender_keys_helpers import mark_sender_keys_retired
 
-        payload, sender_keys = _group_message(tmp_config_dir)
-        server = KeyServer(sender_keys)
+        payload = _group_message(tmp_config_dir)
+        server = KeyServer()
         decrypt_group_message_sync(tmp_config_dir, VICTIM_V, GROUP_ID, payload, server, SENDER_B)
 
         mark_sender_keys_retired(tmp_config_dir, VICTIM_V, GROUP_ID)
@@ -157,9 +155,9 @@ class TestReadingTwice:
 
     def test_cache_file_when_written_then_is_owner_only(self, tmp_config_dir):
         """Plaintext at rest under the same 0600 posture as the rest of the dir."""
-        payload, sender_keys = _group_message(tmp_config_dir)
+        payload = _group_message(tmp_config_dir)
         decrypt_group_message_sync(
-            tmp_config_dir, VICTIM_V, GROUP_ID, payload, KeyServer(sender_keys), SENDER_B
+            tmp_config_dir, VICTIM_V, GROUP_ID, payload, KeyServer(), SENDER_B
         )
 
         mode = stat.S_IMODE(os.stat(_cache_file(tmp_config_dir)).st_mode)
@@ -195,21 +193,6 @@ class TestBounds:
             fh.write("{not json")
 
         assert lookup_group_read(tmp_config_dir, VICTIM_V, GROUP_ID, b"abc") is None
-
-
-def _ts_number(source: str, name: str) -> int:
-    """One ``export const <name> = …;`` from the twin, as an integer.
-
-    Accepts a plain literal or a product of them, which is how both stacks spell
-    a byte bound. Anything else is a source shape this helper has no reading of,
-    and it says so rather than answering ``0``.
-    """
-    match = re.search(rf"\b{name} = ([\d ]+(?:\* *[\d ]+)*);", source)
-    assert match, f"no readable {name} literal in the twin's source"
-    product = 1
-    for factor in match.group(1).split("*"):
-        product *= int(factor.strip())
-    return product
 
 
 class TestTheCrossStackFile:
@@ -280,19 +263,13 @@ class TestTheCrossStackFile:
         the actor and peek headers: the two deployables cannot import each other,
         so a test is the only thing that can bind them.
         """
-        twin = (
-            pathlib.Path(__file__).resolve().parents[2]
-            / "rine-core/src/crypto/group-read-cache.ts"
-        )
-        if not twin.is_file():
-            pytest.skip("rine-core source not present — SDK tested outside the monorepo")
-        source = twin.read_text()
+        source = core_source("crypto/group-read-cache.ts")
 
         # The two bounds. Both are written as one product on both stacks, so the
         # factors are read rather than the expression evaluated — a plain integer
         # is accepted too, because either spelling is the same contract.
-        assert _ts_number(source, "GROUP_READ_MAX_ENTRIES") == GROUP_READ_MAX_ENTRIES
-        assert _ts_number(source, "GROUP_READ_MAX_BYTES") == GROUP_READ_MAX_BYTES
+        assert ts_number(source, "GROUP_READ_MAX_ENTRIES") == GROUP_READ_MAX_ENTRIES
+        assert ts_number(source, "GROUP_READ_MAX_BYTES") == GROUP_READ_MAX_BYTES
         # The path, the lower-casing and the digest, each as one literal: the
         # directory name, ``groupId.toLowerCase()`` in the filename, and sha256
         # over the framed ciphertext.
@@ -313,7 +290,7 @@ class TestTheLeaveTakesIt:
         """Or the sentence a leave prints — that the messages no longer open — is false."""
         from rine._mls.leave import retire_local_group_state
 
-        save_agent_keys(tmp_config_dir, VICTIM_V, generate_agent_keys())
+        save_agent_keys(tmp_config_dir, VICTIM_V, WORLD.keys(VICTIM_V))
         record_group_read(tmp_config_dir, VICTIM_V, GROUP_ID, b"abc", b"envelope")
 
         retire_local_group_state(tmp_config_dir, GROUP_ID, VICTIM_V, VICTIM_V)

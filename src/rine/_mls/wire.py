@@ -23,6 +23,12 @@ def mls_from_base64(encoded: str) -> bytes:
     return base64.b64decode(encoded, validate=True)
 
 
+#: The group's newest GroupInfo is still awaiting a peer's ACK, so the server has
+#: no confirmed join capability to serve. Unlike an epoch conflict this resolves
+#: on its own, so it gets its own short wait rather than the single rebuild.
+PENDING_CONFIRMATION = "pending_confirmation"
+
+
 def api_error_code(err: BaseException) -> str | None:
     """The server's machine-readable ``error`` key for a failed request.
 

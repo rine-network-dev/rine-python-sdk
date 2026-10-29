@@ -27,6 +27,9 @@ from typing import TYPE_CHECKING, Literal
 
 from mnemonic import Mnemonic
 
+from rine._crypto import _mlkem
+from rine.errors import CryptoError
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -35,6 +38,9 @@ _WORD_COUNT = 5
 #: BIP39 indexes are 11 bits, so five of them consume 55 of the digest's bits.
 _BITS_PER_WORD = 11
 _WORD_MASK = 0x7FF
+
+#: The exact length of a recipient key: X25519 ‖ ML-KEM-768.
+RECIPIENT_KEY_SIZE = 32 + _mlkem.PUBLIC_KEY_SIZE
 
 #: Whether the local computation and the server's assertion agree, and why not.
 #:
@@ -92,6 +98,32 @@ def verification_words_for_key(public_key: bytes) -> str:
     if len(public_key) != 32:
         raise ValueError(f"Invalid signing public key: expected 32 bytes, got {len(public_key)}")
     return _words_from_digest(hashlib.sha256(public_key).digest())
+
+
+def recipient_key_words(public_key: bytes) -> str:
+    """The five words of a recipient key: the words of its SHA-256.
+
+    A recipient key is an X25519 public key followed by an ML-KEM-768 public key
+    — 1216 bytes, not the 32 the word function is defined over — so the words are
+    taken over the key's SHA-256 digest, which is 32 bytes. Both sides of a
+    delegation compute them the same way: the fleet's ``recipient_words`` and the
+    TypeScript twin ``recipientKeyWords``
+    (``rine-core/src/crypto/recipient-key.ts``) hash the raw key identically, and
+    the shared golden ``tests/fixtures/recipient_key_words_vector.json`` pins all
+    three.
+
+    Args:
+        public_key: The raw recipient key, X25519 ‖ ML-KEM-768.
+
+    Returns:
+        Five space-separated BIP39 English words.
+
+    Raises:
+        CryptoError: If the key is not 1216 bytes.
+    """
+    if len(public_key) != RECIPIENT_KEY_SIZE:
+        raise CryptoError(f"recipient key must be {RECIPIENT_KEY_SIZE} bytes")
+    return verification_words_for_key(hashlib.sha256(public_key).digest())
 
 
 def verification_words_for_jwk(jwk: Mapping[str, object]) -> str:
@@ -166,9 +198,11 @@ def compare_verification_words(
 
 
 __all__ = [
+    "RECIPIENT_KEY_SIZE",
     "VerificationWordsComparison",
     "VerificationWordsStatus",
     "compare_verification_words",
+    "recipient_key_words",
     "verification_words_for_jwk",
     "verification_words_for_key",
 ]

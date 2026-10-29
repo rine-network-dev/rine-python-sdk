@@ -8,17 +8,27 @@ read passes through here first.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 from rine._actor import AGENT_HEADER
-from rine._logging import logger
-from rine._mls.api import fetch_group_info
-from rine._mls.external_join import ExternalJoin, external_join_mls_group
+from rine._mls.allowed import admit_group_peers
+from rine._mls.binding import PeerNotAdmittedError
+from rine._mls.commit_admission import admit_refused_peers
+from rine._mls.escrow_drain import drain_escrow
+from rine._mls.escrow_handoff import take_unreported
+from rine._mls.escrow_report import EscrowReport
 from rine._mls.failures import is_unprocessable_commit
 from rine._mls.group_access import open_mls_group
 from rine._mls.heartbeat import MlsActor, mls_heartbeat
-from rine._mls.sync_api import MlsHandshake, fetch_handshakes, mls_ack, mls_nack
+from rine._mls.pending_commit import (
+    PendingCommitOutcome,
+    PendingCommitSettlement,
+    settle_pending_commit,
+)
+from rine._mls.sync_api import fetch_handshake_feed
+from rine._mls.sync_signals import emit_ack, emit_nack, reconcile_if_orphaned
 
 
 @dataclass(frozen=True)
@@ -38,6 +48,14 @@ class MlsSyncResult:
     operation that refuses.
     """
 
+    escrow: EscrowReport = field(default_factory=EscrowReport)
+    """What the drains of the applied commits (or of a re-bootstrap) could not do:
+    epochs with no escrow, a deferral, and what waits queued."""
+
+    pending_commit: PendingCommitSettlement | None = None
+    """What became of a self-update this member built and had not applied, when it
+    held one: applied, still held, or lost. ``None`` when nothing was pending."""
+
 
 def sync_mls_group(
     client: Any,
@@ -45,9 +63,14 @@ def sync_mls_group(
     agent_id: str,
     group_id: str,
     *,
-    cipher_suite: int | None = None,
+    carry_unreported: bool = False,
 ) -> MlsSyncResult:
     """Apply every commit posted to the group since this agent's current epoch.
+
+    With ``carry_unreported`` the result also reports the epochs a background sweep lost in
+    this group since the last report (:mod:`rine._mls.escrow_handoff`). Pass it only where
+    the result reaches a caller: a sync whose result is dropped would take the news and
+    throw it away.
 
     Carries the acting agent's key-package heartbeat, which is what covers the
     verbs that post no commit — the catch-up behind an ordinary read, the replay
@@ -63,15 +86,39 @@ def sync_mls_group(
     """
     headers = {AGENT_HEADER: agent_id}
     mls_heartbeat(MlsActor(client=client, config_dir=config_dir, agent_id=agent_id), "gated")
-    group = open_mls_group(config_dir, agent_id, group_id, cipher_suite=cipher_suite)
-    handshakes = fetch_handshakes(client, group_id, group.epoch(), headers)
+    group = open_mls_group(config_dir, agent_id, group_id)
+    # A holding handle names its pending epoch, and the answer says where its own
+    # commit stands. A handle with nothing pending sends the plain request.
+    feed = fetch_handshake_feed(
+        client, group_id, group.epoch(), headers, group.pending_commit_epoch()
+    )
+    handshakes = feed.handshakes
+    actor = MlsActor(client=client, config_dir=config_dir, agent_id=agent_id)
+
+    settled = settle_pending_commit(actor, group_id, group, feed.pending_commit)
+    escrow = settled.escrow if settled is not None else EscrowReport()
+    if settled is not None and settled.outcome is PendingCommitOutcome.HELD:
+        # Our own commit is not confirmed yet, so a commit built on it cannot be
+        # told from a commit built on a rolled-back epoch. Applying or NACKing
+        # anything past it would be a guess.
+        return _idle(config_dir, agent_id, group_id, group, escrow, carry_unreported, settled)
+
+    # Applying a peer's commit meets its leaves for the first time, so the
+    # chain-verified peers must be admitted first. An idle sync has no handshakes
+    # and stays free of the extra reads.
+    if handshakes:
+        admit_group_peers(actor, group_id)
 
     epoch = group.epoch()
     processed = 0
 
     for handshake in handshakes:
+        # The feed was read before the pending commit was applied, so a handshake at
+        # or below the epoch now held is already in this handle.
+        if handshake.epoch is not None and handshake.epoch <= epoch:
+            continue
         try:
-            epoch = group.apply_commit(handshake.blob)
+            epoch = admit_refused_peers(actor, group, partial(group.apply_commit, handshake.blob))
         except Exception as err:
             # Three causes must be told apart. A local failure (store I/O, a
             # retired handle) is not the commit's fault. Our OWN state may be
@@ -81,83 +128,64 @@ def sync_mls_group(
             # left is a genuinely un-processable commit, which earns one NACK.
             if not is_unprocessable_commit(err):
                 raise
-            reconciled = _reconcile_if_orphaned(
-                client, config_dir, agent_id, group_id, epoch, cipher_suite, headers
+            reconciled = reconcile_if_orphaned(
+                client, config_dir, agent_id, group_id, epoch, headers, carry_unreported
             )
             if reconciled is not None:
-                return MlsSyncResult(epoch=reconciled, processed=processed, evicted=False)
-            _emit_nack(client, group_id, handshake, err, headers)
+                return MlsSyncResult(
+                    epoch=reconciled.epoch,
+                    processed=processed,
+                    evicted=False,
+                    escrow=escrow.merge(reconciled.escrow),
+                    pending_commit=settled,
+                )
+            emit_nack(client, group_id, handshake, err, headers)
+            # A refused peer is a typed outcome, not a quiet stop: the recovery
+            # ladder reads it and climbs to the resync that seats us past it.
+            if isinstance(err, PeerNotAdmittedError):
+                raise
             break
         processed += 1
         # Persist the advance BEFORE ACKing, so a crash mid-ACK never confirms an
         # epoch we did not save locally.
-        group.save()
-        _emit_ack(client, group_id, handshake.id, headers)
-        if not group.is_active():
-            return MlsSyncResult(epoch=epoch, processed=processed, evicted=True)
-
-    return MlsSyncResult(epoch=epoch, processed=processed, evicted=not group.is_active())
-
-
-def _reconcile_if_orphaned(
-    client: Any,
-    config_dir: str,
-    agent_id: str,
-    group_id: str,
-    local_epoch: int,
-    cipher_suite: int | None,
-    headers: dict[str, str],
-) -> int | None:
-    """Re-bootstrap when our own local state, not the commit, is the problem.
-
-    The orphan signal is the server's *confirmed* epoch being below our local
-    one: that can only happen if our own tentative commit was rolled back, since
-    the server cannot serve a confirmed token as high as an epoch we alone hold.
-
-    Returns:
-        The re-bootstrapped epoch, or ``None`` when the state is not orphaned and
-        the caller should NACK the commit instead.
-    """
-    try:
-        confirmed = fetch_group_info(client, group_id, headers).epoch
-    except Exception:
-        # pending_confirmation, or a transport hiccup: we cannot prove the state
-        # is orphaned, so the commit gets the benefit of the doubt and a NACK.
-        logger.debug("MLS orphan check failed for group %s", group_id, exc_info=True)
-        return None
-    if confirmed is None or confirmed >= local_epoch:
-        return None
-    return external_join_mls_group(
-        ExternalJoin(
-            client=client,
-            config_dir=config_dir,
-            agent_id=agent_id,
-            group_id=group_id,
-            extra_headers=headers,
-            cipher_suite=cipher_suite,
+        escrow = escrow.advance(
+            drain_escrow(actor, group_id, group, carry_unreported=carry_unreported).report()
         )
+        emit_ack(client, group_id, handshake.id, headers)
+        if not group.is_active():
+            return MlsSyncResult(
+                epoch=epoch,
+                processed=processed,
+                evicted=True,
+                escrow=escrow,
+                pending_commit=settled,
+            )
+
+    return _idle(
+        config_dir, agent_id, group_id, group, escrow, carry_unreported, settled, processed
     )
 
 
-def _emit_ack(client: Any, group_id: str, object_id: str, headers: dict[str, str]) -> None:
-    """Fire-and-forget ACK; a failed ACK must never fail the sync."""
-    try:
-        mls_ack(client, group_id, object_id, headers)
-    except Exception:
-        # Best-effort: the commit still confirms once any peer ACKs.
-        logger.debug("MLS ack failed for group %s", group_id, exc_info=True)
-
-
-def _emit_nack(
-    client: Any,
+def _idle(
+    config_dir: str,
+    agent_id: str,
     group_id: str,
-    handshake: MlsHandshake,
-    err: BaseException,
-    headers: dict[str, str],
-) -> None:
-    """Fire-and-forget NACK; a failed NACK must never fail the sync."""
-    try:
-        mls_nack(client, group_id, handshake, str(err), headers)
-    except Exception:
-        # Best-effort: a timeout-based rollback still self-heals the group.
-        logger.debug("MLS nack failed for group %s", group_id, exc_info=True)
+    group: Any,
+    escrow: EscrowReport,
+    carry_unreported: bool,
+    settled: PendingCommitSettlement | None,
+    processed: int = 0,
+) -> MlsSyncResult:
+    """The result of a sync that applied what it was going to.
+
+    An idle sync drains nothing, so it takes the news of a background loss itself.
+    """
+    if carry_unreported:
+        escrow = escrow.merge(EscrowReport(gaps=take_unreported(config_dir, agent_id, group_id)))
+    return MlsSyncResult(
+        epoch=group.epoch(),
+        processed=processed,
+        evicted=not group.is_active(),
+        escrow=escrow,
+        pending_commit=settled,
+    )

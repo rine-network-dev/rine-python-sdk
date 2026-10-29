@@ -21,12 +21,15 @@ from typing import TYPE_CHECKING
 
 from rine._crypto.wallet import load_wallet_key
 from rine.x402.assets import requirement_canonical_amount
+from rine.x402.errors import X402Error, X402ErrorCode
 from rine.x402.journal import read_daily_spent, reserve_spend
-from rine.x402.messages import X402Message, payment_message
+from rine.x402.messages import X402Message, parse_x402_payload, payment_message
 from rine.x402.pay import build_payment_payload, select_requirement
 from rine.x402.policy import is_auto_payable, load_policy
+from rine.x402.sender_guard import require_payable
 
 if TYPE_CHECKING:
+    from rine.types import DecryptedMessage
     from rine.x402.types import PaymentRequired, PaymentRequirements
 
 
@@ -44,11 +47,33 @@ class PreparedPayment:
     auto_payable: bool
 
 
+def _require_bound_to_quote(
+    quote: DecryptedMessage, payment_required: PaymentRequired, message_id: str | None
+) -> None:
+    """Refuse unless ``payment_required`` and ``message_id`` come from ``quote`` itself.
+
+    The sender gate vouches for ``quote``'s body only, so a requirement or a quote
+    reference taken from anywhere else would be signed under the authority of a
+    quote that never said it.
+    """
+    if message_id is not None and message_id != str(quote.id):
+        raise X402Error(
+            X402ErrorCode.REQUIREMENT_MISMATCH,
+            f"message_id {message_id} is not the quote {quote.id} being paid",
+        )
+    if quote.plaintext is None or parse_x402_payload(quote.plaintext) != payment_required:
+        raise X402Error(
+            X402ErrorCode.REQUIREMENT_MISMATCH,
+            f"The payment requirement is not the one carried by quote {quote.id}",
+        )
+
+
 def prepare_payment(
     config_dir: str,
     agent_id: str,
     payment_required: PaymentRequired,
     *,
+    quote: DecryptedMessage,
     message_id: str | None = None,
     force: bool = False,
     now: int | None = None,
@@ -64,6 +89,14 @@ def prepare_payment(
     daily journal atomically under a cross-process lock — so the budget is reserved
     at signing, before transmit, and the debit stands regardless of send outcome.
 
+    ``quote`` is the received ``payment_required`` message ``payment_required`` was
+    parsed from. It is refused unless its sender is ``verified``
+    (:func:`rine.x402.sender_guard.require_payable`), before the wallet or the policy
+    is touched, with ``inauthentic-sender`` for a quote its sender did not sign and the
+    retryable ``sender-unverifiable`` when the check could not run: a hostile server can
+    forge a quote under any agent while that agent's key cannot be read, and the payer
+    would sign to its ``payTo``.
+
     ``message_id`` (the received ``payment_required`` message id) makes the debit
     idempotent per day: a second prepare for the same id raises ``already-paid``
     unless ``force=True``. It is ALSO stamped into the signed payload's
@@ -78,6 +111,8 @@ def prepare_payment(
     can emit a fully-sealed ``rine.v1.x402_payment`` (no cleartext status marker),
     matching the payer control the TS SDK's ``fulfill``/``sendReceipt`` expose.
     """
+    require_payable(quote)
+    _require_bound_to_quote(quote, payment_required, message_id)
     policy = load_policy(config_dir, agent_id)
     daily_spent = read_daily_spent(config_dir, agent_id, now)
     requirement = select_requirement(payment_required, policy, daily_spent)

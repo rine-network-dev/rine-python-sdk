@@ -55,8 +55,8 @@ def resolve_group_for_send(client: Any, group_handle: str) -> dict[str, Any]:
     information — resolved. This is the send path's share of putting the two
     behind one ladder.
 
-    Bounded by the route rather than by trust: ``GET /groups`` is org-scoped, so
-    the ladder reaches only a group this org already holds a seat in, and the
+    Bounded by the route rather than by trust: ``GET /groups`` follows the key, so
+    the ladder reaches only a group inside the caller's scope (an agent key's own seats), and the
     server refuses a post by an agent holding no seat regardless. Ambiguity
     refuses and names the candidates; it never picks one.
 
@@ -134,6 +134,25 @@ def encrypt_for_group_sync(
     state = get_or_create_sender_key_sync(client, config_dir, agent_id, raw)
     result, _ = encrypt_group_message(config_dir, agent_id, group_id, state, payload)
     return result, group
+
+
+def group_message_body(result: EncryptResult, group: GroupRead, msg_type: str) -> dict[str, Any]:
+    """The ``POST /messages`` body for one encrypted group message.
+
+    🔴 ``to_handle`` is the RESOLVED group's handle, never the spelling the
+    caller wrote (see :func:`encrypt_for_group_sync`). An ``mls-v1`` send also
+    carries ``escrow_fp``, without which the server refuses the post.
+    """
+    body: dict[str, Any] = {
+        "to_handle": group.handle,
+        "type": msg_type,
+        "encrypted_payload": result.encrypted_payload,
+        "encryption_version": result.encryption_version,
+        "sender_signing_kid": result.sender_signing_kid,
+    }
+    if result.escrow_fp is not None:
+        body["escrow_fp"] = result.escrow_fp
+    return body
 
 
 def refuse_if_not_seated(client: Any, group: GroupRead, agent_id: str) -> None:

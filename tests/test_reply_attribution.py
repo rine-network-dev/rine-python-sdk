@@ -61,7 +61,7 @@ def _mock_original(from_agent_id: str, to_agent_id: str):
                 "to_agent_id": to_agent_id,
                 "type": "rine.v1.task_request",
                 "encrypted_payload": "x",
-                "encryption_version": "hpke-v1",
+                "encryption_version": "hpke-hybrid-v2",
                 "created_at": "2024-01-01T00:00:00Z",
             },
         )

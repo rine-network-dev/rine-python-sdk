@@ -10,8 +10,7 @@ That last clause is the point. The contract offers a ``GroupFetcher`` protocol
 or a pure ``_ladder_over(groups, ref)`` helper as the two ways to reach one
 implementation. Neither reaches far enough: a protocol whose methods are
 ``async def`` cannot be satisfied by the sync client, and a pure helper over an
-already-fetched list leaves the RUNG ORDER — ask ``?handle=`` first, list the
-org's groups only if it answered nothing — behind in each client, which is
+already-fetched list leaves the RUNG ORDER — ask ``?handle=`` first, list the groups the key can see only if it answered nothing — behind in each client, which is
 exactly the half that drifted (the local-part fallback shipped to the async
 client and had to be re-derived for the sync one). Yielding the read moves the
 order into the shared body too.
@@ -39,7 +38,7 @@ _T = TypeVar("_T")
 
 @dataclass(frozen=True, slots=True)
 class OwnGroups:
-    """Ask for ``GET /groups`` — every group this org is seated in."""
+    """Ask for ``GET /groups`` — every group the key can see."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +74,7 @@ def group_read_refused(error: RineApiError) -> bool:
     🔴 **404 and 403 answer the same, and that is a disclosure rule rather than
     a simplification.** The route 404s an id no group carries and 403s one
     belonging to an org this caller is neither owner of nor seated in
-    (``has_read_access``, ``src/rine/api/group_helpers.py``). Separating them
+    (``has_read_access``, ``src/rine/api/group_scope.py``). Separating them
     would tell a stranger which unknown ids EXIST, which is the non-member
     lookup this stack refuses to offer — so both become ``None`` and one refusal
     is composed for both.
@@ -160,7 +159,7 @@ def refuse_a_substituted_group(asked: str, answered: str | None) -> None:
 
 @dataclass(frozen=True, slots=True)
 class SeatedByHandle:
-    """Ask for ``GET /groups?handle=`` — an exact, org-scoped handle match.
+    """Ask for ``GET /groups?handle=`` — an exact, key-scoped handle match.
 
     Answered with the ROW, not the id. The filter returns a whole group and the
     ladder needs the handle out of it: a rung that answered with an id alone

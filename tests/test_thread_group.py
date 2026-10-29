@@ -338,19 +338,15 @@ class TestABlankReferenceIsNoReference:
         # this file exists to stop. ``rine-core``'s ``referenceGiven`` trims and
         # treats the result as absent when empty; ``blank_as_absent`` is that
         # function, in Python.
-        import pathlib
-
         from rine.thread_words import blank_as_absent
+        from tests._twin import core_source
 
         assert blank_as_absent("") is None
         assert blank_as_absent("   ") is None
         assert blank_as_absent(None) is None
         assert blank_as_absent(" #ops@org ") == "#ops@org"
 
-        ts = pathlib.Path(__file__).resolve().parents[2] / "rine-core/src/thread-ref.ts"
-        if not ts.is_file():
-            pytest.skip("rine-core not present — SDK tested outside the monorepo")
-        assert "trim()" in ts.read_text(), (
+        assert "trim()" in core_source("thread-ref.ts"), (
             "rine-core no longer trims a reference — the two stacks now disagree "
             "about what an empty string means"
         )

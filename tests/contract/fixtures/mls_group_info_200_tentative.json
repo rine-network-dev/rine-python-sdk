@@ -1,0 +1,11 @@
+{
+  "body": {
+    "confirmed_epoch": 1,
+    "epoch": 1,
+    "group_info": "Z3JvdXAtaW5mby1ibG9i",
+    "latch_epoch": 2
+  },
+  "endpoint": "GET /groups/{group_id}/mls/group-info",
+  "scenario": "latch one ahead of confirmed",
+  "status": 200
+}

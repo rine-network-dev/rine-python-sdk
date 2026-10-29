@@ -42,6 +42,8 @@ from rine._mls.key_packages import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from rine._mls.heartbeat import MlsActor
 
 
@@ -72,26 +74,18 @@ genuine rescue of an agent that got wedged twice.
 """
 
 
-def reset_key_package_rescue_gate() -> None:
-    """Forget every rescue. Test-only: a process boundary is what clears it in life."""
-    _rescued_this_process.clear()
-
-
 def _server_key_package_count(actor: MlsActor) -> int | None:
     """How many unconsumed key packages the server holds, or None if it will not say.
 
-    🔴 ``None`` is *no answer*, and the caller must answer it with **today's
-    behaviour** — not with a number. Both ways of turning it into one are wrong,
-    and every server deployed right now returns it. Read as *nothing to mint*,
-    the rescue becomes a no-op against the whole installed base, so the agent it
-    exists for stays un-addable. Read as *the pool is empty*, it mints a full
+    🔴 ``None`` is *no answer*, never a number. Read as *nothing to mint* the
+    rescue becomes a no-op against the whole installed base, so the agent it
+    exists for stays un-addable; read as *the pool is empty* it mints a full
     batch with no floor in front of it, which is the unbounded loop this route
-    was added to close. So the absence routes to :data:`_rescued_this_process`
-    instead, which is what the code did before this route existed.
+    was added to close. So the recovery rescue routes the absence to
+    :data:`_rescued_this_process`, and a maintenance caller publishes nothing.
 
     Any other failure is ``None`` too: whatever refused this read refuses the
-    upload behind it, so the fallback costs one round trip and reproduces
-    today's report. The shape is checked rather than trusted, and ``bool`` is
+    upload behind it. The shape is checked rather than trusted, and ``bool`` is
     excluded because Python would otherwise let ``True`` through as 1.
     """
     try:
@@ -135,35 +129,79 @@ def top_up_key_packages(actor: MlsActor) -> KeyPackageTopUp:
     Returns:
         Which arm this was, and how many packages the server stored.
     """
-    key = (actor.config_dir, actor.agent_id)
-    try:
+
+    def step(key: tuple[str, str]) -> KeyPackageTopUp:
         status = ensure_mls_key_packages(actor.client, actor.config_dir, actor.agent_id)
         if status.cap_reached:
             return KeyPackageTopUp(outcome="cap-reached")
         if status.published > 0:
             return KeyPackageTopUp(outcome="topped-up", published=status.published)
+        return _mint_server_shortfall(actor, key)
 
+    return _guard_top_up(actor, step)
+
+
+def top_up_from_server_count(actor: MlsActor) -> KeyPackageTopUp:
+    """Step 2 of :func:`top_up_key_packages` alone, for a caller that ran step 1 itself.
+
+    The welcome pass is that caller. A Welcome it sets aside unopened keeps the
+    private half it was sealed to, so the local mirror reads full while the server
+    pool may be empty — the one state the local count cannot see. A count the
+    server will not give is no known shortfall, so unlike the recovery top-up this
+    publishes nothing and leaves the additive rescue to
+    :func:`top_up_key_packages`. Same cap and failure arms as the full top-up;
+    raises nothing.
+
+    Args:
+        actor: Who is acting, and through which client.
+
+    Returns:
+        Which arm this was, and how many packages the server stored.
+    """
+
+    def step(_key: tuple[str, str]) -> KeyPackageTopUp:
         held = _server_key_package_count(actor)
         if held is None:
-            if key in _rescued_this_process:
-                return KeyPackageTopUp(outcome="healthy")
-            _rescued_this_process.add(key)
-            count = KEY_PACKAGE_TARGET
-        else:
-            count = KEY_PACKAGE_TARGET - held
-            # At or above target the pool really was healthy, and this is the arm
-            # that makes a looped ``group sync`` cost nothing: no mint, no upload,
-            # and no process boundary to reset.
-            if count <= 0:
-                return KeyPackageTopUp(outcome="healthy")
-
-        stored = publish_mls_key_packages(actor.client, actor.config_dir, actor.agent_id, count)
-        # ``stored`` and not the batch size: an upload the server answered by
-        # storing none of it is not a top-up, and a sentence that says it topped
-        # the pool up by zero is an affirmative claim beside its own refutation.
-        if stored == 0:
             return KeyPackageTopUp(outcome="healthy")
-        return KeyPackageTopUp(outcome="topped-up", published=stored)
+        return _publish_batch(actor, KEY_PACKAGE_TARGET - held)
+
+    return _guard_top_up(actor, step)
+
+
+def _mint_server_shortfall(actor: MlsActor, key: tuple[str, str]) -> KeyPackageTopUp:
+    """Ask the server what it holds and publish the shortfall against the target."""
+    held = _server_key_package_count(actor)
+    if held is None:
+        if key in _rescued_this_process:
+            return KeyPackageTopUp(outcome="healthy")
+        _rescued_this_process.add(key)
+        return _publish_batch(actor, KEY_PACKAGE_TARGET)
+    return _publish_batch(actor, KEY_PACKAGE_TARGET - held)
+
+
+def _publish_batch(actor: MlsActor, count: int) -> KeyPackageTopUp:
+    """Publish ``count`` key packages, or report the pool healthy when there is no gap."""
+    # At or above target the pool really was healthy, and this is the arm
+    # that makes a looped ``group sync`` cost nothing: no mint, no upload,
+    # and no process boundary to reset.
+    if count <= 0:
+        return KeyPackageTopUp(outcome="healthy")
+    stored = publish_mls_key_packages(actor.client, actor.config_dir, actor.agent_id, count)
+    # ``stored`` and not the batch size: an upload the server answered by
+    # storing none of it is not a top-up, and a sentence that says it topped
+    # the pool up by zero is an affirmative claim beside its own refutation.
+    if stored == 0:
+        return KeyPackageTopUp(outcome="healthy")
+    return KeyPackageTopUp(outcome="topped-up", published=stored)
+
+
+def _guard_top_up(
+    actor: MlsActor, step: Callable[[tuple[str, str]], KeyPackageTopUp]
+) -> KeyPackageTopUp:
+    """Run one top-up step under the shared cap, failure and rescue-floor handling."""
+    key = (actor.config_dir, actor.agent_id)
+    try:
+        return step(key)
     except Exception as err:
         # The cap keeps its stamp: the server has answered, definitively, that
         # it will not hold more for this agent, and another batch would be ten
@@ -176,4 +214,7 @@ def top_up_key_packages(actor: MlsActor) -> KeyPackageTopUp:
         return KeyPackageTopUp(outcome="failed", detail=str(err))
 
 
-__all__ = ["reset_key_package_rescue_gate", "top_up_key_packages"]
+__all__ = [
+    "top_up_from_server_count",
+    "top_up_key_packages",
+]

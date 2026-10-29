@@ -13,27 +13,33 @@ something once it is held against a fact the sender could not choose.
 
 from __future__ import annotations
 
-import hashlib
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-import httpx
-
-from rine._crypto._agent_keys import get_agent_keys_async, get_agent_keys_sync
-from rine._crypto.keys import agent_id_from_kid, jwk_to_public_key
-from rine._crypto.sign import verify_signature
-from rine._logging import logger
-from rine.errors import (
-    APIConnectionError,
-    APITimeoutError,
-    CryptoError,
-    RineApiError,
-    SenderMismatchError,
-    SignatureVerificationError,
+from rine._crypto._agent_keys import (
+    get_agent_keys_async,
+    get_agent_keys_sync,
 )
-from rine.types import SenderKeyChange, VerificationStatus
+from rine._crypto._sender_verdict import (
+    KEY_READ_ERRORS,
+    GenStep,
+    SenderVerification,
+    failure_verdict,
+    gen_step,
+    is_authenticity_failure,
+    rotation_verdict,
+    sender_matches,
+    signer_ref,
+    signing_key_fingerprint,
+    verdict,
+    verify_with_keys,
+)
+from rine.errors import SenderMismatchError, SignatureVerificationError
+from rine.types import VerificationStatus
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
+    from rine._crypto.sign import SigScope
     from rine._http import AsyncHttpClient, SyncHttpClient
 
 __all__ = [
@@ -42,62 +48,13 @@ __all__ = [
     "is_authenticity_failure",
     "refuse_if_inauthentic",
     "refuse_if_sender_differs",
+    "refuse_if_state_not_owned_by",
     "signing_key_fingerprint",
     "verify_envelope_sender_async",
     "verify_envelope_sender_sync",
 ]
 
 _SENDER_MISMATCH_DETAIL = "Envelope sender does not match the message sender"
-
-
-@dataclass(frozen=True)
-class SenderVerification:
-    """The outcome of verifying one envelope's sender signature.
-
-    ``key_changed`` is set only when the rotation refetch returned a *different*
-    signing key, whichever way the re-verification then fell.
-    """
-
-    verified: bool
-    verification_status: VerificationStatus
-    key_changed: SenderKeyChange | None = None
-
-
-def signing_key_fingerprint(keys_resp: dict[str, Any]) -> str:
-    """Return a stable short identity for a published signing key.
-
-    Hex SHA-256 over the raw 32-byte Ed25519 key, so one key fingerprints
-    identically on every rine client whatever language it is written in.
-
-    Args:
-        keys_resp: A raw ``/agents/{id}/keys`` response.
-
-    Returns:
-        Lowercase hex digest.
-    """
-    raw = jwk_to_public_key(keys_resp["signing_public_key"], expected_crv="Ed25519")
-    return hashlib.sha256(raw).hexdigest()
-
-
-def _verify_with_keys(keys_resp: dict[str, Any], payload: bytes, signature: bytes) -> bool:
-    """Verify a signature against the signing key in a keys response."""
-    sender_pk = jwk_to_public_key(keys_resp["signing_public_key"], expected_crv="Ed25519")
-    return verify_signature(sender_pk, payload, signature)
-
-
-def _verdict(verified: bool) -> SenderVerification:
-    """Wrap a plain verify outcome, with no key change to report."""
-    return SenderVerification(verified, "verified" if verified else "invalid")
-
-
-def is_authenticity_failure(status: VerificationStatus) -> bool:
-    """True when the status is a finding against the message, not a gap.
-
-    ``"invalid"`` and ``"sender-mismatch"`` are both refusals: one says these
-    bytes were not signed, the other says they were signed by somebody other
-    than the sender. ``"unverifiable"`` is neither — the key could not be read.
-    """
-    return status in ("invalid", "sender-mismatch")
 
 
 def refuse_if_inauthentic(verification: SenderVerification) -> None:
@@ -135,61 +92,34 @@ def refuse_if_sender_differs(sender_kid: str, expected_sender_agent_id: str) -> 
     Raises:
         SenderMismatchError: The key id names a different agent.
     """
-    try:
-        matches = _sender_matches(agent_id_from_kid(sender_kid), expected_sender_agent_id)
-    except CryptoError:
-        matches = False
-    if not matches:
+    if signer_ref(sender_kid, expected_sender_agent_id) is None:
         raise SenderMismatchError(_SENDER_MISMATCH_DETAIL)
 
 
-def _sender_matches(agent_id: str, expected_sender_agent_id: str) -> bool:
-    """Compare an envelope's signer to the server-authenticated sender.
+def refuse_if_state_not_owned_by(state_owner_agent_id: str, expected_sender_agent_id: str) -> None:
+    """Refuse a sender-key state that its owner did not file for this message's sender.
 
-    Both sides are server-issued UUIDs, so they are compared trimmed and
-    lowercased: a caller that carries the id through a surface which upper-cases
-    it must not have a legitimate message refused over spelling.
+    Every member of an open group holds every member's chain key, so a message
+    can open under a key that is not its signer's. Whoever posts it is verified
+    as itself, but the ratchet it would advance and persist is another agent's:
+    that would spend or skip the owner's next indexes. A state belongs only to
+    the sender the server authenticated for the message that opened it.
+
+    Raises:
+        SenderMismatchError: The state is another agent's.
     """
-    return agent_id.strip().lower() == expected_sender_agent_id.strip().lower()
-
-
-def _rotation_verdict(
-    agent_id: str,
-    cached: dict[str, Any],
-    fresh: dict[str, Any],
-    payload: bytes,
-    signature: bytes,
-) -> SenderVerification:
-    """Decide the outcome of a rotation refetch, and report a real rotation.
-
-    A refetch that returns the SAME key is not re-verified — same key, same
-    payload, same signature, same verdict — which keeps the one-refetch budget
-    explicit rather than incidental. A different key is re-verified and reported
-    either way: the signal is about the key, not about the outcome, and a
-    rotation that does not rescue the signature is the more interesting one.
-    """
-    previous = signing_key_fingerprint(cached)
-    current = signing_key_fingerprint(fresh)
-    if previous == current:
-        return _verdict(False)
-    verified = _verify_with_keys(fresh, payload, signature)
-    return SenderVerification(
-        verified,
-        "verified" if verified else "invalid",
-        SenderKeyChange(
-            agent_id=agent_id,
-            previous_fingerprint=previous,
-            current_fingerprint=current,
-        ),
-    )
+    if not sender_matches(state_owner_agent_id, expected_sender_agent_id):
+        raise SenderMismatchError(_SENDER_MISMATCH_DETAIL)
 
 
 def verify_envelope_sender_sync(
     kid: str,
     payload: bytes,
     signature: bytes,
+    scope: SigScope,
     client: SyncHttpClient,
     expected_sender_agent_id: str,
+    created_at: datetime | None = None,
 ) -> SenderVerification:
     """Verify an envelope's sender signature synchronously.
 
@@ -209,38 +139,60 @@ def verify_envelope_sender_sync(
         kid: The envelope's key id, naming the sending agent.
         payload: The signed bytes.
         signature: The envelope's Ed25519 signature.
+        scope: The recipient agent or group the signature must be addressed to.
         client: HTTP client used to read the sender's published keys.
         expected_sender_agent_id: The sender the server authenticated for this
             message (its ``from_agent_id``). Never a value read off the envelope
             or the payload, which the sender chooses.
+        created_at: The message's server ``created_at``. A signature under a generation
+            the sender has since rotated away verifies only for a row stamped at or before
+            that generation's ``superseded_at``, and one by a revoked agent only for a
+            row stamped at or before its ``revoked_at``; without it such a signature
+            is ``"invalid"``.
 
     Returns:
         The verdict, carrying a key change when the refetch found one.
     """
     try:
-        agent_id = agent_id_from_kid(kid)
-        if not _sender_matches(agent_id, expected_sender_agent_id):
+        ref = signer_ref(kid, expected_sender_agent_id)
+        if ref is None:
             return SenderVerification(False, "sender-mismatch")
+        agent_id = ref.agent_id
         keys, from_cache = get_agent_keys_sync(client, agent_id)
-        verified = _verify_with_keys(keys, payload, signature)
+        step = gen_step(ref.key_gen, keys, from_cache)
+        if step is GenStep.REFRESH:
+            fresh, _ = get_agent_keys_sync(client, agent_id, bypass=True)
+            step = gen_step(ref.key_gen, fresh, False)
+            if step is GenStep.VERIFY:
+                return rotation_verdict(
+                    agent_id, keys, fresh, scope, payload, signature, created_at
+                )
+            keys, from_cache = fresh, False
+        if step is GenStep.INVALID:
+            return verdict(False)
+        historical = step is GenStep.HISTORY
+        if historical:
+            keys, _ = get_agent_keys_sync(client, agent_id, gen=ref.key_gen)
+            from_cache = False
+        verified = verify_with_keys(
+            keys, scope, payload, signature, created_at, historical=historical
+        )
         if verified or not from_cache:
-            return _verdict(verified)
+            return verdict(verified)
         fresh, _ = get_agent_keys_sync(client, agent_id, bypass=True)
-        return _rotation_verdict(agent_id, keys, fresh, payload, signature)
-    except (KeyError, ValueError, CryptoError):
-        logger.debug("Could not verify sender %s (malformed key)", kid, exc_info=True)
-        return SenderVerification(False, "unverifiable")
-    except (httpx.HTTPError, APIConnectionError, APITimeoutError, RineApiError):
-        logger.debug("Could not verify sender %s (network)", kid, exc_info=True)
-        return SenderVerification(False, "unverifiable")
+        return rotation_verdict(agent_id, keys, fresh, scope, payload, signature, created_at)
+    except KEY_READ_ERRORS as error:
+        return failure_verdict(kid, error)
 
 
 async def verify_envelope_sender_async(
     kid: str,
     payload: bytes,
     signature: bytes,
+    scope: SigScope,
     client: AsyncHttpClient,
     expected_sender_agent_id: str,
+    created_at: datetime | None = None,
 ) -> SenderVerification:
     """Verify an envelope's sender signature asynchronously.
 
@@ -252,26 +204,42 @@ async def verify_envelope_sender_async(
         kid: The envelope's key id, naming the sending agent.
         payload: The signed bytes.
         signature: The envelope's Ed25519 signature.
+        scope: The recipient agent or group the signature must be addressed to.
         client: Async HTTP client used to read the sender's published keys.
         expected_sender_agent_id: The sender the server authenticated for this
             message (its ``from_agent_id``).
+        created_at: The message's server ``created_at`` (see the sync twin).
 
     Returns:
         The verdict, carrying a key change when the refetch found one.
     """
     try:
-        agent_id = agent_id_from_kid(kid)
-        if not _sender_matches(agent_id, expected_sender_agent_id):
+        ref = signer_ref(kid, expected_sender_agent_id)
+        if ref is None:
             return SenderVerification(False, "sender-mismatch")
+        agent_id = ref.agent_id
         keys, from_cache = await get_agent_keys_async(client, agent_id)
-        verified = _verify_with_keys(keys, payload, signature)
+        step = gen_step(ref.key_gen, keys, from_cache)
+        if step is GenStep.REFRESH:
+            fresh, _ = await get_agent_keys_async(client, agent_id, bypass=True)
+            step = gen_step(ref.key_gen, fresh, False)
+            if step is GenStep.VERIFY:
+                return rotation_verdict(
+                    agent_id, keys, fresh, scope, payload, signature, created_at
+                )
+            keys, from_cache = fresh, False
+        if step is GenStep.INVALID:
+            return verdict(False)
+        historical = step is GenStep.HISTORY
+        if historical:
+            keys, _ = await get_agent_keys_async(client, agent_id, gen=ref.key_gen)
+            from_cache = False
+        verified = verify_with_keys(
+            keys, scope, payload, signature, created_at, historical=historical
+        )
         if verified or not from_cache:
-            return _verdict(verified)
+            return verdict(verified)
         fresh, _ = await get_agent_keys_async(client, agent_id, bypass=True)
-        return _rotation_verdict(agent_id, keys, fresh, payload, signature)
-    except (KeyError, ValueError, CryptoError):
-        logger.debug("Could not verify sender %s (malformed key)", kid, exc_info=True)
-        return SenderVerification(False, "unverifiable")
-    except (httpx.HTTPError, APIConnectionError, APITimeoutError, RineApiError):
-        logger.debug("Could not verify sender %s (network)", kid, exc_info=True)
-        return SenderVerification(False, "unverifiable")
+        return rotation_verdict(agent_id, keys, fresh, scope, payload, signature, created_at)
+    except KEY_READ_ERRORS as error:
+        return failure_verdict(kid, error)

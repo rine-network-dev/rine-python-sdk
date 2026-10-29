@@ -24,14 +24,12 @@ from rine._mls.api import (
     claim_key_packages,
     fetch_group_info,
     fetch_welcomes,
-    mls_commit,
     mls_init,
     read_group,
     upload_key_packages,
 )
 from rine._mls.binding import (
     APP_MESSAGE_TAG,
-    CLASSICAL_CIPHER_SUITE,
     DEFAULT_CIPHER_SUITE,
     EPOCH_RETENTION_ENV,
     KEY_PACKAGE_LOW_WATER,
@@ -41,7 +39,8 @@ from rine._mls.binding import (
     epoch_retention_limit,
     open_mls_client,
 )
-from rine._mls.commit import post_mls_commit
+from rine._mls.commit import post_mls_commit, post_mls_commit_bundle
+from rine._mls.commit_wire import MlsCommitAccepted, mls_commit
 from rine._mls.external_join import ExternalJoin, external_join_mls_group
 from rine._mls.failures import is_recoverable_mls_failure, is_unprocessable_commit
 from rine._mls.founding import claim_founding_key_packages, mls_founding_batch_sizes
@@ -56,14 +55,12 @@ from rine._mls.heartbeat import (
 )
 from rine._mls.join import (
     install_mls_state,
-    install_mls_state_by_id,
     join_mls_state,
     join_mls_state_async,
 )
+from rine._mls.key_package_cutover import MlsCutoverResult, drain_and_republish_mls_key_packages
 from rine._mls.key_packages import (
-    MlsCutoverResult,
     MlsKeyPackageStatus,
-    drain_and_republish_mls_key_packages,
     ensure_mls_key_packages,
     is_inventory_full,
     publish_mls_key_packages,
@@ -79,9 +76,16 @@ from rine._mls.resync import (
     MlsRecoveryRung,
     recover_mls_group,
 )
+from rine._mls.seat_sweep import (
+    KeyPackageRotation,
+    RotationSettlement,
+    self_update_stale_leaves,
+    settle_rotation,
+)
+from rine._mls.self_update import self_update_group
 from rine._mls.sync import MlsSyncResult, sync_mls_group
 from rine._mls.sync_api import MlsHandshake, fetch_handshakes, mls_ack, mls_nack
-from rine._mls.topup import reset_key_package_rescue_gate, top_up_key_packages
+from rine._mls.topup import top_up_key_packages
 from rine._mls.tree import GroupTree, read_group_tree
 from rine._mls.welcome_guard import MlsWelcomeRefusedError
 from rine._mls.welcomes import MlsWelcomeOutcome, process_mls_welcomes
@@ -91,7 +95,6 @@ __all__ = [
     "APP_MESSAGE_TAG",
     "MLS_HEARTBEAT_MIN_INTERVAL_S",
     "MLS_RESYNC_REQUIRED",
-    "CLASSICAL_CIPHER_SUITE",
     "DEFAULT_CIPHER_SUITE",
     "EPOCH_RETENTION_ENV",
     "KEY_PACKAGE_LOW_WATER",
@@ -104,6 +107,9 @@ __all__ = [
     "MlsAdmissionResult",
     "MlsAdmissionSkipReason",
     "MlsCommit",
+    "KeyPackageRotation",
+    "MlsCommitAccepted",
+    "RotationSettlement",
     "MlsCoreError",
     "MlsCutoverResult",
     "MlsGroupInfo",
@@ -140,7 +146,6 @@ __all__ = [
     "fetch_welcomes",
     "init_mls_group",
     "install_mls_state",
-    "install_mls_state_by_id",
     "is_inventory_full",
     "is_recoverable_mls_failure",
     "is_unprocessable_commit",
@@ -159,13 +164,16 @@ __all__ = [
     "open_mls_client",
     "open_mls_group",
     "post_mls_commit",
+    "post_mls_commit_bundle",
+    "self_update_group",
+    "self_update_stale_leaves",
+    "settle_rotation",
     "orphan_leaves",
     "process_mls_welcomes",
     "publish_mls_key_packages",
     "read_group",
     "read_group_tree",
     "reclaim_orphan_leaves",
-    "reset_key_package_rescue_gate",
     "reset_mls_heartbeat_gate",
     "recover_mls_group",
     "remove_mls_group_member",

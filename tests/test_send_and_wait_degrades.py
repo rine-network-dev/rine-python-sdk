@@ -18,12 +18,9 @@ from __future__ import annotations
 import httpx
 import respx
 
-from rine._crypto.keys import (
-    encryption_public_key_to_jwk,
-    generate_agent_keys,
-    save_agent_keys,
-    signing_public_key_to_jwk,
-)
+from rine._constants import EncryptionVersion
+from rine._crypto.keys import make_kid, save_agent_keys
+from rine.testing import WORLD
 
 API = "https://rine.network"
 OTHER_AGENT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -65,19 +62,9 @@ def _mock_send_and_wait_with_an_unopenable_reply(tmp_config_dir: str, agent_id: 
         return_value=httpx.Response(200, json={"aliases": [f"{API}/agents/{OTHER_AGENT_ID}"]})
     )
 
-    peer_keys = generate_agent_keys()
-    save_agent_keys(tmp_config_dir, OTHER_AGENT_ID, peer_keys)
+    save_agent_keys(tmp_config_dir, OTHER_AGENT_ID, WORLD.keys(OTHER_AGENT_ID))
     respx.get(f"{API}/agents/{OTHER_AGENT_ID}/keys").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "agent_id": OTHER_AGENT_ID,
-                "encryption_public_key": encryption_public_key_to_jwk(
-                    peer_keys.encryption.public_key
-                ),
-                "signing_public_key": signing_public_key_to_jwk(peer_keys.signing.public_key),
-            },
-        )
+        return_value=httpx.Response(200, json=WORLD.keys_response(OTHER_AGENT_ID))
     )
 
     def _row(message_id: str, sender: str, recipient: str) -> dict:
@@ -88,8 +75,8 @@ def _mock_send_and_wait_with_an_unopenable_reply(tmp_config_dir: str, agent_id: 
             "to_agent_id": recipient,
             "type": TYPE,
             "encrypted_payload": "bm90LWFuLWVudmVsb3Bl",
-            "encryption_version": "hpke-v1",
-            "sender_signing_kid": f"rine:{sender}",
+            "encryption_version": EncryptionVersion.HPKE_HYBRID_V2,
+            "sender_signing_kid": make_kid(sender, 0),
             "created_at": "2024-01-01T00:00:00Z",
         }
 

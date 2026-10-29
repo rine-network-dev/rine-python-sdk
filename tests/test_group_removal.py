@@ -77,8 +77,8 @@ class TestRemovalMessageTellsTheGroupTypesApart:
         )
 
         assert "epoch 47" in text
-        assert "carries the signing key they publish now" in text
-        assert "rotated their signing key" in text
+        assert "no leaf in the ratchet tree is theirs" in text
+        assert "rotated" not in text
         assert "took their ratchet-tree leaf" not in text
 
     def test_a_kick_from_an_open_group_says_what_actually_bounds_their_reach(self):

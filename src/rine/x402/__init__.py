@@ -28,7 +28,7 @@ from rine.x402.assets import (
     parse_units,
     requirement_canonical_amount,
 )
-from rine.x402.errors import X402Error, X402ErrorCode
+from rine.x402.errors import CorruptSpendJournalError, X402Error, X402ErrorCode
 from rine.x402.extract import extract_payment_payload
 from rine.x402.facilitator import (
     FACILITATOR_PRESETS,
@@ -72,6 +72,7 @@ from rine.x402.policy import (
 )
 from rine.x402.quote_ref import ReferencedQuote, load_referenced_quote
 from rine.x402.reconcile import reconcile_payment
+from rine.x402.sender_guard import require_payable
 from rine.x402.types import (
     X402_METADATA_KEY,
     X402_QUOTE_REF_KEY,
@@ -100,6 +101,7 @@ __all__ = [
     "X402_VERSION",
     "X402_SUPPORTED_SCHEMES",
     # Errors
+    "CorruptSpendJournalError",
     "X402Error",
     "X402ErrorCode",
     # Assets
@@ -136,6 +138,7 @@ __all__ = [
     # Flow helpers
     "PreparedPayment",
     "prepare_payment",
+    "require_payable",
     # Payee orchestrator (reconcile → verify → settle → receipt)
     "extract_payment_payload",
     "fulfill",

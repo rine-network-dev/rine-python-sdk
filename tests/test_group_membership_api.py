@@ -495,11 +495,10 @@ class TestRemovingAMember:
         assert calls[1].url.params["mls_removal_epoch"] == "11"
         assert result.mls_removal_epoch == 11
         assert result.mls_removed_leaf is False
-        # The narrow, true thing: ``removed_leaf=False`` is "no leaf carries the
-        # key they publish now", not "they hold no leaf" — a target that rotated
-        # its signing key is indistinguishable from here and still holds a leaf.
-        assert "carries the signing key they publish now" in result.message
-        assert "rotated their signing key" in result.message
+        # The narrow, true thing: ``removed_leaf=False`` is "no leaf is theirs", and
+        # the message says what kept them out.
+        assert "no leaf in the ratchet tree is theirs" in result.message
+        assert "rotated" not in result.message
         assert "took their ratchet-tree leaf" not in result.message
 
     @respx.mock

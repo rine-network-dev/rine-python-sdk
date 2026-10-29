@@ -26,8 +26,13 @@ from rine._mls import (
     replenish_mls_key_packages,
 )
 from rine._mls.binding import EPOCH_RETENTION_ENV
+from rine._owner import resolve_owner_dir
 from rine.errors import ConfigError, RineApiError
 from rine.format import group_is_mls
+from rine.testing import write_owner
+from tests.identity import echo_created_agent
+
+pytestmark = pytest.mark.usefixtures("mls_escrow_stub")
 
 API = "https://rine.network"
 GROUP_ID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
@@ -44,6 +49,12 @@ _GROUP_PAYLOAD = {
     "mls_pending": False,
     "mls_cipher_suite": None,
 }
+
+
+@pytest.fixture
+def key_is_current(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The drain's pre-check passes: this device holds the agent's published key."""
+    monkeypatch.setattr("rine._mls.key_package_cutover.disk_key_is_current", lambda _actor: True)
 
 
 def _mock_token() -> None:
@@ -148,9 +159,11 @@ class TestKeyPackagePool:
         publish_mls_key_packages(sync_client._http, tmp_config_dir, agent_id)
 
         peer_dir = str(tmp_path / "peer")
-        from rine._crypto.keys import generate_agent_keys, save_agent_keys
+        from rine._crypto.keys import save_agent_keys
+        from rine.testing import WORLD
 
-        save_agent_keys(peer_dir, other_agent_id, generate_agent_keys())
+        save_agent_keys(peer_dir, other_agent_id, WORLD.keys(other_agent_id))
+        save_agent_keys(peer_dir, agent_id, WORLD.keys(agent_id))
         peer = open_mls_client(peer_dir, other_agent_id)
 
         group = peer.create_group_with_members(
@@ -204,6 +217,23 @@ class TestKeyPackagePool:
         assert status.published == 0
 
     @respx.mock
+    def test_ensure_when_server_answers_the_inventory_full_code_is_a_no_op_success(
+        self, sync_client, tmp_config_dir, agent_id
+    ):
+        """The machine code decides, whatever the detail sentence says."""
+        _mock_token()
+        respx.post(f"{API}/agents/{agent_id}/mls/key-packages").mock(
+            return_value=httpx.Response(
+                422, json={"error": "key_package_inventory_full", "detail": "At the cap"}
+            )
+        )
+
+        status = ensure_mls_key_packages(sync_client._http, tmp_config_dir, agent_id)
+
+        assert status.cap_reached is True
+        assert status.published == 0
+
+    @respx.mock
     def test_ensure_when_the_server_rejects_the_upload_raises(
         self, sync_client, tmp_config_dir, agent_id
     ):
@@ -227,6 +257,7 @@ class TestKeyPackagePool:
         replenish_mls_key_packages(sync_client._http, tmp_config_dir, agent_id)
 
     @respx.mock
+    @pytest.mark.usefixtures("key_is_current")
     def test_drain_replaces_every_key_package(self, sync_client, tmp_config_dir, agent_id):
         """The cutover: the old pool goes, a fresh one is published in one step."""
         _mock_token()
@@ -244,6 +275,7 @@ class TestKeyPackagePool:
         assert open_mls_client(tmp_config_dir, agent_id).key_package_count() == KEY_PACKAGE_TARGET
 
     @respx.mock
+    @pytest.mark.usefixtures("key_is_current")
     def test_drain_claims_the_stale_server_pool_out(self, sync_client, tmp_config_dir, agent_id):
         """The stale packages are claimed OUT of the server, not merely
         outnumbered locally. Otherwise a peer claims one, finds it unreadable, and
@@ -445,28 +477,19 @@ class TestGroupCreate:
 
 class TestAgentCreation:
     @respx.mock
-    def test_a_new_agent_is_addable_to_groups_from_birth(self, sync_client, tmp_config_dir):
+    def test_a_new_agent_is_addable_to_groups_from_birth(self, sync_client):
         """Without a published pool the first invite fails 409 "No key packages"."""
-        new_agent_id = "11111111-2222-3333-4444-555555555555"
+        write_owner(resolve_owner_dir())
         _mock_token()
-        respx.post(f"{API}/agents").mock(
-            return_value=httpx.Response(
-                201,
-                json={
-                    "id": new_agent_id,
-                    "name": "fresh",
-                    "handle": "fresh@myorg.rine.network",
-                    "human_oversight": True,
-                    "incoming_policy": "accept_all",
-                    "outgoing_policy": "send_all",
-                    "created_at": "2024-01-01T00:00:00Z",
-                },
-            )
+        created = respx.post(f"{API}/agents").mock(side_effect=echo_created_agent)
+        route = respx.post(url__regex=rf"{API}/agents/[0-9a-f-]{{36}}/mls/key-packages").mock(
+            return_value=httpx.Response(201, json={"stored": KEY_PACKAGE_TARGET})
         )
-        route = _mock_upload(new_agent_id)
 
         sync_client.create_agent("fresh")
 
+        new_agent_id = json.loads(created.calls.last.request.content)["id"]
+        assert route.calls.last.request.url.path == f"/agents/{new_agent_id}/mls/key-packages"
         assert len(_uploaded_packages(route)) == KEY_PACKAGE_TARGET
 
 
@@ -474,6 +497,7 @@ class TestCutover:
     """An agent upgrading from the previous MLS core republishes its pool."""
 
     @respx.mock
+    @pytest.mark.usefixtures("key_is_current")
     def test_client_republish_replaces_the_pool(self, sync_client, tmp_config_dir, agent_id):
         _mock_token()
         route = _mock_upload(agent_id)
@@ -487,6 +511,7 @@ class TestCutover:
         assert old.isdisjoint(set(_uploaded_packages(route, 1)))
 
     @respx.mock
+    @pytest.mark.usefixtures("key_is_current")
     async def test_async_client_republish_replaces_the_pool(
         self, async_client, tmp_config_dir, agent_id
     ):

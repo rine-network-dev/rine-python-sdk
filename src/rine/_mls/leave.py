@@ -41,12 +41,37 @@ the downgrade guard itself, so no leave path can retire state and leave a stale
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from rine._crypto.group_read_cache import delete_group_read_cache
 from rine._crypto.keys import agent_keys_exist
 from rine._mls.binding import open_mls_client
+from rine._mls.escrow_settle import settle_escrow
 from rine._mls.group_access import holds_mls_state, mls_group_id_bytes, note_mls_state_changed
+from rine._mls.heartbeat import MlsActor
 from rine._sender_key_ops import delete_sender_key, sender_key_state_exists
+
+
+def settle_escrow_before_leave(
+    client: Any, config_dir: str, group_id: str, removed_agent_id: str, acting_agent_id: str
+) -> None:
+    """Seal, or set aside, what a self-leave's wipe is about to discard.
+
+    Run BEFORE the server removal, while the leaver is still a member: the exports
+    a deferred drain left in the local state are sealed with the cached escrow key,
+    or the state is parked for the sweep (:mod:`rine._mls.escrow_settle`). It is
+    local and never refuses the leave. Removing somebody else wipes nothing, so it
+    settles nothing.
+
+    Args:
+        client: Sync HTTP client.
+        config_dir: Config directory path.
+        group_id: The rine group UUID the removal targets.
+        removed_agent_id: The member the caller asked to remove.
+        acting_agent_id: The agent the caller acted as.
+    """
+    if removed_agent_id.lower() == acting_agent_id.lower():
+        settle_escrow(MlsActor(client, config_dir, acting_agent_id), group_id)
 
 
 def wipe_mls_state(config_dir: str, agent_id: str, group_id: str) -> None:
@@ -133,4 +158,9 @@ def retire_local_group_state(
     return RetiredGroupState(mls=held_mls, sender_key=held_sender_key)
 
 
-__all__ = ["RetiredGroupState", "retire_local_group_state", "wipe_mls_state"]
+__all__ = [
+    "RetiredGroupState",
+    "retire_local_group_state",
+    "settle_escrow_before_leave",
+    "wipe_mls_state",
+]

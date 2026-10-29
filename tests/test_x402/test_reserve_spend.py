@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+from datetime import datetime
 from uuid import uuid4
 
 import pytest
 
-from rine.x402.errors import X402Error, X402ErrorCode
-from rine.x402.journal import _journal_path, read_daily_spent, reserve_spend
+from rine.x402.errors import CorruptSpendJournalError, X402Error, X402ErrorCode
+from rine.x402.journal import _journal_path, read_daily_spent, record_spend, reserve_spend
 from rine.x402.types import PaymentPolicy
 
 BASE = "eip155:8453"
@@ -26,6 +29,15 @@ def _req(amount: str) -> dict:
         "maxTimeoutSeconds": 60,
         "extra": {"name": "EURC", "version": "2"},
     }
+
+
+def _write_journal(tmp_path, agent_id: str, raw: bytes) -> str:
+    """Write ``raw`` as the agent's journal file and return its path."""
+    path = _journal_path(str(tmp_path), agent_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(raw)
+    return path
 
 
 def _policy(**overrides) -> PaymentPolicy:
@@ -92,10 +104,27 @@ def test_reserve_spend_when_next_utc_day_resets(tmp_path) -> None:
     assert read_daily_spent(str(tmp_path), agent_id, T + 86_400) == 900_000
 
 
+def test_reserve_spend_when_clock_moved_back_a_day_then_cap_and_paid_ids_hold(tmp_path) -> None:
+    """A journal dated tomorrow (clock set back across midnight) still counts."""
+    agent_id = str(uuid4())
+    reserve_spend(
+        str(tmp_path), agent_id, _policy(), _req("300000"), message_id="m1", now_seconds=T
+    )
+    with pytest.raises(X402Error) as exc:
+        reserve_spend(
+            str(tmp_path),
+            agent_id,
+            _policy(),
+            _req("300000"),
+            message_id="m1",
+            now_seconds=T - 86_400,
+        )
+    assert exc.value.code == X402ErrorCode.ALREADY_PAID
+    assert read_daily_spent(str(tmp_path), agent_id, T - 86_400) == 300_000
+
+
 def test_reserve_spend_tolerates_old_v1_journal(tmp_path) -> None:
     """A v1 journal (no paidIds) is read, then upgraded to v2 on the next debit."""
-    from rine.x402.journal import record_spend
-
     agent_id = str(uuid4())
     record_spend(str(tmp_path), agent_id, 300_000, T)  # writes a v1 body, no paidIds
     reserve_spend(
@@ -134,3 +163,84 @@ def test_reserve_spend_when_no_message_id_leaves_paidids_empty(tmp_path) -> None
     agent_id = str(uuid4())
     reserve_spend(str(tmp_path), agent_id, _policy(), _req("300000"), now_seconds=T)
     assert _journal(tmp_path, agent_id)["paidIds"] == []
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        pytest.param('{"day": "2025-02-19", "spent', id="truncated-json"),
+        pytest.param('{"day": "2025-02-19", "spentCanonical": "lots"}', id="non-numeric-total"),
+        pytest.param('{"spentCanonical": "5"}', id="missing-day"),
+        pytest.param(
+            '{"day": "2025-02-18", "spentCanonical": "5", "paidIds": [1]}',
+            id="non-string-paid-ids-on-a-prior-day",
+        ),
+        pytest.param('{"day": "2025-02-19", "spentCanonical": 5}', id="numeric-total"),
+        pytest.param('{"day": "2025-02-21", "spentCanonical": "5"}', id="two-days-ahead"),
+        pytest.param('{"day": "2035-02-19", "spentCanonical": "5"}', id="far-future-year"),
+        pytest.param(b"\xff\xfe", id="not-utf8"),
+        pytest.param(
+            b'{"day": "2025-02-19", "spentCanonical": "5", "paidIds": ["\xff"]}',
+            id="not-utf8-inside-a-string",
+        ),
+    ],
+)
+def test_reserve_spend_when_journal_is_corrupt_then_refuses_and_names_the_file(
+    tmp_path, corrupt: str | bytes
+) -> None:
+    """A journal that cannot be read refuses every payment, naming the file, and stays as is."""
+    agent_id = str(uuid4())
+    raw = corrupt if isinstance(corrupt, bytes) else corrupt.encode()
+    path = _write_journal(tmp_path, agent_id, raw)
+
+    with pytest.raises(CorruptSpendJournalError, match=re.escape(path)):
+        read_daily_spent(str(tmp_path), agent_id, T)
+    with pytest.raises(CorruptSpendJournalError, match=re.escape(path)):
+        reserve_spend(str(tmp_path), agent_id, _policy(), _req("1"), now_seconds=T)
+    with pytest.raises(CorruptSpendJournalError, match=re.escape(path)):
+        record_spend(str(tmp_path), agent_id, 1, T)
+    with open(path, "rb") as handle:
+        assert handle.read() == raw
+
+
+@pytest.mark.parametrize(
+    ("now", "journal_day", "kept"),
+    [
+        pytest.param("2026-01-31T12:00:00+00:00", "2026-02-01", True, id="month-end"),
+        pytest.param("2026-12-31T12:00:00+00:00", "2027-01-01", True, id="year-end"),
+        pytest.param("2026-12-31T12:00:00+00:00", "2027-01-02", False, id="year-end-plus-two"),
+    ],
+)
+def test_read_daily_spent_when_journal_is_dated_across_a_calendar_boundary_then_the_day_decides(
+    tmp_path, now: str, journal_day: str, kept: bool
+) -> None:
+    """Tomorrow keeps its spend and two days ahead refuses, across a month and a year end."""
+    agent_id = str(uuid4())
+    path = _write_journal(
+        tmp_path, agent_id, json.dumps({"day": journal_day, "spentCanonical": "5"}).encode()
+    )
+    now_seconds = datetime.fromisoformat(now).timestamp()
+    if kept:
+        assert read_daily_spent(str(tmp_path), agent_id, now_seconds) == 5
+    else:
+        with pytest.raises(CorruptSpendJournalError, match=re.escape(path)):
+            read_daily_spent(str(tmp_path), agent_id, now_seconds)
+
+
+def test_read_daily_spent_when_journal_is_days_ahead_then_the_message_names_the_clock(
+    tmp_path,
+) -> None:
+    """The error says the journal is dated later than today, so the clock is what to check."""
+    agent_id = str(uuid4())
+    path = _write_journal(tmp_path, agent_id, b'{"day": "2025-02-21", "spentCanonical": "5"}')
+    with pytest.raises(CorruptSpendJournalError) as exc:
+        read_daily_spent(str(tmp_path), agent_id, T)
+    assert str(exc.value) == (
+        f"{path} is dated 2025-02-21, later than today's date 2025-02-19, so check the "
+        "system clock; payments are refused until the clock is right or the file is repaired"
+    )
+
+
+def test_read_daily_spent_when_journal_is_missing_then_reads_zero(tmp_path) -> None:
+    """No journal yet is an empty day, not a corrupt one."""
+    assert read_daily_spent(str(tmp_path), str(uuid4()), T) == 0

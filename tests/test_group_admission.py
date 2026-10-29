@@ -20,7 +20,7 @@ from rine._constants import (
     MLS_WELCOME_B64_PER_MEMBER,
     MLS_WELCOMES_PER_COMMIT_MAX,
 )
-from rine._crypto.keys import generate_agent_keys, public_keys_body, save_agent_keys
+from rine._crypto.keys import save_agent_keys
 from rine._mls import (
     add_mls_group_members,
     claim_founding_key_packages,
@@ -28,6 +28,10 @@ from rine._mls import (
     mls_founding_batch_sizes,
     open_mls_client,
 )
+from rine.errors import CryptoError
+from rine.testing import WORLD
+
+pytestmark = pytest.mark.usefixtures("mls_escrow_stub")
 
 API = "https://rine.network"
 GROUP_ID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
@@ -48,22 +52,26 @@ _GROUP_READ = {
 }
 
 
-def _peer(tmp_path, index: int) -> tuple[str, str, bytes]:
-    """A peer agent with real keys and one published KeyPackage."""
+def _peer(tmp_path, index: int) -> tuple[str, dict, bytes]:
+    """A peer agent with real keys and one published KeyPackage.
+
+    The keys are saved into the shared config dir the founder acts from, so the
+    founder's MLS client admits the peer's leaf key: its allowed set is every
+    agent whose keys live in ``<config_dir>/keys/``.
+    """
     agent_id = f"aaaaaaaa-0000-4000-8000-{index:012d}"
-    peer_dir = str(tmp_path / f"peer{index}")
-    keys = generate_agent_keys()
-    save_agent_keys(peer_dir, agent_id, keys)
-    key_package = open_mls_client(peer_dir, agent_id).generate_key_package()
-    return agent_id, json.dumps(public_keys_body(keys)), key_package
+    config_dir = str(tmp_path)
+    save_agent_keys(config_dir, agent_id, WORLD.keys(agent_id))
+    key_package = open_mls_client(config_dir, agent_id).generate_key_package()
+    return agent_id, WORLD.keys_response(agent_id), key_package
 
 
 class _Server:
     """The routes an admission touches, with the calls it made."""
 
-    def __init__(self, peers: list[tuple[str, str, bytes]]) -> None:
+    def __init__(self, peers: list[tuple[str, dict, bytes]]) -> None:
         self.packages = {a: kp for a, _, kp in peers}
-        self.keys = {a: json.loads(body) for a, body, _ in peers}
+        self.keys = {a: body for a, body, _ in peers}
         self.claims: list[list[str]] = []
         self.commits: list[dict] = []
         self.epoch = 0
@@ -270,7 +278,7 @@ class TestFoundingWithManyMembers:
 class TestARejectedRecipient:
     @respx.mock
     def test_the_batch_drops_them_retries_once_and_reports_them(
-        self, sync_client, tmp_config_dir, tmp_path
+        self, sync_client, tmp_config_dir, tmp_path, mls_escrow_stub
     ):
         peers = [_peer(tmp_path, i) for i in range(3)]
         server = _Server(peers).install()
@@ -284,6 +292,27 @@ class TestARejectedRecipient:
         assert [o.agent_id for o in rejected] == [peers[1][0]]
         # The batch, then the retry. Never a loop.
         assert len(server.commits) == 2
+        # The accepted retry installed its epoch and escrowed it.
+        assert mls_escrow_stub[-1] == (GROUP_ID, server.commits[-1]["epoch"])
+
+    @respx.mock
+    def test_a_drain_failure_after_the_server_seated_the_retry_is_raised_not_recorded(
+        self, sync_client, tmp_config_dir, tmp_path, monkeypatch
+    ):
+        peers = [_peer(tmp_path, i) for i in range(3)]
+        server = _Server(peers).install()
+        server.reject = {peers[1][0]}
+        _init_roster(peers)
+
+        def _fail(*_args, **_kwargs):
+            raise CryptoError("escrow seal failed")
+
+        monkeypatch.setattr("rine._mls.admission_state.drain_escrow", _fail)
+
+        # The retried commit was accepted, so those joiners are seated: the
+        # failure is the caller's, and no one is ledgered as rejected for it.
+        with pytest.raises(CryptoError, match="escrow seal failed"):
+            init_mls_group(sync_client._http, tmp_config_dir, FOUNDER, GROUP_ID, {})
 
 
 class TestClaimingKeyPackages:
