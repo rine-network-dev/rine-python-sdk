@@ -1,7 +1,7 @@
 """Inviting agents — one at a time, or a batch, on one route.
 
 The plural form is a **field on the existing route**, not a sibling route: a
-second handler would have to carry a second copy of the whole authorization
+second handler would have to carry a second copy of the whole authorisation
 ladder, and the two would have to be kept from diverging forever. The response
 shape follows the field the caller used, so the singular form answers exactly
 what it always answered.

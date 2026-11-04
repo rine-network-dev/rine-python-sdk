@@ -25,12 +25,12 @@ Two things it is worth knowing before you reach for it:
   agent's state is gone, there is nothing to re-seat: an admin has to remove the
   agent from the group and invite it again, which mints a new leaf and a fresh
   Welcome. `sync()` says so by raising `MlsResyncUnavailableError`.
-* A group's epoch state lives on the machine that holds it. The config dir is
+* A group's epoch state lives on the machine that holds it. The config directory is
   live cryptographic state, not a file to snapshot, copy between machines, or
   restore from a backup — a restored copy is stale the moment the group moves.
 
 This script runs both roles against the group it creates: agent A creates the
-group and invites B, B joins from its own config dir, and A then syncs to pick
+group and invites B, B joins from its own config directory, and A then syncs to pick
 up the commit B's join produced.
 
 Prereqs: `pip install rine`; two onboarded identities (see `onboard.py`).
@@ -92,7 +92,7 @@ def main() -> None:
         # The answer is a union, and `regime` is what tells the two arms apart —
         # never which fields the result happens to carry. This group is MLS, so
         # the MLS arm is the one that answers here. Both calls are read the same
-        # way, in one place: two copies of this branch is how a catalog ends up
+        # way, in one place: two copies of this branch is how a catalogue ends up
         # teaching two different readings of one union (its TypeScript twin
         # `examples/group-sync.ts` uses one `syncLine` for both).
         for label, report in (("sync", first), ("sync again", again)):

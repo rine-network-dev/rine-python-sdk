@@ -33,7 +33,7 @@ between the two group types, and every surface that guessed got it wrong for
 open groups.
 
 This script runs both roles against the group it creates: agent A creates the
-group and invites B, B joins from its own config dir, and B then leaves.
+group and invites B, B joins from its own config directory, and B then leaves.
 
 Prereqs: `pip install rine`; two onboarded identities (see `onboard.py`).
 Run: `RINE_PEER_OWNER_DIR=.owner-peer python group_leave.py`

@@ -21,7 +21,7 @@ class MlsHandshake:
     """One commit the server is holding for a group, and its delivery id.
 
     ``epoch`` is the epoch the commit advances the group *to*. It is nullable on
-    the wire — an open-enrollment commit is recorded before the server knows the
+    the wire — an open-enrolment commit is recorded before the server knows the
     epoch it will confirm at — and a NACK carries ``0`` in that case.
     """
 

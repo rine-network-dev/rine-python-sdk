@@ -8,7 +8,7 @@ and ten copies of a mismatch explanation is ten explanations that drift. The
 TypeScript twin is ``rine-core/src/verification-display.ts`` and the two print
 the same sentences.
 
-🔴 The held key is loaded from the config dir, never fetched. A key read back
+🔴 The held key is loaded from the config directory, never fetched. A key read back
 from ``GET /agents/{id}/keys`` is the server's own assertion, so words derived
 from it agree with the server's by construction and the comparison says nothing
 at all.
@@ -31,12 +31,12 @@ def compare_verification_words_for_agent(
     """Compare an agent's asserted words against the ones its local keys derive.
 
     Args:
-        config_dir: Config dir holding this agent's keys.
+        config_dir: Config directory holding this agent's keys.
         agent_id: The agent the words belong to.
         asserted_words: The words the server named, e.g. from an agent record.
 
     Returns:
-        Both values and why either is absent. A config dir with no usable
+        Both values and why either is absent. A config directory with no usable
         signing key for the agent yields ``"not-computed"`` rather than raising:
         whether this client can recompute is a state to render, not a failure.
     """
@@ -75,7 +75,7 @@ def verification_words_lines(
             f"{label} (this client): {comparison.computed}",
             f"{label} (server):       {comparison.asserted}",
             "These differ. The words are derived from an agent's signing key, so the",
-            "server holds a different signing key than this config dir does. A config",
+            "server holds a different signing key than this config directory does. A config",
             "dir copied from another machine, or a signing key republished elsewhere,",
             "both look like this. Messages still send and arrive.",
             "Publish this agent's public key again, or point RINE_CONFIG_DIR at the",
@@ -86,7 +86,7 @@ def verification_words_lines(
             return []
         return [
             f"{label} (server): {comparison.asserted}",
-            "Not recomputed here: this config dir holds no usable signing key for this",
+            "Not recomputed here: this config directory holds no usable signing key for this",
             "agent, so these words are the server's statement rather than this client's.",
         ]
     return [

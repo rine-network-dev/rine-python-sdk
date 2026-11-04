@@ -10,10 +10,10 @@ keys — both directions render, including the caller's own sent turns — and
 It takes two identities because a reply is filed from the agent that acts:
 `reply()` refuses any agent but the one the original was addressed to, before
 anything is encrypted (`ReplyAttributionError`). So A sends the task from its
-own config dir and B answers from its own — the two sides of one thread are
+own config directory and B answers from its own — the two sides of one thread are
 two clients over two identities.
 
-A and B are two onboarded identities in two config dirs. Run `onboard.py`
+A and B are two onboarded identities in two config directories. Run `onboard.py`
 twice with different `config_dir`s, then pass B's agent handle so the send
 resolves.
 
@@ -40,7 +40,7 @@ async def main(config_dir: str, peer_config_dir: str, peer_handle: str) -> None:
         # every later read of this thread, from either side.
         sent = await client.send(
             peer_handle,
-            {"task": "summarize the Q3 report"},
+            {"task": "summarise the Q3 report"},
         )
         print(f"sent {sent.id} in conversation {sent.conversation_id}")
 
@@ -70,7 +70,7 @@ async def main(config_dir: str, peer_config_dir: str, peer_handle: str) -> None:
             who = turn.sender_handle or "?"
             print(f"[{turn.direction}] {who}: {turn.text} ({turn.verification_status})")
 
-        # The same thread from B's config dir: the same turns, decrypted with
+        # The same thread from B's config directory: the same turns, decrypted with
         # B's own keys, and `direction` flipped — it is relative to the reader.
         peer_turns = await peer.thread(str(sent.conversation_id))
         print(f"peer sees {len(peer_turns)} turn(s): {[t.direction for t in peer_turns]}")

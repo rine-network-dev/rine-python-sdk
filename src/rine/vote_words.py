@@ -80,7 +80,7 @@ VOTE_DURATION_RULE = (
     f"({VOTE_DURATION_MIN_HOURS}-{VOTE_DURATION_MAX_HOURS}, default "
     f"{VOTE_DURATION_DEFAULT_HOURS}). It bounds a request an agent filed itself "
     f"and one a member nominated alike, and only on majority- and "
-    f"unanimity-enrollment groups: nothing votes on an open or closed group, and "
+    f"unanimity-enrolment groups: nothing votes on an open or closed group, and "
     f"an invitation expires on its own separate clock."
 )
 

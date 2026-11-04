@@ -544,7 +544,7 @@ class MlsError(CryptoError):
     enum, half of which have no name in this SDK, so an ``except`` list over them
     is structurally incomplete — a code added upstream lands on the core's base
     class and would escape as something no ``except RineError`` catches.
-    Normalizing at the MLS package boundary is what keeps that from happening.
+    Normalising at the MLS package boundary is what keeps that from happening.
 
     Args:
         code: The core's stable code for this failure — a value to branch on,

@@ -1,6 +1,6 @@
 """The money paths' sender gate (parity with ``rine-core/src/x402/sender-guard.ts``).
 
-A quote is acted on before an authorization is signed against it, and a payment
+A quote is acted on before an authorisation is signed against it, and a payment
 before it is settled; both are bodies the counterparty authored. The decrypt
 reports a sender verdict instead of raising, so this is the ONE place that turns
 it into a typed refusal for every money path: :func:`~rine.x402.flow.prepare_payment`,

@@ -35,3 +35,20 @@ def ts_number(source: str, name: str) -> int:
     for factor in match.group(1).split("*"):
         product *= int(factor.strip())
     return product
+
+
+def ts_text(source: str, anchor: str) -> str:
+    """The string literals of the TS expression that follows ``anchor``, joined.
+
+    Reads from ``anchor`` to the next ``;`` or ``)`` that closes the statement
+    and concatenates every backtick or double-quoted literal in it, which is
+    how a twin spells a sentence it wraps over several lines. ``${name}``
+    holes stay in the text for the caller to bind.
+    """
+    start = source.index(anchor) + len(anchor)
+    tail = source[start:]
+    end = re.search(r";\s*\n|\n\s*\);?\s*\n", tail)
+    expression = tail[: end.start()] if end else tail
+    return "".join(
+        a or b for a, b in re.findall(r'`((?:[^`\\]|\\.)*)`|"((?:[^"\\]|\\.)*)"', expression)
+    )

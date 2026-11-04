@@ -19,7 +19,7 @@ T = TypeVar("T")
 
 
 class OrgRead(BaseModel):
-    """Organization details."""
+    """Organisation details."""
 
     id: UUID
     name: str
@@ -411,7 +411,7 @@ class MlsInitFailure(BaseModel):
 
     The group is a real product object either way — sender keys are a supported
     encryption — so the failure travels back on :class:`GroupCreateResult`
-    instead of being raised, and the group can be initialized again later.
+    instead of being raised, and the group can be initialised again later.
     Callers branch on the field being present; ``reason`` is human-facing text
     and is never matched against. Mirrors the TypeScript SDK's
     ``MlsInitFailure``.
@@ -426,7 +426,7 @@ class GroupCreateResult(GroupRead):
     ``mls_init`` is set only when an attempted init failed. On success the group
     is re-read, so ``mls_group_id`` carries the latch the init wrote and
     ``mls_init`` is ``None``; nothing was attempted at all for an
-    open-enrollment group, which runs on sender keys. Mirrors the TypeScript
+    open-enrolment group, which runs on sender keys. Mirrors the TypeScript
     SDK's ``GroupCreateResult = GroupRead & { mlsInit?: MlsInitFailure }``.
     """
 

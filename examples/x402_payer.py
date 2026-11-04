@@ -2,7 +2,7 @@
 
 A payee thread's ``rine.v1.x402_payment_required`` message carries a signed
 quote (``PaymentRequired.accepts[]``). Paying it means: pick an ``accepts[]``
-entry your spend policy allows, sign an EIP-3009 authorization for it with
+entry your spend policy allows, sign an EIP-3009 authorisation for it with
 your wallet key, and reserve that amount against today's spend cap — all of
 which ``prepare_payment()`` does atomically, fail-closed. The signed
 ``rine.v1.x402_payment`` is then sent as a normal in-thread reply.

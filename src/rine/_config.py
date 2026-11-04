@@ -190,7 +190,7 @@ def get_cached_token_entry(
         principal: Principal string the token was issued to.
         margin: Seconds before expiry at which the token is considered stale.
             Defaults to the flat base; callers pass a per-client jittered value
-            so co-located clients desynchronize their refreshes.
+            so co-located clients desynchronise their refreshes.
         now: Current time as a Unix timestamp. Defaults to the wall clock.
 
     Returns:

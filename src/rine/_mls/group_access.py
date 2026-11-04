@@ -5,7 +5,7 @@ server's opaque ``mls_group_id`` latch, which is a different value with a
 confusingly similar name. Keying it here, once, is what lets joining, sending
 and reading all find the same state.
 
-This module also owns the memoized "does this agent hold state?" answer
+This module also owns the memoised "does this agent hold state?" answer
 (:func:`holds_mls_state`) and its invalidation (:func:`note_mls_state_changed`),
 because the memo and the state it remembers have to be retired together. The
 TypeScript mirror is ``rine-core/src/crypto/mls-state.ts``, with the same names
@@ -119,7 +119,7 @@ def _state_stamp(config_dir: str, agent_id: str, group_id: str) -> _StateStamp:
     creates that file and retiring removes the directory. So its presence is the
     same fact the memo remembers, readable with a single ``stat`` — which is
     emphatically not a store open: it loads no compiled core, reads no
-    signing key and deserializes nothing.
+    signing key and deserialises nothing.
 
     ``None`` versus not-``None`` is the exact, timing-free half of the check:
     the fail-open direction — a remembered "holds none" outliving the join that
@@ -141,7 +141,7 @@ def _state_stamp(config_dir: str, agent_id: str, group_id: str) -> _StateStamp:
 def holds_mls_state(config_dir: str, agent_id: str, group_id: str) -> bool:
     """Whether this agent holds local MLS state for a group.
 
-    Memoized because the downgrade guard asks it once per row on a group read,
+    Memoised because the downgrade guard asks it once per row on a group read,
     and answering it from the native store means opening that store per row.
     An entry is served only while the group's state file still looks exactly as
     it did when the answer was taken, so the memo cannot outlive the thing it

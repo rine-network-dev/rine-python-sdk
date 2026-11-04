@@ -17,7 +17,7 @@ from rine._config import mls_store_dir
 def holds_mls_store(config_dir: str, agent_id: str) -> bool:
     """Whether the agent's MLS store root exists on this host.
 
-    One ``stat``: no compiled core, no signing key, nothing deserialized. An absent
+    One ``stat``: no compiled core, no signing key, nothing deserialised. An absent
     path is the answer ``False``; a path that is a file is not a store. Any other
     failure propagates, so a store that cannot be read never answers "holds none".
     """

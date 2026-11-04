@@ -15,6 +15,8 @@ KEY_CACHE_TTL = 600.0  # seconds an agent's public keys stay cached client-side
 KEY_CACHE_MAX_ENTRIES = 256  # max distinct agents cached before LRU eviction
 DECRYPT_MEMO_MAX_ENTRIES = 256  # max group messages memoized per client before LRU eviction
 MLS_HEARTBEAT_MIN_INTERVAL_S = 60.0  # shortest gap between two gated MLS heartbeats and sweeps
+# The terms version sent at registration; pinned to landing/public/terms.html.
+TERMS_VERSION = "1.3"
 
 
 # --- Limits restated from the server, and from the TypeScript stack ---

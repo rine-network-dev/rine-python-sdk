@@ -480,7 +480,6 @@ class TestUpdateAgent:
                 200,
                 json={
                     **_AGENT_PAYLOAD,
-                    "name": "renamed",
                     "human_oversight": False,
                     "incoming_policy": "groups_only",
                     "outgoing_policy": "groups_only",
@@ -491,21 +490,18 @@ class TestUpdateAgent:
 
         result = await async_client.update_agent(
             AGENT_ID,
-            name="renamed",
             human_oversight=False,
             incoming_policy="groups_only",
             outgoing_policy="groups_only",
         )
 
         assert isinstance(result, AgentRead)
-        assert result.name == "renamed"
         assert result.human_oversight is False
         assert result.incoming_policy == "groups_only"
         assert result.outgoing_policy == "groups_only"
         assert result.warnings is not None
         parsed = json.loads(route.calls[0].request.content)
         assert parsed == {
-            "name": "renamed",
             "human_oversight": False,
             "incoming_policy": "groups_only",
             "outgoing_policy": "groups_only",
@@ -519,10 +515,34 @@ class TestUpdateAgent:
             return_value=httpx.Response(200, json=_AGENT_PAYLOAD)
         )
 
-        await async_client.update_agent(AGENT_ID, name="new-name")
+        await async_client.update_agent(AGENT_ID, human_oversight=True)
 
         parsed = json.loads(route.calls[0].request.content)
-        assert parsed == {"name": "new-name"}
+        assert parsed == {"human_oversight": True}
+        await async_client.close()
+
+    @respx.mock
+    async def test_update_agent_unlisted_true_is_sent(self, async_client):
+        _mock_token()
+        route = respx.patch(f"https://rine.network/agents/{AGENT_ID}").mock(
+            return_value=httpx.Response(200, json=_AGENT_PAYLOAD)
+        )
+
+        await async_client.update_agent(AGENT_ID, unlisted=True)
+
+        assert json.loads(route.calls[0].request.content) == {"unlisted": True}
+        await async_client.close()
+
+    @respx.mock
+    async def test_update_agent_unlisted_false_is_sent(self, async_client):
+        _mock_token()
+        route = respx.patch(f"https://rine.network/agents/{AGENT_ID}").mock(
+            return_value=httpx.Response(200, json=_AGENT_PAYLOAD)
+        )
+
+        await async_client.update_agent(AGENT_ID, unlisted=False)
+
+        assert json.loads(route.calls[0].request.content) == {"unlisted": False}
         await async_client.close()
 
     @respx.mock
@@ -546,21 +566,7 @@ class TestUpdateAgent:
         )
 
         with pytest.raises(ConflictError, match="already revoked"):
-            await async_client.update_agent(AGENT_ID, name="x")
-        await async_client.close()
-
-    @respx.mock
-    async def test_update_agent_rename_after_handle_raises_conflict(self, async_client):
-        _mock_token()
-        respx.patch(f"https://rine.network/agents/{AGENT_ID}").mock(
-            return_value=httpx.Response(
-                409,
-                json={"detail": "Cannot rename agent after handle assignment"},
-            )
-        )
-
-        with pytest.raises(ConflictError, match="Cannot rename"):
-            await async_client.update_agent(AGENT_ID, name="x")
+            await async_client.update_agent(AGENT_ID, incoming_policy="groups_only")
         await async_client.close()
 
     @respx.mock
@@ -571,18 +577,13 @@ class TestUpdateAgent:
         )
 
         with pytest.raises(NotFoundError):
-            await async_client.update_agent(AGENT_ID, name="x")
+            await async_client.update_agent(AGENT_ID, incoming_policy="groups_only")
         await async_client.close()
 
     @respx.mock
-    async def test_update_agent_blank_name_raises_validation(self, async_client):
-        _mock_token()
-        respx.patch(f"https://rine.network/agents/{AGENT_ID}").mock(
-            return_value=httpx.Response(422, json={"detail": "Name must not be blank"})
-        )
-
-        with pytest.raises(ValidationError):
-            await async_client.update_agent(AGENT_ID, name="")
+    async def test_update_agent_when_name_passed_raises_type_error(self, async_client):
+        with pytest.raises(TypeError):
+            await async_client.update_agent(AGENT_ID, name="renamed")
         await async_client.close()
 
 

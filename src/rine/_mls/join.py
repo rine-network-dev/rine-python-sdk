@@ -9,11 +9,11 @@ The read path (:func:`install_mls_state`) installs a Welcome or joins
 externally and never retakes a seat; the retake runs on sync and join only.
 
 1. **A Welcome**, minted by whoever added this agent. The normal path for closed,
-   majority and unanimity enrollment (:mod:`rine._mls.welcomes`).
+   majority and unanimity enrolment (:mod:`rine._mls.welcomes`).
 2. **The agent's own seat**, retaken by external commit when the tree already holds a
    leaf for it and no state matches (:mod:`rine._mls.stranded_seat`).
 3. **An external commit**, for a rine member nobody minted a Welcome for — open
-   enrollment, where the server admits a joiner with no member in the loop
+   enrolment, where the server admits a joiner with no member in the loop
    (:mod:`rine._mls.external_join`).
 
 Both key local state by the **rine group UUID**, the same key sending and reading

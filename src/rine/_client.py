@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from rine._mls import MlsCutoverResult
 
 
-from rine._actor import AGENT_HEADER, ResolvedActor, normalize_actor, refuse_if_not_addressee
+from rine._actor import ResolvedActor, normalize_actor, refuse_if_not_addressee
 from rine._agent_provision import create_agent as _create_agent
 from rine._agent_rotate_seats import RotatedAgent, rotate_agent_with_seats
 from rine._base_client import BaseRineClient
@@ -56,6 +56,7 @@ from rine._http import AsyncHttpClient
 from rine._logging import logger
 from rine._mls.bridge import with_sync_http
 from rine._mls.escrow_sweep import agents_with_escrow_work, startup_escrow_sweep
+from rine._read_ack import is_marked, is_settled, report_ack_failure
 from rine._recipient import (
     REF_CLASS_GROUP,
     REF_CLASS_ID,
@@ -94,6 +95,7 @@ from rine.errors import (
     NoSenderKeyStateError,
     NotFoundError,
     RineApiError,
+    SignatureVerificationError,
     UnsupportedTargetError,
 )
 from rine.sender_key_words import SenderKeyRefusal
@@ -147,7 +149,7 @@ class RineClient(BaseRineClient):
             ``~/.config/rine-owner`` when omitted.
         profile: Named profile to act as; the default profile when omitted.
         agent_only: Act only as an agent whose leaf keys are in ``config_dir``; the
-            owner dir is never read, so ``root.key`` cannot make this client the org.
+            owner directory is never read, so ``root.key`` cannot make this client the org.
 
     Example::
 
@@ -694,8 +696,9 @@ class RineClient(BaseRineClient):
     ) -> MessageRead:
         """Send an encrypted message (1:1 or group).
 
-        Auto-detects encryption: recipients starting with ``#`` use Sender Keys
-        (group encryption); all others use hpke-hybrid-v2 (1:1 encryption).
+        Auto-detects encryption: a group recipient uses the group's own
+        cryptography (MLS for a closed, majority or unanimity group, Sender
+        Keys for an open one); all others use hpke-hybrid-v2 (1:1 encryption).
 
         A recipient that is neither a UUID nor a handle is a **group name**:
         the agent namespace refuses a bare word before any request
@@ -860,13 +863,16 @@ class RineClient(BaseRineClient):
         )
         raw_items = data.get("items", []) if isinstance(data, dict) else data
 
+        # One distribution scan serves the whole page: every unreadable group row would
+        # otherwise repeat the same list-and-fetch pass for the same keys.
+        scanned: set[str] = set()
         messages: list[DecryptedMessage] = []
         for raw in raw_items:
             msg = DecryptedMessage.from_wire(raw)
             try:
                 msg = await self._decrypt_message(agent_id, msg)
             except CryptoError as e:
-                msg = await self._self_heal_group_decrypt(agent_id, msg, e)
+                msg = await self._self_heal_group_decrypt(agent_id, msg, e, scanned=scanned)
             except Exception as e:  # noqa: BLE001 — degrade, never raise (inbox's contract)
                 # The shared degrade, not a second copy of it: this arm once set
                 # ``decrypt_error`` by hand, which meant every field the degrade
@@ -921,12 +927,16 @@ class RineClient(BaseRineClient):
         and ``plaintext = None``, exactly as it would from :meth:`inbox`. Check
         ``decrypt_error`` before touching ``plaintext``.
 
-        Reading a message marks it delivered for the acting agent **whether or
-        not it decrypts** — the server holds no key and stamps the mark before
-        this client has tried — and there is no un-mark route, so the row leaves
-        :meth:`inbox` with ``status="new"``, :meth:`poll` and SSE catch-up and
-        stays fetchable only by id. Pass ``peek=True`` to read without
-        consuming it.
+        The row is read with ``X-Rine-Peek``, so the server marks nothing, and
+        this client marks it delivered for the acting agent once the read is
+        settled: the message opened, carried no ciphertext (A2A cleartext), or
+        was refused for its sender's signature. A message this agent could not
+        open — no key yet, a sender key that has not arrived, an envelope this
+        client does not know — stays ``status="new"`` in :meth:`inbox`,
+        :meth:`poll` and SSE catch-up, so a key fix or a resync can still
+        recover it. A read that opens therefore makes a second request, the
+        mark; if that request fails the message is still returned and the
+        failure is logged as a warning on the ``rine`` logger.
 
         Reading a **group** message a second time is answered from a local copy,
         not from the group's cryptography, which spends a message's key on first
@@ -940,25 +950,40 @@ class RineClient(BaseRineClient):
         Args:
             message_id: Message UUID.
             agent: Agent to read as.
-            peek: Read without consuming the message — it stays new, and stays
-                offered by ``inbox(status="new")``, :meth:`poll` and SSE
-                catch-up. What an unattended loop wants for a message it may not
-                be able to open yet: the acting agent is still named and still
-                refused if it names nobody, so only the mark is suppressed.
+            peek: Never mark the message delivered, even once it opens — it
+                stays new, and stays offered by ``inbox(status="new")``,
+                :meth:`poll` and SSE catch-up. For a caller that will mark it
+                itself, or not at all. The acting agent is still named and
+                still refused if it names nobody.
 
         Returns:
             Decrypted message, or the message carrying ``decrypt_error``.
         """
         agent_id = await self._resolve_agent_id(agent)
-        extra = self._with_peek(await self._agent_header(agent), peek=peek)
+        extra = self._with_peek(await self._agent_header(agent), peek=True)
         data = await self._http.get(f"/messages/{message_id}", extra_headers=extra)
         msg = DecryptedMessage.from_wire(data)
         try:
-            return await self._decrypt_message(agent_id, msg)
+            msg = await self._decrypt_message(agent_id, msg)
         except CryptoError as e:
-            return await self._self_heal_group_decrypt(agent_id, msg, e)
+            msg = await self._self_heal_group_decrypt(agent_id, msg, e)
         except Exception as e:  # noqa: BLE001 — degrade, never raise (inbox's contract)
-            return self._apply_decrypt_failure(msg, e)
+            msg = self._apply_decrypt_failure(msg, e)
+        if not peek and is_settled(msg):
+            await self._mark_read(message_id, agent)
+        return msg
+
+    async def _mark_listed_read(self, listed: dict[str, Any], agent_id: str) -> None:
+        """Mark a row from a listing delivered, unless the listing already shows it so."""
+        if not is_marked(listed):
+            await self._mark_read(listed["id"], agent_id)
+
+    async def _mark_read(self, message_id: str, agent: str | None) -> None:
+        """Mark a row this client has just read delivered; a failure is reported, never raised."""
+        try:
+            await self.mark_delivered([message_id], agent=agent)
+        except Exception as e:  # noqa: BLE001 — the read succeeded; a missing mark is recoverable
+            report_ack_failure(message_id, e)
 
     async def _decrypt_message(self, agent_id: str, msg: DecryptedMessage) -> DecryptedMessage:
         """Decrypt a message in-place.
@@ -1073,7 +1098,12 @@ class RineClient(BaseRineClient):
         return result
 
     async def _self_heal_group_decrypt(
-        self, agent_id: str, msg: DecryptedMessage, error: CryptoError
+        self,
+        agent_id: str,
+        msg: DecryptedMessage,
+        error: CryptoError,
+        *,
+        scanned: set[str] | None = None,
     ) -> DecryptedMessage:
         """Retry one failed group decrypt after ingesting pending sender keys.
 
@@ -1081,13 +1111,19 @@ class RineClient(BaseRineClient):
         its distribution DM is opened, and would otherwise stay undecryptable
         forever. Shared by ``inbox()`` and ``read()``. Never raises — the failure
         is reported as ``decrypt_error``.
+
+        ``scanned`` lets one caller that heals several rows share a single scan: an
+        agent already in it is not scanned again, and is added once it has been.
         """
         if msg.encryption_version != EncryptionVersion.SENDER_KEY_V1:
             return self._apply_decrypt_failure(msg, error)
         try:
             if await self._retirement_blocks_read(agent_id, msg.group_id):
                 return self._apply_decrypt_failure(msg, error)
-            await self._fetch_pending_sk_distributions(agent_id)
+            if scanned is None or agent_id not in scanned:
+                await self._fetch_pending_sk_distributions(agent_id)
+                if scanned is not None:
+                    scanned.add(agent_id)
             return await self._decrypt_message(agent_id, msg)
         except Exception as e:  # noqa: BLE001 — degrade, never raise (inbox is best-effort)
             return self._apply_decrypt_failure(msg, e)
@@ -1159,21 +1195,29 @@ class RineClient(BaseRineClient):
 
         for raw in items:
             try:
+                # Peeked, then marked here once the row is settled: a
+                # distribution this agent cannot open yet stays new for the next scan.
                 full = await self._http.get(
                     f"/messages/{raw['id']}",
-                    extra_headers=self._actor_header_dict(agent_id),
+                    extra_headers=self._with_peek(self._actor_header_dict(agent_id), peek=True),
                 )
                 # The distribution DM is verified against the sender the server
                 # stamped on the row it was listed as, never against the agent id
                 # inside its own payload.
-                result = await decrypt_message_async(
-                    self._config_dir,
-                    agent_id,
-                    full["encrypted_payload"],
-                    self._http,
-                    str(full["from_agent_id"]),
-                    created_at=datetime.fromisoformat(full["created_at"]),
-                )
+                try:
+                    result = await decrypt_message_async(
+                        self._config_dir,
+                        agent_id,
+                        full["encrypted_payload"],
+                        self._http,
+                        str(full["from_agent_id"]),
+                        created_at=datetime.fromisoformat(full["created_at"]),
+                    )
+                except SignatureVerificationError:
+                    # Refused for its signer: a property of the bytes, so it never heals.
+                    await self._mark_listed_read(raw, agent_id)
+                    raise
+                await self._mark_listed_read(raw, agent_id)
                 if not result.verified:
                     continue
                 payload = json.loads(result.plaintext)
@@ -1669,32 +1713,33 @@ class RineClient(BaseRineClient):
         self,
         agent_id: str,
         *,
-        name: str | NotGiven = NOT_GIVEN,
         human_oversight: bool | NotGiven = NOT_GIVEN,
         incoming_policy: str | NotGiven = NOT_GIVEN,
         outgoing_policy: str | NotGiven = NOT_GIVEN,
+        unlisted: bool | NotGiven = NOT_GIVEN,
     ) -> AgentRead:
         """Update agent properties.
 
         Args:
             agent_id: Agent UUID.
-            name: New agent name (cannot change after handle assignment).
             human_oversight: Whether agent requires human oversight.
             incoming_policy: ``"accept_all"`` or ``"groups_only"``.
             outgoing_policy: ``"send_all"`` or ``"groups_only"``.
+            unlisted: ``True`` hides the agent from the directory, ``False`` lists
+                it again. Needs a server that accepts ``unlisted`` on this route.
 
         Returns:
             Updated AgentRead.
 
         Raises:
-            ConflictError: If agent is revoked or rename after handle assignment.
+            ConflictError: If agent is revoked.
             NotFoundError: If agent not found.
         """
         body = self._build_body(
-            ("name", name),
             ("human_oversight", human_oversight),
             ("incoming_policy", incoming_policy),
             ("outgoing_policy", outgoing_policy),
+            ("unlisted", unlisted),
         )
         data = await self._http.patch(f"/agents/{agent_id}", json_body=body)
         return AgentRead.model_validate(data)
@@ -2275,20 +2320,29 @@ class RineClient(BaseRineClient):
 
     # --- Streaming ---
 
-    async def stream(self, *, agent: str | None = None) -> AsyncIterator[Event]:
+    async def stream(self, *, agent: str | None = None, peek: bool = True) -> AsyncIterator[Event]:
         """Stream server-sent events.
 
         Args:
             agent: Agent to stream as.
+            peek: Ask the server not to mark a message delivered when it streams it
+                (the default). A frame carries no verdict on whether this client can
+                open the message, so **you acknowledge**: call
+                :meth:`mark_delivered` once you have handled it. A message you never
+                acknowledge stays ``new`` and is sent again on a reconnect that has no
+                saved position. ``peek=False`` restores the old behaviour, where the
+                server marks every message delivered as it streams it.
 
         Yields:
             Event objects from the SSE stream.
         """
         agent_id = await self._resolve_agent_id(agent)
         token = await self._http._get_token()
-        headers = {"Authorization": f"Bearer {token}", "User-Agent": "rine-python"}
-        if agent_id:
-            headers[AGENT_HEADER] = agent_id
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "rine-python",
+            **(self._with_peek(self._actor_header_dict(agent_id), peek=peek) or {}),
+        }
 
         async with (
             httpx.AsyncClient() as http,

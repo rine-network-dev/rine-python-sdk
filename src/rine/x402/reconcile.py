@@ -57,7 +57,7 @@ def reconcile_payment(
     tier keeps the settled amount and ``matchedQuote`` aligned with the quote the
     payer answered.
 
-    Defense-in-depth: the SIGNED EIP-3009 ``payload.authorization.value`` — not the
+    Defence-in-depth: the SIGNED EIP-3009 ``payload.authorization.value`` — not the
     payer-controlled echoed ``accepted.amount`` — must cover the quoted atomic amount,
     so a payment whose signed value underfunds the tier it names is refused LOCALLY
     even if a non-conformant facilitator would settle it. Overpayment (a signed value
@@ -86,7 +86,7 @@ def reconcile_payment(
     authorization = (payment.get("payload") or {}).get("authorization") or {}
     signed = parse_atomic_units(
         str(authorization.get("value") if authorization.get("value") is not None else ""),
-        "Signed authorization value",
+        "Signed authorisation value",
     )
     for quote in quote_accepts:
         if accepted.get("scheme") != quote.get("scheme"):
@@ -103,7 +103,7 @@ def reconcile_payment(
         if signed < quoted:
             raise X402Error(
                 X402ErrorCode.REQUIREMENT_MISMATCH,
-                "Signed authorization value underfunds the quoted requirement — "
+                "Signed authorisation value underfunds the quoted requirement — "
                 "refusing to settle (local underpayment guard)",
                 {"signed": str(signed), "required": str(quoted)},
             )

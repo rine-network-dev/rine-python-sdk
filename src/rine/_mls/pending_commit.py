@@ -1,6 +1,6 @@
 """Settling a self-update this member built and has not applied yet.
 
-In an open-enrollment group the server accepts a commit as *tentative*: it
+In an open-enrolment group the server accepts a commit as *tentative*: it
 advances the compare-and-swap latch but not the confirmed epoch, and rolls the
 commit back unless a member acknowledges it in time. A self-update cannot be
 recovered from a fork onto a rolled-back epoch, because the only way back is an

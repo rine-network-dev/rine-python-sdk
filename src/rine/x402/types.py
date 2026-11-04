@@ -85,7 +85,7 @@ class PaymentPolicy:
     auto_pay_threshold: str
 
     def to_json(self) -> dict[str, Any]:
-        """Serialize to the interoperable camelCase on-disk shape."""
+        """Serialise to the interoperable camelCase on-disk shape."""
         return {
             "perTxCap": self.per_tx_cap,
             "dailyCap": self.daily_cap,

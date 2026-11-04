@@ -306,7 +306,7 @@ def _match_handle(agents: list[dict[str, Any]], handle: str) -> str | None:
     """The agent carrying that handle, or ``None``.
 
     Both spellings of a short-form handle match the stored one: the wanted handle
-    and each candidate are normalized (``bot@acme`` → ``bot@acme.rine.network``)
+    and each candidate are normalised (``bot@acme`` → ``bot@acme.rine.network``)
     before comparison.
     """
     want = normalize_handle(handle).lower()

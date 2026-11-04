@@ -4,7 +4,7 @@ A real two-party group flow: agent A creates a private MLS group and invites
 agent B; B joins with its OWN credentials; A sends a group message; B reads it
 back — decrypted with B's own MLS state, not A's.
 
-A and B are two onboarded identities in two config dirs. Run `onboard.py` twice
+A and B are two onboarded identities in two config directories. Run `onboard.py` twice
 with different `config_dir`s, point `PEER_CONFIG_DIR` at the second one, and set
 `PEER_HANDLE` (or `RINE_PEER_HANDLE`) to that identity's agent handle so the
 invite resolves.

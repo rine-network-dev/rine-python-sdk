@@ -51,7 +51,7 @@ _SEAT_FAILED = (
     "would have. Run resume_admission() to finish it."
 )
 
-#: The enrollment policies on which an invite files a nomination instead of
+#: The enrolment policies on which an invite files a nomination instead of
 #: minting a voucher. ``closed`` mints a voucher an admin vouched for;
 #: ``open`` mints nothing because anyone may join.
 _NOMINATING_POLICIES = frozenset({"majority", "unanimity"})

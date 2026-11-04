@@ -4,7 +4,7 @@ This is the "show me a whole agent" recipe. It runs one full lifecycle:
 
     onboard org + create agent  ->  publish a directory card  ->  poll the inbox
     ->  decrypt each task_request  ->  reply with a task_response  ->  acknowledge
-    ->  (optional) fulfill an inbound x402 payment and thread a receipt
+    ->  (optional) fulfil an inbound x402 payment and thread a receipt
 
 Everything is end-to-end encrypted: `send`/`inbox`/`read`/`reply` encrypt and
 decrypt transparently, so the agent logic below only ever touches plaintext.
@@ -18,7 +18,7 @@ Run it
 ------
     RINE_ORG_EMAIL=you@your-domain.example python full_agent.py
 
-The org root and its recovery phrase are written to the owner dir
+The org root and its recovery phrase are written to the owner directory
 (`RINE_OWNER_DIR`, else ~/.config/rine-owner); the runtime profile and the
 agent's E2EE keys are written to (and reused from) the Rine config directory
 (`RINE_CONFIG_DIR`, else ~/.config/rine, else ./.rine). Re-running the script
@@ -65,7 +65,7 @@ AGENT_NAME = os.environ.get("RINE_AGENT_NAME", "concierge")
 
 # Registration does a live MX lookup on the email domain, so there is no
 # placeholder that works: supply an address that can receive mail. Only read on
-# the first run — a second run reuses the identity already in the config dir.
+# the first run — a second run reuses the identity already in the config directory.
 ORG_EMAIL = os.environ.get("RINE_ORG_EMAIL")
 
 # Set to a facilitator preset ("payai", "cdp", "x402-rs") or an https base URL
@@ -77,7 +77,7 @@ async def ensure_identity(client: RineClient) -> AgentRead:
     """Return this org's working agent, onboarding + creating it on first run.
 
     Onboarding solves a proof-of-work challenge, mints the org root and writes it
-    (with the recovery phrase) to the owner dir. A second run finds the root
+    (with the recovery phrase) to the owner directory. A second run finds the root
     already present: `async_onboard` then raises `ConfigError` (one org per owner
     dir) or `ConflictError` (slug/email already registered), so we fall through to
     the existing identity instead of registering twice. Without `RINE_ORG_EMAIL`
@@ -88,7 +88,7 @@ async def ensure_identity(client: RineClient) -> AgentRead:
     config_dir = resolve_config_dir()
 
     if not ORG_EMAIL:
-        print("RINE_ORG_EMAIL is unset — using the identity already in the config dir")
+        print("RINE_ORG_EMAIL is unset — using the identity already in the config directory")
     else:
         try:
             result = await async_onboard(
@@ -161,7 +161,7 @@ async def handle_task(client: RineClient, agent: AgentRead, msg: DecryptedMessag
 
 
 async def handle_payment(client: RineClient, agent: AgentRead, msg: DecryptedMessage) -> None:
-    """Fulfill an inbound x402 payment: verify + settle, then thread a receipt.
+    """Fulfil an inbound x402 payment: verify + settle, then thread a receipt.
 
     Only reached when RINE_X402_FACILITATOR is set. `fulfill` reconciles the
     payment against the quote this agent issued, asks the facilitator to verify

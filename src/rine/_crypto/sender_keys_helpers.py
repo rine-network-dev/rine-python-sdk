@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 
 def _state_to_json(state: SenderKeyState) -> dict[str, Any]:
-    """Serialize SenderKeyState to JSON-compatible dict."""
+    """Serialise SenderKeyState to JSON-compatible dict."""
     d: dict[str, Any] = {
         "senderKeyId": state.sender_key_id,
         "groupId": state.group_id,
@@ -40,7 +40,7 @@ def _state_to_json(state: SenderKeyState) -> dict[str, Any]:
 
 
 def _state_from_json(d: dict[str, Any]) -> SenderKeyState:
-    """Deserialize SenderKeyState from JSON dict."""
+    """Deserialise SenderKeyState from JSON dict."""
     skipped: dict[int, str] = {}
     raw_skipped = d.get("skippedKeys", {})
     if isinstance(raw_skipped, dict):

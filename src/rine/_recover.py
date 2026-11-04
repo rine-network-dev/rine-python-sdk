@@ -93,14 +93,14 @@ def recover_org(
         phrase: The 24-word recovery phrase.
         owner_dir: Owner directory to receive ``root.key``; ``RINE_OWNER_DIR`` or
             ``~/.config/rine-owner`` when omitted.
-        profile: Name of the org profile written to the owner dir.
+        profile: Name of the org profile written to the owner directory.
         on_org_words: Called with the 8 org verification words before the first request.
 
     Returns:
         A report with one entry per agent: restored, or mismatched with the reason.
 
     Raises:
-        ConfigError: The owner dir is unsafe or holds an org, or no org matches the phrase.
+        ConfigError: The owner directory is unsafe or holds an org, or no org matches the phrase.
         PhraseError: The phrase is not 24 valid BIP39 words.
     """
     import httpx

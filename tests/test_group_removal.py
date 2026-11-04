@@ -144,7 +144,7 @@ class TestSkipReasonsReadAsSentences:
     def test_not_applicable_says_the_group_needs_no_voucher(self):
         text = group_admission_skip_sentence("not_applicable")
 
-        assert "open enrollment" in text
+        assert "open enrolment" in text
         assert "may join whenever it likes" in text
         assert "mints no invitation because none is needed" in text
 

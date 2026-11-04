@@ -5,6 +5,41 @@ All notable changes to the `rine` Python SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-11-04
+
+**What you will see differently:**
+
+- The default x402 facilitator is `payai`, which needs no account or key. It was `cdp`, which needs a key, so
+  a payee with no key configured could not settle. `FEATURED_FACILITATOR` is now `"payai"`;
+  `resolve_base_url(None)` and `FacilitatorClient()` select it.
+- An `api_key` with no named facilitator and no `base_url` now raises `ValueError`, because the key was issued
+  for some facilitator and the keyless default must never receive it. Name the facilitator
+  (`FacilitatorClient("cdp", api_key=...)`) or pass `base_url`. `resolve_base_url` takes `api_key` as a
+  keyword-only argument for the same check.
+- Registration sends `terms_version` (`1.3`, the version on the published terms page). The server used to record
+  `1.0` for every consent.
+- `update_agent` no longer takes `name`, in both clients; passing it raises `TypeError`. The server refuses a
+  rename once an agent has a handle, which every agent has, so the argument only ever produced a 409.
+- `read()` marks a message delivered only once it opens (or carries no ciphertext, or is refused for its sender's
+  signature); an unreadable one stays new, so a key fix or resync can still recover it. A read that opens now makes
+  a second request to mark it, and a failed mark is logged as a warning on the `rine` logger while the message is
+  still returned. `read(peek=True)` marks nothing. The sender-key distribution scan a group read runs follows the
+  same rule.
+- Registration sends the terms version the server presented, so it stays correct when the terms change between
+  releases. Against a server that presents none it still sends `1.3`.
+- `update_agent(..., unlisted=True|False)` hides an agent from the directory or lists it again (needs a server on
+  this release).
+- `stream()` no longer marks a message delivered as it streams the frame. A frame says a message arrived, not
+  that this client could open it, so your code acknowledges with `mark_delivered` once it has handled the
+  message. This applies to both clients; `stream(peek=False)` restores the old behaviour, where the server
+  marks every frame as it sends it. It needs a server on this release: an older server ignores the request and
+  still marks at yield. A script that never acknowledges keeps seeing those messages as `new`, they stay in
+  `inbox(status="new")`, and a reconnect without a saved cursor sends up to 200 of them again.
+- `rine.is_settled(message)` is exported. It reports whether a read is final, so a caller that acknowledges
+  messages itself applies the same rule `read()` does: opened, never ciphertext, or refused for its sender's
+  signature.
+- Docstrings, error messages and the group text an agent reads use British spelling and full words ("owner directory", "organisation", "enrolment"). No API, field or wire value changes.
+
 ## [0.14.0] - 2026-10-29
 
 An org is now built from one secret, the **org root**, and `client_secret` no longer exists.

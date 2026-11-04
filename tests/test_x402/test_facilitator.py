@@ -32,7 +32,7 @@ PAYMENT = {"x402Version": 2, "accepted": REQ, "payload": {"signature": "0x", "au
 def test_presets_include_cdp_payai_and_self_hosted() -> None:
     """Presets include cdp payai and self hosted."""
     assert set(FACILITATOR_PRESETS) == {"cdp", "payai", "x402-rs"}
-    assert FEATURED_FACILITATOR == "cdp"
+    assert FEATURED_FACILITATOR == "payai"
 
 
 def test_resolve_base_url_when_preset_named_returns_url() -> None:
@@ -51,6 +51,38 @@ def test_resolve_base_url_when_unknown_preset_raises() -> None:
     """Resolve base url when unknown preset raises."""
     with pytest.raises(ValueError):
         resolve_base_url("nope")
+
+
+def test_resolve_base_url_when_none_returns_payai_url() -> None:
+    """Resolve base url when none returns payai url."""
+    assert resolve_base_url(None) == FACILITATOR_PRESETS["payai"].base_url
+
+
+def test_resolve_base_url_when_api_key_and_no_facilitator_raises() -> None:
+    """Resolve base url when api key and no facilitator raises."""
+    with pytest.raises(ValueError, match="api_key"):
+        resolve_base_url(None, api_key="cdp-secret")
+
+
+def test_resolve_base_url_when_api_key_and_base_url_ok() -> None:
+    """Resolve base url when api key and base url ok."""
+    assert resolve_base_url(None, "https://fac.local/", api_key="k") == "https://fac.local"
+
+
+def test_resolve_base_url_when_api_key_and_named_cdp_ok() -> None:
+    """Resolve base url when api key and named cdp ok."""
+    assert resolve_base_url("cdp", api_key="k") == FACILITATOR_PRESETS["cdp"].base_url
+
+
+def test_client_init_when_no_facilitator_uses_payai() -> None:
+    """Client init when no facilitator uses payai."""
+    assert FacilitatorClient().base_url == FACILITATOR_PRESETS["payai"].base_url
+
+
+def test_client_init_when_api_key_and_no_facilitator_raises() -> None:
+    """Client init when api key and no facilitator raises."""
+    with pytest.raises(ValueError, match="api_key"):
+        FacilitatorClient(api_key="cdp-secret")
 
 
 @respx.mock

@@ -126,7 +126,7 @@ _T = TypeVar("_T")
 
 
 def mls_boundary(fn: Callable[_P, _T]) -> Callable[_P, _T]:
-    """Normalize every core failure escaping ``fn`` into an SDK error.
+    """Normalise every core failure escaping ``fn`` into an SDK error.
 
     Applied to the functions this package is entered through, and to no others:
     a wrapped failure would defeat the predicates above, which are what decide

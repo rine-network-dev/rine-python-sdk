@@ -122,7 +122,7 @@ def found_mls_state(
     surface and re-initializable later, so it is reported rather than raised.
 
     Two things skip the founding, and neither is a failure: ``enable_mls=False``,
-    the caller asking for a sender-key group outright, and open enrollment, where
+    the caller asking for a sender-key group outright, and open enrolment, where
     the server refuses MLS so an attempt could only ever fail. This function is
     the one place both are stated — the same single expression
     ``rine-ts-sdk/src/resources/groups-create.ts`` calls ``skipMls`` — and

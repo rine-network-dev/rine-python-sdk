@@ -7,7 +7,7 @@ seat is kept. Only a host that holds the group's local MLS state can build one.
 
 The commit is built as a pending commit and applied only when the server confirms
 it. A closed group confirms on the post and the commit applies at once; an
-open-enrollment group answers ``confirmed: false`` and the commit stays pending
+open-enrolment group answers ``confirmed: false`` and the commit stays pending
 until a member acknowledges it, or is dropped if the group rolls it back
 (:mod:`rine._mls.pending_commit`). The pending commit is saved before the post
 leaves, so no exit point leaves the server holding a commit this host cannot

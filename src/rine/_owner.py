@@ -1,4 +1,4 @@
-"""The owner dir: where ``root.key`` and the recovery phrase live.
+"""The owner directory: where ``root.key`` and the recovery phrase live.
 
 It is a different directory from the runtime config dir an agent reads, so an
 agent with file tools never sits next to the org root. ``root.key`` is the org's
@@ -34,16 +34,16 @@ PHRASE_INSTRUCTION = (
 
 
 def resolve_owner_dir() -> str:
-    """The owner dir: ``RINE_OWNER_DIR``, else ``~/.config/rine-owner``."""
+    """The owner directory: ``RINE_OWNER_DIR``, else ``~/.config/rine-owner``."""
     env_dir = os.environ.get(OWNER_DIR_ENV)
     return os.path.abspath(env_dir) if env_dir else os.path.expanduser("~/.config/rine-owner")
 
 
 def effective_owner_dir(owner_dir: str | None, agent_only: bool) -> str | None:
-    """The owner dir a client reads, or ``None`` for an agent runtime that never reads one.
+    """The owner directory a client reads, or ``None`` for an agent runtime that never reads one.
 
     An agent runtime never loads ``root.key``: ``agent_only`` is how a runtime
-    (an adapter, a deployed agent) says so, whatever the host's owner dir holds.
+    (an adapter, a deployed agent) says so, whatever the host's owner directory holds.
 
     Raises:
         ConfigError: ``agent_only`` was combined with an explicit ``owner_dir``.
@@ -107,7 +107,9 @@ def assert_owner_dir_allowed(owner_dir: str, config_dir: str | None = None) -> N
 
 
 def _root_taken_error(owner_dir: str) -> ConfigError:
-    return ConfigError(f"{ROOT_KEY_FILE} already exists in {owner_dir}: one org per owner dir.")
+    return ConfigError(
+        f"{ROOT_KEY_FILE} already exists in {owner_dir}: one org per owner directory."
+    )
 
 
 def assert_fresh_owner_dir(owner_dir: str, config_dir: str | None = None) -> None:
@@ -122,7 +124,7 @@ def assert_fresh_owner_dir(owner_dir: str, config_dir: str | None = None) -> Non
 
 
 def has_root(owner_dir: str) -> bool:
-    """Whether the owner dir holds a ``root.key``."""
+    """Whether the owner directory holds a ``root.key``."""
     return os.path.isfile(os.path.join(owner_dir, ROOT_KEY_FILE))
 
 

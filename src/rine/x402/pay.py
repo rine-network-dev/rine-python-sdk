@@ -36,7 +36,7 @@ becomes the EIP-3009 ``validBefore``.
 The payee controls that field verbatim; an absurd value (e.g. 10 years) would
 keep the signed pull-authorization live far longer than intended. 24h comfortably
 covers ``settle-after-delivery`` task windows while killing multi-year
-authorizations. Clamping is fail-closed — it only ever shortens validity.
+authorisations. Clamping is fail-closed — it only ever shortens validity.
 """
 
 

@@ -3,7 +3,7 @@
 When a payer's signed ``rine.v1.x402_payment`` arrives, `rine.x402.payee.fulfill()`
 runs the whole payee ladder in one call: it binds the payment to the ONE quote
 you issued (refusing anything that doesn't reconcile — no settling payer-authored
-terms), verifies the signed authorization with your facilitator, settles it
+terms), verifies the signed authorisation with your facilitator, settles it
 on-chain, and threads a `rine.v1.x402_receipt` back to the payer. rine never
 runs the facilitator or custodies funds — you configure and call it directly.
 
@@ -103,7 +103,7 @@ async def main(config_dir: str, agent_handle: str, payment_message_id: str) -> N
         await client.set_agent_card(
             agent_id,
             name="Example Payee Agent",
-            description="Summarizes reports for a fee.",
+            description="Summarises reports for a fee.",
             pricing_model="per_request",
         )
 

@@ -546,7 +546,6 @@ class TestUpdateAgent:
                 200,
                 json={
                     **_AGENT_PAYLOAD,
-                    "name": "renamed",
                     "human_oversight": False,
                     "incoming_policy": "groups_only",
                     "outgoing_policy": "groups_only",
@@ -557,21 +556,18 @@ class TestUpdateAgent:
 
         result = sync_client.update_agent(
             AGENT_ID,
-            name="renamed",
             human_oversight=False,
             incoming_policy="groups_only",
             outgoing_policy="groups_only",
         )
 
         assert isinstance(result, AgentRead)
-        assert result.name == "renamed"
         assert result.human_oversight is False
         assert result.incoming_policy == "groups_only"
         assert result.outgoing_policy == "groups_only"
         assert result.warnings is not None
         parsed = json.loads(route.calls[0].request.content)
         assert parsed == {
-            "name": "renamed",
             "human_oversight": False,
             "incoming_policy": "groups_only",
             "outgoing_policy": "groups_only",
@@ -584,10 +580,32 @@ class TestUpdateAgent:
             return_value=httpx.Response(200, json=_AGENT_PAYLOAD)
         )
 
-        sync_client.update_agent(AGENT_ID, name="new-name")
+        sync_client.update_agent(AGENT_ID, human_oversight=True)
 
         parsed = json.loads(route.calls[0].request.content)
-        assert parsed == {"name": "new-name"}
+        assert parsed == {"human_oversight": True}
+
+    @respx.mock
+    def test_update_agent_unlisted_true_is_sent(self, sync_client):
+        _mock_token()
+        route = respx.patch(f"https://rine.network/agents/{AGENT_ID}").mock(
+            return_value=httpx.Response(200, json=_AGENT_PAYLOAD)
+        )
+
+        sync_client.update_agent(AGENT_ID, unlisted=True)
+
+        assert json.loads(route.calls[0].request.content) == {"unlisted": True}
+
+    @respx.mock
+    def test_update_agent_unlisted_false_is_sent(self, sync_client):
+        _mock_token()
+        route = respx.patch(f"https://rine.network/agents/{AGENT_ID}").mock(
+            return_value=httpx.Response(200, json=_AGENT_PAYLOAD)
+        )
+
+        sync_client.update_agent(AGENT_ID, unlisted=False)
+
+        assert json.loads(route.calls[0].request.content) == {"unlisted": False}
 
     @respx.mock
     def test_update_agent_no_args_sends_empty_body(self, sync_client):
@@ -609,20 +627,7 @@ class TestUpdateAgent:
         )
 
         with pytest.raises(ConflictError, match="already revoked"):
-            sync_client.update_agent(AGENT_ID, name="x")
-
-    @respx.mock
-    def test_update_agent_rename_after_handle_raises_conflict(self, sync_client):
-        _mock_token()
-        respx.patch(f"https://rine.network/agents/{AGENT_ID}").mock(
-            return_value=httpx.Response(
-                409,
-                json={"detail": "Cannot rename agent after handle assignment"},
-            )
-        )
-
-        with pytest.raises(ConflictError, match="Cannot rename"):
-            sync_client.update_agent(AGENT_ID, name="x")
+            sync_client.update_agent(AGENT_ID, incoming_policy="groups_only")
 
     @respx.mock
     def test_update_agent_when_not_found_raises_not_found(self, sync_client):
@@ -632,17 +637,12 @@ class TestUpdateAgent:
         )
 
         with pytest.raises(NotFoundError):
-            sync_client.update_agent(AGENT_ID, name="x")
+            sync_client.update_agent(AGENT_ID, incoming_policy="groups_only")
 
     @respx.mock
-    def test_update_agent_blank_name_raises_validation(self, sync_client):
-        _mock_token()
-        respx.patch(f"https://rine.network/agents/{AGENT_ID}").mock(
-            return_value=httpx.Response(422, json={"detail": "Name must not be blank"})
-        )
-
-        with pytest.raises(ValidationError):
-            sync_client.update_agent(AGENT_ID, name="")
+    def test_update_agent_when_name_passed_raises_type_error(self, sync_client):
+        with pytest.raises(TypeError):
+            sync_client.update_agent(AGENT_ID, name="renamed")
 
 
 class TestRevokeAgent:

@@ -98,7 +98,7 @@ class SyncGroups:
                 encrypted**: unlike a message body it is a plain column on the
                 group row, so the rine server reads it and so does any agent the
                 group is visible to. Put the rules here; send the secret.
-            enrollment: Enrollment policy (``open``, ``closed``, ``majority``, ``unanimity``).
+            enrollment: Enrolment policy (``open``, ``closed``, ``majority``, ``unanimity``).
             members: Handles or UUIDs of the agents to invite as the group is
                 created. A roster **invites**; it never seats, so the group
                 comes back with one member however many agents it names. Each
@@ -117,7 +117,7 @@ class SyncGroups:
             enable_mls: Whether the new group runs MLS. Omitted, the server's
                 own default stands and nothing about it is sent, which is how
                 every group has always been created: post-quantum MLS unless
-                the enrollment policy says otherwise. Pass ``False`` for a
+                the enrolment policy says otherwise. Pass ``False`` for a
                 sender-key group instead — the value travels to the server, so
                 the group row says sender-key rather than "created to run MLS
                 and never founded", which is what a client-side skip alone
@@ -138,7 +138,7 @@ class SyncGroups:
             their MLS state is founded as part of this call — in batches sized to
             the tree, so a roster of any size up to the group ceiling founds.
             Two things skip that founding, and neither is a failure:
-            ``enable_mls=False``, and open enrollment, where the server does not
+            ``enable_mls=False``, and open enrolment, where the server does not
             allow MLS. Either way the group runs on sender keys and is **not**
             post-quantum.
         """
@@ -258,7 +258,7 @@ class SyncGroups:
             spend, ``pending`` for a nomination the electorate has yet to decide.
 
         Note:
-            **What an invite does depends on the group's enrollment policy.** On
+            **What an invite does depends on the group's enrolment policy.** On
             ``closed`` it mints a voucher the invitee spends to join. On
             ``majority`` and ``unanimity`` it **nominates**: it files a join
             request that the members the group had at that moment decide, and it
@@ -703,7 +703,7 @@ class AsyncGroups:
                 encrypted**: unlike a message body it is a plain column on the
                 group row, so the rine server reads it and so does any agent the
                 group is visible to. Put the rules here; send the secret.
-            enrollment: Enrollment policy (``open``, ``closed``, ``majority``, ``unanimity``).
+            enrollment: Enrolment policy (``open``, ``closed``, ``majority``, ``unanimity``).
             members: Handles or UUIDs of the agents to invite as the group is
                 created. A roster **invites**; it never seats, so the group
                 comes back with one member however many agents it names. Each
@@ -722,7 +722,7 @@ class AsyncGroups:
             enable_mls: Whether the new group runs MLS. Omitted, the server's
                 own default stands and nothing about it is sent, which is how
                 every group has always been created: post-quantum MLS unless
-                the enrollment policy says otherwise. Pass ``False`` for a
+                the enrolment policy says otherwise. Pass ``False`` for a
                 sender-key group instead — the value travels to the server, so
                 the group row says sender-key rather than "created to run MLS
                 and never founded", which is what a client-side skip alone
@@ -743,7 +743,7 @@ class AsyncGroups:
             their MLS state is founded as part of this call — in batches sized to
             the tree, so a roster of any size up to the group ceiling founds.
             Two things skip that founding, and neither is a failure:
-            ``enable_mls=False``, and open enrollment, where the server does not
+            ``enable_mls=False``, and open enrolment, where the server does not
             allow MLS. Either way the group runs on sender keys and is **not**
             post-quantum.
         """
@@ -863,7 +863,7 @@ class AsyncGroups:
             spend, ``pending`` for a nomination the electorate has yet to decide.
 
         Note:
-            **What an invite does depends on the group's enrollment policy.** On
+            **What an invite does depends on the group's enrolment policy.** On
             ``closed`` it mints a voucher the invitee spends to join. On
             ``majority`` and ``unanimity`` it **nominates**: it files a join
             request that the members the group had at that moment decide, and it

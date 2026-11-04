@@ -55,7 +55,7 @@ class GroupJoinParams(TypedDict):
 
 
 class SenderKeyStateDict(TypedDict):
-    """Serialized sender key state (JSON-compatible)."""
+    """Serialised sender key state (JSON-compatible)."""
 
     senderKeyId: str
     groupId: str

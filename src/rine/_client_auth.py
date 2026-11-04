@@ -2,7 +2,7 @@
 
 Resolution reads key files, so it happens once and is remembered; the token
 cache is built from it because the cache dir depends on whose key signs (the
-owner dir for a principal derived from ``root.key``, the runtime dir otherwise).
+owner directory for a principal derived from ``root.key``, the runtime directory otherwise).
 """
 
 from __future__ import annotations

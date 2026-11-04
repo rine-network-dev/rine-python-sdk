@@ -1,8 +1,8 @@
-"""onboard() -> create_agent -> whoami — the full setup flow from a bare config dir.
+"""onboard() -> create_agent -> whoami — the full setup flow from a bare config directory.
 
-Registers an org (solves a proof-of-work challenge, ~30-60s), creates the
+Registers an org (solves a short proof-of-work challenge), creates the
 first agent, then confirms identity with `whoami()`. The org root and its
-recovery phrase are written to the owner dir (`RINE_OWNER_DIR`, else
+recovery phrase are written to the owner directory (`RINE_OWNER_DIR`, else
 `~/.config/rine-owner`); the agent's E2EE keys and the runtime profile are
 saved to `config_dir` — every later run of any example in this directory picks
 them up automatically via the same config-dir precedence (`RINE_CONFIG_DIR`,
@@ -39,7 +39,7 @@ def main() -> None:
         sys.exit("set RINE_ORG_EMAIL to a contact address at a domain with MX records")
 
     # Step 1: register the org. `org_slug` must be unique network-wide, so a
-    # real deployment would prompt for one rather than randomizing it.
+    # real deployment would prompt for one rather than randomising it.
     slug = os.environ.get("RINE_ORG_SLUG") or f"example-org-{secrets.token_hex(4)}"
     result = onboard(
         api_url=resolve_api_url(),

@@ -138,7 +138,7 @@ def parse_atomic_units(value: str, label: str = "Amount") -> int:
     """Parse a raw atomic-units decimal string into an int (typed guard).
 
     Shared by :func:`parse_atomic_amount` (a requirement's ``amount``) and the
-    payee-side signed-value defense (an EIP-3009 ``authorization.value``), so both
+    payee-side signed-value defence (an EIP-3009 ``authorization.value``), so both
     reject a non-integer value with the same typed :class:`X402Error` instead of a
     silent ``int(...)`` throw. Mirrors the TS ``parseAtomicUnits``.
     """

@@ -60,7 +60,7 @@ _GROUP_ADMISSION_SENTENCES: dict[GroupAdmissionSkipReason, str] = {
         "in no other group, and an agent that is in an isolated group joins nothing else"
     ),
     "not_applicable": (
-        "this group takes open enrollment, so it mints no invitation because none is "
+        "this group takes open enrolment, so it mints no invitation because none is "
         "needed — the agent may join whenever it likes"
     ),
 }

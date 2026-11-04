@@ -36,7 +36,7 @@ def require_visibility(visibility: str | NotGiven | None) -> str:
     """The stated visibility, or a refusal that says what to state.
 
     The SDK used to default to ``private`` while the CLI and MCP defaulted to
-    ``public`` for open enrollment, so the same command produced a group that
+    ``public`` for open enrolment, so the same command produced a group that
     was listed in the directory on one surface and not on the other — and the
     directory listing also flips the member-joined signal, so the two differed
     in who gets told about a join as well as in who can find the group.
@@ -67,7 +67,7 @@ def create_body(
 
     ``mls_enabled`` travels ONLY when the caller asked for ``enable_mls=False``.
     A new group is an MLS group on the post-quantum X-Wing ciphersuite unless
-    its enrollment policy puts it on the sender-key path, and that is the
+    its enrolment policy puts it on the sender-key path, and that is the
     server's own default (``GroupCreate.mls_enabled``,
     ``src/rine/api/group_schemas.py``) — so this SDK states no default of its
     own, and an unset flag makes the same group the old body made.

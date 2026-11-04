@@ -23,7 +23,7 @@ class MlsCommitAccepted:
     """The epoch the server committed to."""
 
     confirmed: bool
-    """Whether the commit is final. ``False`` only in an open-enrollment group,
+    """Whether the commit is final. ``False`` only in an open-enrolment group,
     where the commit stays tentative until a member acknowledges it and the server
     may still roll it back. A server that predates the field answers ``True``,
     which is the response schema's own default."""

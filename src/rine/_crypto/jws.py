@@ -70,10 +70,10 @@ def _canonical_value(value: str | int) -> str:
 
 
 def canonicalize(value: Claims) -> str:
-    """Serialize a restricted-JCS object to its canonical text.
+    """Serialise a restricted-JCS object to its canonical text.
 
     Args:
-        value: The object to serialize.
+        value: The object to serialise.
 
     Returns:
         The canonical text: keys sorted by byte value, no whitespace, strings
@@ -170,7 +170,7 @@ def sign_jws(typ: JwsTyp, payload: Claims, seed: bytes) -> str:
         seed: 32-byte Ed25519 private seed.
 
     Returns:
-        The compact serialization ``header.payload.signature``.
+        The compact serialisation ``header.payload.signature``.
     """
     header = _expected_header(typ)
     input_text = f"{to_base64url(header.encode())}.{to_base64url(canonicalize(payload).encode())}"
@@ -185,7 +185,7 @@ def verify_jws(compact: str, public_key: bytes, typ: JwsTyp) -> dict[str, str | 
     then the signature, then the payload's canonical form.
 
     Args:
-        compact: The compact serialization to verify.
+        compact: The compact serialisation to verify.
         public_key: 32-byte Ed25519 public key of the expected signer.
         typ: The ``typ`` header value the JWS must carry.
 
@@ -204,7 +204,7 @@ def verify_jws(compact: str, public_key: bytes, typ: JwsTyp) -> dict[str, str | 
     try:
         signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
     except UnicodeEncodeError as exc:
-        raise JwsError("jws: malformed compact serialization") from exc
+        raise JwsError("jws: malformed compact serialisation") from exc
     if not verify_ed25519_strict(public_key, signing_input, _decode_bytes(parts[2])):
         raise JwsError("jws: bad signature")
     payload_text = _decode_text(parts[1])

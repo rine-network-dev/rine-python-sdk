@@ -37,8 +37,8 @@ class TokenCache:
     """The token one client is holding, and the deadline it is judged against.
 
     Not shared between clients: the margin is drawn per client so co-located
-    clients desynchronize their refreshes, and two clients sharing one instance
-    would resynchronize them. The DISK cache underneath *is* shared, and that is
+    clients desynchronise their refreshes, and two clients sharing one instance
+    would resynchronise them. The DISK cache underneath *is* shared, and that is
     where a warm start gets its token from.
     """
 

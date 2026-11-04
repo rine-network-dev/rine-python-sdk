@@ -1,7 +1,7 @@
 """Joining a group by RFC 9420 external commit — the way in without a Welcome.
 
 Used when an agent is a rine member of an MLS group that nobody minted a Welcome
-for: open enrollment admits a joiner with no member in the loop. The joiner takes
+for: open enrolment admits a joiner with no member in the loop. The joiner takes
 the group's published GroupInfo, derives its own leaf against the group's
 ``external_pub``, and publishes a commit that admits it and advances the epoch
 for everyone else.

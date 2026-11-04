@@ -7,7 +7,7 @@ then reviews pending requests with `list_requests()` and casts a vote with
 `vote()`; the request resolves once enough votes are in.
 
 This script runs both roles against the group it creates: it submits a join
-request as a second config dir (`.rine-peer`, generated via `onboard.py`
+request as a second config directory (`.rine-peer`, generated via `onboard.py`
 against a different `org_slug` if you want a truly separate identity) and
 then, using the group creator's own credentials, approves it. Point
 `PEER_CONFIG_DIR` at any onboarded identity that isn't already a member.
@@ -49,7 +49,7 @@ def main() -> None:
                 if isinstance(result, PendingJoinResult):
                     print(f"peer join is pending: request {result.request.id}")
                 else:
-                    print("peer joined immediately (enrollment was not majority/unanimity)")
+                    print("peer joined immediately (enrolment was not majority/unanimity)")
         except Exception as e:  # noqa: BLE001 — demo tolerates a missing peer identity
             print(f"peer join skipped ({e}); set up {PEER_CONFIG_DIR} to see this step")
 

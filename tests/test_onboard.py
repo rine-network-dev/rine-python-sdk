@@ -10,6 +10,7 @@ import pytest
 import respx
 
 from rine._config import get_cached_token_entry
+from rine._constants import TERMS_VERSION
 from rine._crypto.derive_nodes import derive_branch, derive_org
 from rine._crypto.jws import JwsTyp, verify_jws
 from rine._crypto.org_words import org_words
@@ -249,6 +250,33 @@ class TestRegisterSolve:
 
         assert body["reader_public_key"]
         assert body["consent"] is True
+        assert body["terms_version"] == "1.3"
+
+    @respx.mock
+    def test_register_when_challenge_names_terms_version_then_solve_sends_it(
+        self, tmp_path, monkeypatch
+    ):
+        _no_pow(monkeypatch)
+        owner = str(tmp_path / "owner")
+        _, solve, _ = _mock_routes(owner, challenge={**CHALLENGE, "terms_version": "9.9"})
+
+        register(API, str(tmp_path / "cfg"), EMAIL, SLUG, NAME, owner_dir=owner)
+
+        assert json.loads(solve.calls[0].request.content)["terms_version"] == "9.9"
+
+    @respx.mock
+    def test_register_when_challenge_has_no_terms_version_then_solve_sends_the_constant(
+        self, tmp_path, monkeypatch
+    ):
+        """An old server presents no version, so the client sends the one it was built against."""
+        _no_pow(monkeypatch)
+        owner = str(tmp_path / "owner")
+        assert "terms_version" not in CHALLENGE
+        _, solve, _ = _mock_routes(owner)
+
+        register(API, str(tmp_path / "cfg"), EMAIL, SLUG, NAME, owner_dir=owner)
+
+        assert json.loads(solve.calls[0].request.content)["terms_version"] == TERMS_VERSION
 
 
 class TestRegisterSuccess:

@@ -55,7 +55,7 @@ def apply_cleartext_fields(
 
 
 def compact_json(obj: Any) -> bytes:
-    """Serialize to compact JSON bytes (no whitespace).
+    """Serialise to compact JSON bytes (no whitespace).
 
     Matches ``JSON.stringify()`` output for cross-language compatibility.
 

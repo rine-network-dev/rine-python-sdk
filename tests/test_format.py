@@ -17,6 +17,7 @@ from typing import Any, get_args
 import pytest
 
 from rine._mls.admission import MlsAdmissionResult
+from rine._resources.group_resume import NOT_AN_MLS_GROUP
 from rine.format import (
     _ENCRYPTION_WORDS,
     MLS_NEVER_FOUNDED_NOTE,
@@ -33,6 +34,7 @@ from rine.format import (
 )
 from rine.group_admission import GroupCreateWithRoster
 from rine.types import GroupRead
+from tests._twin import core_source, ts_text
 
 _BASE: dict[str, Any] = {
     "id": "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
@@ -399,7 +401,7 @@ class TestGroupEncryptionWord:
         said = describe_group_encryption(_group(enrollment_policy="open", mls_enabled=True))
 
         assert MLS_NEVER_FOUNDED_NOTE not in said
-        assert "open enrollment off the MLS path" in said
+        assert "open enrolment off the MLS path" in said
 
     def test_group_encryption_when_every_word_is_asked_for_then_each_has_a_sentence(self):
         # A word with no sentence is a ``KeyError`` in front of an operator, so
@@ -455,3 +457,30 @@ class TestJoinLines:
         # It joins; it never normalises. Every tail it appends is a sentence two
         # matrix drivers match, so rewriting one is the thing it may not do.
         assert _join_lines("head.", " tail ") == "head.\n tail "
+
+
+class TestSenderKeySummaryTwin:
+    def test_head_and_shared_clauses_when_read_beside_group_format_then_both_stacks_say_them(self):
+        """``SENDER_KEY_SUMMARY`` words the same reasons in its own punctuation."""
+        head = "Sender Keys \u2014 NOT post-quantum."
+        core = ts_text(core_source("group-format.ts"), "const SENDER_KEY_SUMMARY =")
+        core = core.replace("${SENDER_KEY_HEAD}", head)
+        py = _ENCRYPTION_WORDS["sender-key"]
+        for clause in (
+            head,
+            "open enrolment off the MLS path",
+            "unattested joiner a cryptographic seat",
+            "a closed group created without MLS",
+            "Removal here is enforced by rine's delivery filter, not by cryptography.",
+        ):
+            assert clause in py, clause
+            assert clause in core, clause
+
+
+class TestNotAnMlsGroupResumeTwin:
+    def test_refusal_when_read_beside_the_core_function_then_it_is_sentence_for_sentence_identical(self):
+        text = ts_text(
+            core_source("mls-recovery-format.ts"),
+            "export function notAnMlsGroupResume(groupRef: string): string {\n\treturn (",
+        )
+        assert text.replace("${groupRef}", "{handle}") == NOT_AN_MLS_GROUP

@@ -14,7 +14,7 @@ Wire format, byte-for-byte the same as the TypeScript stack's
     [remaining: AES-256-GCM ciphertext + 16-byte auth tag]
 
 The AEAD nonce is twelve zero bytes and is not on the wire: both KEM halves are
-freshly randomized per message, so the derived key is used exactly once. The
+freshly randomised per message, so the derived key is used exactly once. The
 AAD is never caller-supplied bytes — it is encoded from a closed
 :data:`SealContext` union, so a payload only opens under its own context.
 """

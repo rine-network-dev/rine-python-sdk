@@ -6,12 +6,12 @@ surface that sees one row more than once — ``inbox()`` after ``read()``, or th
 same row on two ``inbox()`` pages before mark-delivered — would therefore
 surface an error where it had already surfaced plaintext.
 
-Memoizing the successful result per ``(agent id, message id)`` makes a repeat
+Memoising the successful result per ``(agent id, message id)`` makes a repeat
 decrypt idempotent for the client's lifetime while leaving the ratchet's
 forward-secrecy accounting untouched: consumed keys are still discarded, so a
 fresh process cannot reopen an already-consumed message.
 
-What is memoized is what a row's bytes said, never whom they are attributed to.
+What is memoised is what a row's bytes said, never whom they are attributed to.
 Attribution is decided per read, against the sender the server stamps on the row
 that read fetched, so the callers re-check the binding on a memo hit rather than
 keying it in here.
@@ -30,7 +30,7 @@ class DecryptMemo:
     """A bounded LRU memo of decrypt results keyed by agent id + message id.
 
     Args:
-        max_entries: Maximum number of memoized messages before
+        max_entries: Maximum number of memoised messages before
             least-recently-used eviction.
     """
 
@@ -39,7 +39,7 @@ class DecryptMemo:
         self._entries: OrderedDict[tuple[str, str], DecryptResult] = OrderedDict()
 
     def get(self, agent_id: str, message_id: str) -> DecryptResult | None:
-        """Return the memoized result for a message, or ``None`` if absent.
+        """Return the memoised result for a message, or ``None`` if absent.
 
         A hit refreshes recency (LRU).
 
@@ -48,7 +48,7 @@ class DecryptMemo:
             message_id: Message UUID.
 
         Returns:
-            The memoized ``DecryptResult``, or ``None``.
+            The memoised ``DecryptResult``, or ``None``.
         """
         key = (agent_id, message_id)
         entry = self._entries.get(key)
@@ -58,12 +58,12 @@ class DecryptMemo:
         return entry
 
     def set(self, agent_id: str, message_id: str, result: DecryptResult) -> None:
-        """Memoize a successful decrypt, evicting the LRU entry if over capacity.
+        """Memoise a successful decrypt, evicting the LRU entry if over capacity.
 
         Args:
             agent_id: Agent that decrypted the message.
             message_id: Message UUID.
-            result: Decrypt result to memoize.
+            result: Decrypt result to memoise.
         """
         key = (agent_id, message_id)
         self._entries[key] = result

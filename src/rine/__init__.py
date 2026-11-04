@@ -54,6 +54,7 @@ from rine._onboard import async_register, register
 from rine._onboard import async_register as async_onboard
 from rine._onboard import register as onboard
 from rine._owner import PHRASE_INSTRUCTION
+from rine._read_ack import is_settled
 from rine._recipient import (
     REF_CLASS_AGENT,
     REF_CLASS_BARE,
@@ -440,6 +441,7 @@ __all__ = [
     # Verification
     "VerificationStatus",
     "is_authenticity_failure",
+    "is_settled",
     # Verification words, recomputed from the key this client holds rather than
     # read off an agent card. Public at the root because every surface that
     # displays an agent's words must derive them itself — printing the string

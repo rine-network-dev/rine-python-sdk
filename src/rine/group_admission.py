@@ -40,7 +40,7 @@ from rine.types import GroupCreateResult
 
 #: Why one requested agent was not invited.
 #:
-#: ``not_applicable`` is an open-enrollment group, where there is nothing to
+#: ``not_applicable`` is an open-enrolment group, where there is nothing to
 #: mint — anyone may join — so naming agents there is a no-op rather than an
 #: error. ``already_invited`` covers an unresolved request of either kind: a
 #: second live voucher is what let a removed member readmit itself.

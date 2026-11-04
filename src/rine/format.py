@@ -2,9 +2,9 @@
 
 A rine group runs one of two encryptions, and both are supported products.
 Closed, majority and unanimity groups run on **MLS over the post-quantum X-Wing
-ciphersuite**, which is the default for every new group. Open-enrollment groups
+ciphersuite**, which is the default for every new group. Open-enrolment groups
 run on **sender keys**: MLS's Add semantics would hand an unattested joiner a
-cryptographic seat, so the server keeps open enrollment on the sender-key path
+cryptographic seat, so the server keeps open enrolment on the sender-key path
 by design. These predicates are how a surface tells the two apart.
 
 The first two answer different questions and must never be swapped:
@@ -214,18 +214,18 @@ _ENCRYPTION_WORDS: dict[GroupEncryption, str] = {
     # :func:`describe_group_encryption` from this same head plus
     # :func:`unfounded_group_note`, so there is one wording and not a table row
     # that quietly disagrees with it.
-    # 🔴 It does not say "this group is open-enrollment". A group runs sender
-    # keys whenever it has no ratchet tree, and open enrollment is only the
+    # 🔴 It does not say "this group is open-enrolment". A group runs sender
+    # keys whenever it has no ratchet tree, and open enrolment is only the
     # commonest way to be in that position: a closed group created without MLS
     # lands on this same word, and telling its operator their private group is
-    # open-enrollment is a misstatement about who can join it. A group created
+    # open-enrolment is a misstatement about who can join it. A group created
     # to run MLS and never founded lands on ``mls-never-founded`` instead —
     # this word is true of it, but only half the answer.
     "sender-key": (
         f"{_SENDER_KEYS_HEAD} A group runs them whenever it "
-        "has no ratchet tree. Open-enrollment groups are that way by design — "
+        "has no ratchet tree. Open-enrolment groups are that way by design — "
         "MLS would hand an unattested joiner a cryptographic seat, so the server "
-        "keeps open enrollment off the MLS path — and a closed group created "
+        "keeps open enrolment off the MLS path — and a closed group created "
         "without MLS runs them too. Removal here is enforced by rine's delivery "
         "filter, not by cryptography."
     ),
@@ -332,7 +332,7 @@ def group_is_mls(g: GroupRead) -> bool:
     state. It is the only field that says so.
 
     ``mls_enabled`` is an *intent* flag — a closed group carries it from birth,
-    before any MLS state exists, and an open-enrollment group carries it while
+    before any MLS state exists, and an open-enrolment group carries it while
     running on sender keys, because the server refuses MLS there. ``mls_pending``
     marks an init in flight, which is not state either. Neither belongs in this
     answer; a surface that reads them labels a sender-key group "MLS".

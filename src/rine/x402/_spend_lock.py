@@ -5,7 +5,7 @@ two processes of the same agent cannot both slip a payment past the daily cap
 (the cross-process TOCTOU fix). Byte-compatible with the TypeScript lock: same
 path (``keys/{agent_id}/wallet-spend.lock``), same body and protocol
 (:mod:`rine._file_lock`), and the same ``STALE_MS``/``ACQUIRE_TIMEOUT_MS``/
-``POLL_MS`` constants — so a Python and a Node payer of one agent serialize
+``POLL_MS`` constants — so a Python and a Node payer of one agent serialise
 against each other on a shared config dir.
 """
 

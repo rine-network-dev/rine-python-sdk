@@ -1,12 +1,12 @@
 """Facilitator client + presets (payee verify/settle side).
 
 The facilitator is a third-party service the *payee* calls to ``/verify`` a signed
-authorization and ``/settle`` it on-chain. rine never runs a facilitator and never
+authorisation and ``/settle`` it on-chain. rine never runs a facilitator and never
 touches settlement (the pure-metadata-relay posture) — this client just speaks the
 standard x402 facilitator HTTP API to whichever facilitator the payee configures.
 
-Presets: ``cdp`` (Coinbase Developer Platform, the default),
-``payai`` (keyless hosted facilitator), and self-hosted ``x402-rs`` (base URL
+Presets: ``payai`` (keyless hosted facilitator, the default), ``cdp`` (Coinbase
+Developer Platform, needs an API key), and self-hosted ``x402-rs`` (base URL
 supplied by the caller — a first-class option, not a fallback). The presets are
 convenience shortcuts only — any facilitator that implements the standard x402
 ``/verify`` + ``/settle`` API is natively supported via an explicit ``base_url``.
@@ -58,14 +58,36 @@ FACILITATOR_PRESETS: dict[str, FacilitatorPreset] = {
     ),
 }
 
-FEATURED_FACILITATOR = "cdp"
-"""Default preset in examples; any x402-API facilitator is interchangeable."""
+FEATURED_FACILITATOR = "payai"
+"""Default preset when none is named; any x402-API facilitator is interchangeable."""
 
 
-def resolve_base_url(facilitator: str, base_url: str | None = None) -> str:
-    """Resolve a facilitator preset name (or explicit URL) to a base URL."""
+def resolve_base_url(
+    facilitator: str | None,
+    base_url: str | None = None,
+    *,
+    api_key: str | None = None,
+) -> str:
+    """Resolve a facilitator preset name (or explicit URL) to a base URL.
+
+    ``facilitator=None`` means the default preset (``FEATURED_FACILITATOR``, keyless).
+
+    Raises:
+        ValueError: For an unknown preset, a preset that needs a ``base_url``, or an
+            ``api_key`` with neither a named facilitator nor a ``base_url``. The last
+            fails closed: the key was issued for some facilitator, and sending it to
+            the implicit default would leak it to a third party.
+    """
     if base_url:
         return base_url.rstrip("/")
+    if facilitator is None:
+        if api_key:
+            raise ValueError(
+                "An api_key needs a named facilitator or a base_url: the default "
+                f"facilitator ({FEATURED_FACILITATOR!r}) is keyless, so the key would be "
+                "sent to a service it was not issued for"
+            )
+        facilitator = FEATURED_FACILITATOR
     preset = FACILITATOR_PRESETS.get(facilitator)
     if preset is None:
         raise ValueError(
@@ -81,7 +103,7 @@ def assert_facilitator_transport(base_url: str) -> None:
 
     ``https:`` is always fine; ``http:`` is allowed ONLY to a loopback host
     (``127.0.0.1``/``localhost``/``::1``), credentials or not — a facilitator call
-    carries the payment terms and the signed authorization, and there is no
+    carries the payment terms and the signed authorisation, and there is no
     legitimate reason to send it in cleartext to a remote host where an on-path
     attacker could tamper with the ``/verify``+``/settle`` exchange. Any other
     scheme is rejected outright. Mirrors ``rine-core`` ``assertFacilitatorTransport``.
@@ -140,7 +162,7 @@ class FacilitatorClient:
 
     def __init__(
         self,
-        facilitator: str = FEATURED_FACILITATOR,
+        facilitator: str | None = None,
         *,
         base_url: str | None = None,
         api_key: str | None = None,
@@ -148,11 +170,14 @@ class FacilitatorClient:
     ) -> None:
         """Configure against a preset name or an explicit facilitator base URL.
 
+        ``facilitator=None`` with no ``base_url`` selects the default keyless preset.
+
         Raises:
-            ValueError: If the resolved base URL is a non-loopback ``http://``
-                URL or an otherwise disallowed scheme (transport allowlist).
+            ValueError: If an ``api_key`` is given with neither a named facilitator
+                nor a ``base_url``, or if the resolved base URL is a non-loopback
+                ``http://`` URL or an otherwise disallowed scheme (transport allowlist).
         """
-        self.base_url = resolve_base_url(facilitator, base_url)
+        self.base_url = resolve_base_url(facilitator, base_url, api_key=api_key)
         assert_facilitator_transport(self.base_url)
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout, headers=headers)
@@ -172,7 +197,7 @@ class FacilitatorClient:
     async def verify(
         self, payment: PaymentPayload, requirement: PaymentRequirements
     ) -> dict[str, Any]:
-        """Verify a signed authorization (signature + balance; no broadcast)."""
+        """Verify a signed authorisation (signature + balance; no broadcast)."""
         resp = await self._client.post("/verify", json=_request_body(payment, requirement))
         resp.raise_for_status()
         data: dict[str, Any] = resp.json()
@@ -181,7 +206,7 @@ class FacilitatorClient:
     async def settle(
         self, payment: PaymentPayload, requirement: PaymentRequirements
     ) -> SettlementResponse:
-        """Broadcast the authorization on-chain, returning a ``SettlementResponse``."""
+        """Broadcast the authorisation on-chain, returning a ``SettlementResponse``."""
         resp = await self._client.post("/settle", json=_request_body(payment, requirement))
         resp.raise_for_status()
         data: SettlementResponse = resp.json()

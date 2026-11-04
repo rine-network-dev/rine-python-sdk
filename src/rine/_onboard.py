@@ -1,7 +1,7 @@
 """Org registration: the client mints the root, the server sees public keys.
 
 ``register`` mints the 32-byte org root, derives every key from it, solves the
-PoW, writes ``root.key`` and the recovery phrase to the owner dir, and sends the
+PoW, writes ``root.key`` and the recovery phrase to the owner directory, and sends the
 org and ``main`` branch public keys with a proof of possession. Ports rine-core's
 ``onboard.ts``; agents are created afterwards by :mod:`rine._agent_provision`.
 """
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     import httpx
 
 from rine._config import _ensure_dir, cache_token
-from rine._constants import MAIN_BRANCH
+from rine._constants import MAIN_BRANCH, TERMS_VERSION
 from rine._crypto.derive_nodes import BranchNode, OrgNode, derive_branch, derive_org
 from rine._crypto.org_words import org_words
 from rine._custody import Signer
@@ -126,6 +126,7 @@ class _Mint:
             "org_name": org_name,
             "org_slug": org_slug,
             "consent": True,
+            "terms_version": challenge.get("terms_version") or TERMS_VERSION,
             "main_branch": branch_key_body(self.main, cert),
             "reader_public_key": to_base64url(self.org.reader_pk),
             "proof": register_proof(api_url, self.org, challenge["challenge_id"]),
@@ -136,7 +137,7 @@ class _Mint:
 
 
 def _prepare(owner_dir: str | None, config_dir: str, org_slug: str) -> str:
-    """Validate the slug and the owner dir, and make the runtime dir the agents will use."""
+    """Validate the slug and owner directory, and make the agents' runtime directory."""
     if not validate_slug(org_slug):
         raise RineError(
             f"Invalid slug '{org_slug}'. Must match: [a-z0-9][a-z0-9-]{{0,30}}[a-z0-9]"
@@ -214,7 +215,7 @@ def register(
         org_slug: URL-safe org identifier.
         org_name: Human-readable org name.
         on_progress: Optional callback for PoW progress (0-100).
-        profile: Name of the org profile written to the owner dir.
+        profile: Name of the org profile written to the owner directory.
         owner_dir: Owner directory receiving ``root.key`` and the phrase;
             ``RINE_OWNER_DIR`` or ``~/.config/rine-owner`` when omitted.
         extra_headers: Headers sent with every request of the registration, the token
@@ -226,7 +227,7 @@ def register(
 
     Raises:
         RineError: If slug is invalid.
-        ConfigError: If the owner dir is unsafe or already holds an org.
+        ConfigError: If the owner directory is unsafe or already holds an org.
         ConflictError: If slug or email already in use.
         RateLimitError: If rate limited.
         RineApiError: If registration fails.

@@ -1,8 +1,8 @@
 """``profiles.json``: which principal each named profile acts as.
 
 The file holds no secret. A profile names a principal and the ids needed to find
-that principal's key files; a runtime dir carries ``agent:`` and ``branch:``
-principals only, and the owner dir carries the ``org:`` principal.
+that principal's key files; a runtime directory carries ``agent:`` and ``branch:``
+principals only, and the owner directory carries the ``org:`` principal.
 """
 
 from __future__ import annotations

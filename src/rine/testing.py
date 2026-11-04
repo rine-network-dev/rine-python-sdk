@@ -174,7 +174,7 @@ def write_agent_identity(
 
 
 def write_owner(owner_dir: str, *, world: World = WORLD, profile: str = DEFAULT_PROFILE) -> None:
-    """Save the world's ``root.key`` and the org profile in an owner dir."""
+    """Save the world's ``root.key`` and the org profile in an owner directory."""
     save_root(owner_dir, world.root)
     add_profile_if_absent(
         owner_dir,

@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 class PreparedPayment:
     """The result of :func:`prepare_payment` — signed message + accounting facts.
 
-    ``auto_payable`` reflects the policy's ``autoPayThreshold``: a caller honoring
+    ``auto_payable`` reflects the policy's ``autoPayThreshold``: a caller honouring
     ``--auto-pay`` sends without a human prompt only when this is ``True``.
     """
 

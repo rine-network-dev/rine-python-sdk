@@ -67,7 +67,7 @@ class BaseRineClient:
             ``~/.config/rine-owner``). Needed only to act as the org or a branch.
         profile: Named profile to act as. The default profile when omitted.
         agent_only: Act only as an agent whose leaf keys are in ``config_dir``; the
-            owner dir is never read, so a host that also holds ``root.key`` cannot
+            owner directory is never read, so a host that also holds ``root.key`` cannot
             turn this client into the org. Excludes ``owner_dir``.
     """
 
@@ -140,7 +140,7 @@ class BaseRineClient:
     def _local_org_id(self) -> str | None:
         """The org id of the identity this client acts as, when it holds one.
 
-        Read from the resolved auth, which prefers the owner dir's profile, so a
+        Read from the resolved auth, which prefers the owner directory's profile, so a
         recovered or org-principal client compares the server's answer with the
         org its own credentials name.
         """

@@ -1,7 +1,7 @@
 """Which principal a directory acts as, and which key signs for it.
 
-Key material lives in two places. The owner dir holds ``root.key``, from which
-the org and every branch beneath it derive. A runtime dir holds an agent's leaf
+Key material lives in two places. The owner directory holds ``root.key``, from which
+the org and every branch beneath it derive. A runtime directory holds an agent's leaf
 keys and, for a delegate, a branch's two secrets under ``branch/<name>/``.
 :func:`resolve_auth` reads both and says who this process may act as.
 """
@@ -67,7 +67,7 @@ def _branch(config_dir: str, org: OrgNode | None, name: str) -> tuple[BranchSecr
 
 
 def load_custody(config_dir: str, owner_dir: str | None, branch: str) -> Custody:
-    """Custody of ``branch``: from ``root.key`` when the owner dir has one, else delegate files.
+    """Custody of ``branch``: ``root.key`` if the owner directory has one, else delegate files.
 
     Raises:
         ConfigError: This process holds no key material for the branch.
@@ -84,14 +84,14 @@ def load_custody(config_dir: str, owner_dir: str | None, branch: str) -> Custody
     )
     if held is None or org_id is None:
         raise ConfigError(
-            f"No key material for branch '{branch}': need root.key in the owner dir "
-            "or branch key files in the config dir."
+            f"No key material for branch '{branch}': need root.key in the owner directory "
+            "or branch key files in the config directory."
         )
     return Custody(org_id, held)
 
 
 def local_agent_ids(config_dir: str) -> list[str]:
-    """The agent ids whose leaf keys this config dir holds."""
+    """The agent ids whose leaf keys this config directory holds."""
     try:
         names = os.listdir(os.path.join(config_dir, "keys"))
     except FileNotFoundError:
@@ -123,11 +123,11 @@ def _signer_for(
 def _choose_profile(
     config_dir: str, owner_dir: str | None, profile: str | None, owner_org: str | None
 ) -> Profile | None:
-    """The profile to act as: the org's when the owner dir holds its root, by default.
+    """The profile to act as: the org's when the owner directory holds its root, by default.
 
-    A named profile is looked up in the runtime dir first. The owner dir's
-    profile applies to a runtime dir only when both name the same org, so a
-    second org's runtime dir is never signed as the first org.
+    A named profile is looked up in the runtime directory first. The owner directory's
+    profile applies to a runtime directory only when both name the same org, so a
+    second org's runtime directory is never signed as the first org.
     """
     name = profile or DEFAULT_PROFILE
     runtime = get_profile(config_dir, name)

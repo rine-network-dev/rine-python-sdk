@@ -25,8 +25,14 @@ from rine import (
 )
 from rine._constants import VoteEligibilityReason
 from rine.types import JoinRequestRead
-from rine.vote_words import _ELIGIBILITY_CLAUSES
-from tests._twin import core_source
+from rine.vote_words import (
+    _ELIGIBILITY_CLAUSES,
+    VOTE_DURATION_DEFAULT_HOURS,
+    VOTE_DURATION_MAX_HOURS,
+    VOTE_DURATION_MIN_HOURS,
+    VOTE_DURATION_RULE,
+)
+from tests._twin import core_source, ts_text
 
 _BASE: dict[str, Any] = {
     "id": "11111111-2222-3333-4444-555555555555",
@@ -317,3 +323,16 @@ class TestEligibilityClausesTwin:
         core = dict(re.findall(r'(\w+):\s*"((?:[^"\\]|\\.)*)"', table.group(1)))
 
         assert core == dict(_ELIGIBILITY_CLAUSES)
+
+
+class TestDurationRuleTwin:
+    def test_rule_when_read_beside_the_core_constant_then_it_is_byte_identical(self):
+        """The sentence both stacks tell an agent about how long a request stays open."""
+        text = ts_text(core_source("vote-words.ts"), "export const VOTE_DURATION_RULE =")
+        holes = {
+            "VOTE_DURATION_MIN_HOURS": VOTE_DURATION_MIN_HOURS,
+            "VOTE_DURATION_MAX_HOURS": VOTE_DURATION_MAX_HOURS,
+            "VOTE_DURATION_DEFAULT_HOURS": VOTE_DURATION_DEFAULT_HOURS,
+        }
+        core = re.sub(r"\$\{(\w+)\}", lambda m: str(holes[m.group(1)]), text)
+        assert core == VOTE_DURATION_RULE

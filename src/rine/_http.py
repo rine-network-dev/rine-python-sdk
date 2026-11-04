@@ -79,7 +79,7 @@ def _parse_retry_after(response: httpx.Response) -> float | None:
 
 
 def _token_retry_delay(attempt: int, retry_after: float | None, rng: Callable[[], float]) -> float:
-    """Delay before the next token retry: honor ``Retry-After``, else full jitter.
+    """Delay before the next token retry: honour ``Retry-After``, else full jitter.
 
     Full jitter draws uniformly from ``[0, min(cap, base * 2**attempt))`` so
     co-located clients that all trip a 429 do not retry in lockstep.
@@ -127,7 +127,7 @@ def _jittered_margin(rng: Callable[[], float]) -> float:
     """Draw a per-client token-refresh margin: base + uniform(0, jitter) seconds.
 
     Drawn once per client so a single client stays stable around the expiry
-    boundary while co-located clients desynchronize.
+    boundary while co-located clients desynchronise.
 
     Args:
         rng: Uniform ``[0, 1)`` source.
@@ -197,7 +197,7 @@ def _fetch_oauth_token(
     retry that resent the first form would be refused as a replay.
 
     On a ``429`` the POST is retried up to ``TOKEN_RETRY_ATTEMPTS`` times,
-    honoring ``Retry-After`` (else exponential backoff with full jitter) and
+    honouring ``Retry-After`` (else exponential backoff with full jitter) and
     capping cumulative sleep at ``TOKEN_RETRY_TOTAL_CAP`` seconds. Non-429
     failures fail fast.
 
@@ -270,7 +270,7 @@ class SyncHttpClient:
         owner_dir: Owner directory holding ``root.key``. ``RINE_OWNER_DIR``, else
             ``~/.config/rine-owner``, when omitted.
         profile: Named profile to act as; the default profile when omitted.
-        agent_only: Never read the owner dir, so ``root.key`` cannot make this
+        agent_only: Never read the owner directory, so ``root.key`` cannot make this
             client the org (excludes ``owner_dir``).
     """
 
@@ -681,7 +681,7 @@ class AsyncHttpClient:
         owner_dir: Owner directory holding ``root.key``. ``RINE_OWNER_DIR``, else
             ``~/.config/rine-owner``, when omitted.
         profile: Named profile to act as; the default profile when omitted.
-        agent_only: Never read the owner dir, so ``root.key`` cannot make this
+        agent_only: Never read the owner directory, so ``root.key`` cannot make this
             client the org (excludes ``owner_dir``).
     """
 
