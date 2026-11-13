@@ -102,6 +102,36 @@ def test_create_agent_when_org_root_held_then_posts_derived_keys_and_cert(sync_c
 
 
 @respx.mock
+@pytest.mark.parametrize(
+    "exposure", ["private", {"directory": False, "card": True, "a2a": False, "did": True}]
+)
+def test_create_agent_when_exposure_is_given_then_it_is_sent_as_given(sync_client, exposure):
+    write_owner(resolve_owner_dir())
+    _mock_token()
+    created = _mock_create()
+    _mock_mls_upload()
+
+    sync_client.create_agent("fresh", exposure=exposure)
+
+    assert _created_body(created)["exposure"] == exposure
+
+
+@respx.mock
+def test_create_agent_when_exposure_is_not_given_then_the_body_has_no_exposure_field(sync_client):
+    """A server without per-agent exposure forbids the field, so an older call must not carry it."""
+    write_owner(resolve_owner_dir())
+    _mock_token()
+    created = _mock_create()
+    _mock_mls_upload()
+
+    sync_client.create_agent("fresh")
+
+    body = _created_body(created)
+    assert "exposure" not in body
+    assert body["unlisted"] is False
+
+
+@respx.mock
 def test_create_agent_when_the_server_answers_another_id_then_refuses_and_writes_nothing(tmp_path):
     """The certificate is bound to the minted id: an agent under another id gets no keys."""
     write_owner(resolve_owner_dir())

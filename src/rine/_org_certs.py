@@ -12,6 +12,7 @@ name and flags, and rotate is the next generation and nothing else.
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from rine._crypto.certs import CERT_VERSION, key_digest
@@ -19,6 +20,9 @@ from rine._crypto.derive_nodes import AgentNode, BranchNode, OrgNode, derive_age
 from rine._crypto.jws import JwsTyp, sign_jws
 from rine._crypto.keys import AgentKeys, agent_keys_from_node, public_keys_body
 from rine._utils import to_base64url
+
+ExposureArg = str | Mapping[str, bool]
+"""A preset name or the four switches (``directory``, ``card``, ``a2a``, ``did``)."""
 
 if TYPE_CHECKING:
     from rine._branch_custody import BranchSecrets
@@ -122,15 +126,25 @@ def _agent_request(custody: Custody, agent_id: str, gen: int) -> AgentRequest:
 
 
 def agent_create_request(
-    custody: Custody, agent_id: str, name: str, *, human_oversight: bool, unlisted: bool
+    custody: Custody,
+    agent_id: str,
+    name: str,
+    *,
+    human_oversight: bool,
+    unlisted: bool,
+    exposure: ExposureArg | None = None,
 ) -> AgentRequest:
-    """The ``POST /agents`` body for a new agent: a client-minted id and generation-0 keys."""
+    """The ``POST /agents`` body for a new agent: a client-minted id and generation-0 keys.
+
+    ``exposure`` is sent only when set: a server without per-agent exposure rejects the field.
+    """
     request = _agent_request(custody, agent_id, 0)
     request.body = {
         "id": agent_id,
         "name": name,
         "human_oversight": human_oversight,
         "unlisted": unlisted,
+        **({} if exposure is None else {"exposure": exposure}),
         **request.body,
     }
     return request

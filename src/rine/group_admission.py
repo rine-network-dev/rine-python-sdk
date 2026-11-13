@@ -51,6 +51,7 @@ GroupAdmissionSkipReason = Literal[
     "already_invited",
     "isolation_conflict",
     "not_applicable",
+    "org_rule",
 ]
 
 #: Which outstanding population ``groups.list_requests`` asks the server for.
@@ -76,8 +77,14 @@ class GroupAdmissionEntry(BaseModel):
 
     agent_id: UUID
     status: Literal["invited", "nominated", "skipped"]
-    reason: GroupAdmissionSkipReason | None = None
-    """Present iff ``status == "skipped"``."""
+    reason: GroupAdmissionSkipReason | str | None = None
+    """Present iff ``status == "skipped"``.
+
+    Loose on read: a token a newer server adds parses and keeps its raw string,
+    and :func:`rine.admission_words.group_admission_skip_sentence` quotes it back
+    rather than raising. A strict ``Literal`` here made a plural invite from an
+    older client raise a parse error the moment the server refused an agent for a
+    reason the client predates."""
 
 
 class GroupAdmissionReport(BaseModel):

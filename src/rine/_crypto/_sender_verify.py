@@ -30,6 +30,7 @@ from rine._crypto._sender_verdict import (
     sender_matches,
     signer_ref,
     signing_key_fingerprint,
+    unverified,
     verdict,
     verify_with_keys,
 )
@@ -156,7 +157,7 @@ def verify_envelope_sender_sync(
     try:
         ref = signer_ref(kid, expected_sender_agent_id)
         if ref is None:
-            return SenderVerification(False, "sender-mismatch")
+            return unverified("sender-mismatch")
         agent_id = ref.agent_id
         keys, from_cache = get_agent_keys_sync(client, agent_id)
         step = gen_step(ref.key_gen, keys, from_cache)
@@ -169,7 +170,7 @@ def verify_envelope_sender_sync(
                 )
             keys, from_cache = fresh, False
         if step is GenStep.INVALID:
-            return verdict(False)
+            return unverified("invalid")
         historical = step is GenStep.HISTORY
         if historical:
             keys, _ = get_agent_keys_sync(client, agent_id, gen=ref.key_gen)
@@ -178,7 +179,7 @@ def verify_envelope_sender_sync(
             keys, scope, payload, signature, created_at, historical=historical
         )
         if verified or not from_cache:
-            return verdict(verified)
+            return verdict(verified, keys)
         fresh, _ = get_agent_keys_sync(client, agent_id, bypass=True)
         return rotation_verdict(agent_id, keys, fresh, scope, payload, signature, created_at)
     except KEY_READ_ERRORS as error:
@@ -216,7 +217,7 @@ async def verify_envelope_sender_async(
     try:
         ref = signer_ref(kid, expected_sender_agent_id)
         if ref is None:
-            return SenderVerification(False, "sender-mismatch")
+            return unverified("sender-mismatch")
         agent_id = ref.agent_id
         keys, from_cache = await get_agent_keys_async(client, agent_id)
         step = gen_step(ref.key_gen, keys, from_cache)
@@ -229,7 +230,7 @@ async def verify_envelope_sender_async(
                 )
             keys, from_cache = fresh, False
         if step is GenStep.INVALID:
-            return verdict(False)
+            return unverified("invalid")
         historical = step is GenStep.HISTORY
         if historical:
             keys, _ = await get_agent_keys_async(client, agent_id, gen=ref.key_gen)
@@ -238,7 +239,7 @@ async def verify_envelope_sender_async(
             keys, scope, payload, signature, created_at, historical=historical
         )
         if verified or not from_cache:
-            return verdict(verified)
+            return verdict(verified, keys)
         fresh, _ = await get_agent_keys_async(client, agent_id, bypass=True)
         return rotation_verdict(agent_id, keys, fresh, scope, payload, signature, created_at)
     except KEY_READ_ERRORS as error:

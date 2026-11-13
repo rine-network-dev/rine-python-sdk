@@ -58,6 +58,9 @@ class AgentRead(BaseModel):
     created_at: datetime
     revoked_at: datetime | None = None
     unlisted: bool | None = None
+    # Create only: the switches the new agent starts with, and the preset they equal.
+    exposure: dict[str, bool] | None = None
+    preset: str | None = None
     verification_words: str | None = None
     warnings: list[str] | None = None
     poll_url: str | None = None
@@ -77,6 +80,25 @@ class WhoAmIKind(StrEnum):
     AGENT = "agent"
     ORG_READER = "org_reader"
     BRANCH_READER = "branch_reader"
+
+
+class PostingRefusal(StrEnum):
+    """Why the server refuses our org's posts in a group (``GroupRead.posting_refused``).
+
+    Lives here, beside the model that carries it, so the formatter and the send
+    guard can both name it without importing each other.
+    """
+
+    FOREIGN_OPEN_GROUP = "foreign_open_group"
+    REFUSED_MEMBERS = "refused_members"
+
+    @classmethod
+    def known(cls, value: str | None) -> PostingRefusal | None:
+        """The refusal this client knows, or ``None`` for none set or a newer server's value."""
+        try:
+            return None if value is None else cls(value)
+        except ValueError:
+            return None
 
 
 class WhoAmIPrincipal(BaseModel):
@@ -130,6 +152,15 @@ class MessageRead(BaseModel):
     recipient_handle: str | None = None
     group_id: UUID | None = None
     group_handle: str | None = None
+    # Set by the server when a hold is involved (``sender_held``, ``recipient_held`` or
+    # ``held``): the row is context, never a live command. Any set value counts, so a value
+    # a newer server adds is still treated as context.
+    context_only: str | None = None
+    # On a group post's own response only: how many other member organisations may
+    # not be able to read it (their rules or ours refuse the sender key). Absent on
+    # 1:1 sends and on reads. :func:`rine.group_postable.unreadable_by_orgs_sentence`
+    # words it.
+    unreadable_by_orgs: int | None = None
 
 
 VerificationStatus = Literal["verified", "invalid", "sender-mismatch", "unverifiable"]
@@ -243,6 +274,9 @@ class DecryptedMessage(MessageRead):
     catch_up: GroupCatchUp | None = None
     a2a_cleartext: bool = False
     a2a_cleartext_notice: str | None = None
+    # The full public key that verified the signature, never serialised: an operator pin is
+    # compared against it, so it must not travel in a dump a model could read.
+    verifying_key: bytes | None = Field(default=None, exclude=True, repr=False)
 
     @classmethod
     def from_wire(cls, raw: Mapping[str, Any]) -> DecryptedMessage:
@@ -285,10 +319,17 @@ class ThreadEntry(BaseModel):
     :data:`~rine.a2a_cleartext.A2A_CLEARTEXT_NOTICE` sentence in brackets ahead of its
     ``text``, so a transcript handed to a model never reads that turn as end-to-end encrypted;
     ``a2a_cleartext`` is that same fact as a typed flag.
+
+    ``from_agent_id`` and ``sender_class`` say who sent the turn and how it reaches a model:
+    ``"operator"`` and ``"operator_history"`` only for a received direct turn the operator
+    classifier accepted, ``"other"`` for everything else (and for every call that was given no
+    :class:`~rine.operator_classify.OperatorContext`).
     """
 
     direction: Literal["sent", "received"]
     sender_handle: str | None = None
+    from_agent_id: str | None = None
+    sender_class: Literal["operator", "operator_history", "other"] = "other"
     text: str
     verification_status: VerificationStatus = "unverifiable"
     type: str
@@ -390,6 +431,14 @@ class GroupRead(BaseModel):
     # empty. Defaulted so an older server that omits the key still parses, and an
     # empty list is a fact rather than a null.
     member_agent_ids: list[UUID] = Field(default_factory=list)
+    # Why OUR org's posts here are refused, under its own ``external_groups`` rule;
+    # ``None`` when they are not, and whenever the org has no such rule on. Loose
+    # ``str`` so a refusal a newer server adds still parses; the known values are
+    # :class:`PostingRefusal`. Mirrors ``GroupRead`` in
+    # rine-core.
+    posting_refused: str | None = None
+    # The seated members' agents that our rule refuses; never our own agents.
+    refused_members: list[UUID] | None = None
     # How to SPELL the ids above, filled in by the client that read them and by
     # nothing else. Private on purpose rather than by preference: a pydantic
     # private attribute is absent from ``model_dump``, ``model_dump_json``, the

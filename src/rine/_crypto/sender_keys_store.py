@@ -196,7 +196,7 @@ async def with_sender_key_states(
     mind — ``rine._client.RineClient._self_heal_group_decrypt`` re-enters
     :func:`rine._crypto.message.decrypt_group_message_async` — and it may only do
     so from OUTSIDE this block. It does: the first attempt's exception has already
-    escaped the decrypt, and ``_fetch_pending_sk_distributions`` runs between the
+    escaped the decrypt, and ``_scan_pending_sk_distributions`` runs between the
     two attempts. That is why the decrypt takes the lock inside itself rather than
     the recovery taking it around both.
 

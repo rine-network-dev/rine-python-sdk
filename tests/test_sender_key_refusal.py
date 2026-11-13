@@ -47,6 +47,7 @@ import pytest
 import respx
 
 from rine._constants import MessageType
+from rine._sk_negative_cache import NEGATIVE_TTL_SECONDS, SENDER_KEY_NEGATIVE_CACHE
 from rine._thread import UNAVAILABLE, to_thread_entry
 from rine.errors import (
     SENDER_KEY_UNAVAILABLE_CODE,
@@ -807,15 +808,19 @@ class TestThreadEarnsItsRefusal:
         await async_client.close()
 
     @respx.mock
-    async def test_thread_when_called_again_then_it_explains_again_and_looks_again(
-        self, async_client, group_message_fixture, agent_id
+    async def test_thread_when_called_again_then_it_explains_again_and_remembers_the_empty_scan(
+        self, async_client, group_message_fixture, agent_id, monkeypatch
     ):
-        """A second transcript is a second render: a second sentence and a second scan.
+        """A second transcript is a second sentence, but the empty scan is the answer for 15 minutes.
 
-        Both budgets are per call for the same reason. A client renders for
-        hours, and one that declined to look because an earlier render already
-        had would refuse a row whose distribution arrived in between.
+        The sentence budget is per call. The scan is not: the process-wide negative cache
+        remembers that a scan for this sender's key found nothing, so a
+        client rendering for hours lists the distribution inbox once per window, not once per
+        render. The window ends, so a row whose distribution arrived in between is looked at
+        again.
         """
+        now = [1000.0]
+        monkeypatch.setattr(SENDER_KEY_NEGATIVE_CACHE, "_clock", lambda: now[0])
         _mock_identity_routes(agent_id)
         scan = _mock_empty_distribution_scan(agent_id)
         _mock_conversation(_group_rows(group_message_fixture, 2))
@@ -824,6 +829,9 @@ class TestThreadEarnsItsRefusal:
         entries = await async_client.thread(CONVERSATION_ID)
 
         _earned_shape(entries[0].text)
+        assert scan.call_count == 1
+        now[0] += NEGATIVE_TTL_SECONDS
+        await async_client.thread(CONVERSATION_ID)
         assert scan.call_count == 2
         await async_client.close()
 

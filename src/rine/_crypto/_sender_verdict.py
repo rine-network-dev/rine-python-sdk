@@ -36,13 +36,24 @@ if TYPE_CHECKING:
 class SenderVerification:
     """The outcome of verifying one envelope's sender signature.
 
+    ``verifying_key`` is the full 32-byte Ed25519 public key whose signature
+    checked out, and ``None`` unless ``verified``. After a rotation refetch it is
+    the refetched key when that is the one that verified, so a caller comparing it
+    with a pin compares the key that actually signed, never the one the cache held.
+
     ``key_changed`` is set only when the rotation refetch returned a *different*
     signing key, whichever way the re-verification then fell.
     """
 
     verified: bool
     verification_status: VerificationStatus
+    verifying_key: bytes | None
     key_changed: SenderKeyChange | None = None
+
+
+def unverified(verification_status: VerificationStatus) -> SenderVerification:
+    """A verdict that verified nothing, so there is no key to report."""
+    return SenderVerification(False, verification_status, None)
 
 
 def signing_key_fingerprint(keys: VerifiedAgentKeys) -> str:
@@ -79,9 +90,11 @@ def verify_with_keys(
     ) and verify_message_signature(keys.signing_public_key, scope, payload, signature)
 
 
-def verdict(verified: bool) -> SenderVerification:
-    """Wrap a plain verify outcome, with no key change to report."""
-    return SenderVerification(verified, "verified" if verified else "invalid")
+def verdict(verified: bool, keys: VerifiedAgentKeys) -> SenderVerification:
+    """Wrap a plain verify outcome against ``keys``, with no key change to report."""
+    if not verified:
+        return unverified("invalid")
+    return SenderVerification(True, "verified", keys.signing_public_key)
 
 
 def is_authenticity_failure(status: VerificationStatus) -> bool:
@@ -124,11 +137,12 @@ def rotation_verdict(
     previous = signing_key_fingerprint(cached)
     current = signing_key_fingerprint(fresh)
     if previous == current:
-        return verdict(False)
+        return unverified("invalid")
     verified = verify_with_keys(fresh, scope, payload, signature, created_at)
     return SenderVerification(
         verified,
         "verified" if verified else "invalid",
+        fresh.signing_public_key if verified else None,
         SenderKeyChange(
             agent_id=agent_id,
             previous_fingerprint=previous,
@@ -184,9 +198,9 @@ def failure_verdict(kid: str, error: Exception) -> SenderVerification:
     """
     if isinstance(error, ChainError):
         logger.debug("Refused sender %s (chain or pin)", kid, exc_info=True)
-        return SenderVerification(False, "invalid")
+        return unverified("invalid")
     logger.debug("Could not verify sender %s", kid, exc_info=True)
-    return SenderVerification(False, "unverifiable")
+    return unverified("unverifiable")
 
 
 KEY_READ_ERRORS = (

@@ -49,6 +49,7 @@ from rine._group_ref import (
 )
 from rine._resolve import invalid_agent_identifier, resolve_to_uuid_sync
 from rine.errors import GroupIdentityMismatchError, NotFoundError, RineApiError
+from rine.sender_key_words import SENDER_KEY_UNDELIVERED_REFUSAL, sender_key_undelivered
 from rine.thread_words import not_a_conversation_uuid
 
 from ._recipient_server import mocked_server
@@ -150,6 +151,8 @@ def compose(vector: dict[str, Any]) -> str | None:
             f"and the vector names '{vector['surface']}'"
         )
         return not_a_conversation_uuid(spelling)
+    if slot == "sender_key_undelivered":
+        return str(sender_key_undelivered("00000000-0000-0000-0000-000000000000"))
     raise AssertionError(f"unknown refusal slot '{slot}' in vector '{vector['id']}'")
 
 
@@ -241,6 +244,14 @@ def test_a_refusal_when_composed_here_then_it_matches_the_typescript_stack(
     """One sentence, two implementations, the same bytes."""
     assert "expected" in vector, f"{vector['id']} has no golden — regenerate"
     assert compose(vector) == vector["expected"]
+
+
+@needs_the_goldens
+def test_the_sender_key_refusal_constant_when_read_here_then_it_is_the_golden_sentence() -> None:
+    """Pins the constant, not only the error that carries it."""
+    vector = next((v for v in VECTORS if v["slot"] == "sender_key_undelivered"), None)
+    assert vector is not None, "the sender_key_undelivered vector is missing"
+    assert vector["expected"] == SENDER_KEY_UNDELIVERED_REFUSAL
 
 
 def test_the_agent_resolver_when_given_a_bare_name_then_it_raises_the_gated_sentence() -> None:

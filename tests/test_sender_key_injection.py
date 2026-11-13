@@ -30,7 +30,6 @@ thread (``rine._client.RineClient.send`` → ``rine._group_send.encrypt_for_grou
 from __future__ import annotations
 
 import httpx
-import pytest
 import respx
 
 from rine._constants import MessageType
@@ -58,18 +57,6 @@ DISTRIBUTION_ID = "99999999-8888-4777-8666-555555555555"
 ARRIVING_KEY_ID = "12345678-1234-4234-8234-123456789abc"
 #: Recognisable material: a chain key the reader must never seal under.
 ARRIVING_CHAIN_KEY = bytes(range(32))
-
-
-@pytest.fixture
-def foreign_config_dir(tmp_path):
-    """A config dir that is NOT the reader's, where another agent holds its keys.
-
-    Sealing needs the SENDER's private signing key, and putting it in the
-    reader's own dir would let a test pass on material no attacker has.
-    """
-    path = tmp_path / "foreign"
-    path.mkdir()
-    return str(path)
 
 
 def _agent(config_dir: str, agent_id: str) -> dict:

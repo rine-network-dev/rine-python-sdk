@@ -291,6 +291,7 @@ def _authenticate(
         envelope.kid,
         verification.verified,
         verification.verification_status,
+        verification.verifying_key,
         verification.key_changed,
     )
 

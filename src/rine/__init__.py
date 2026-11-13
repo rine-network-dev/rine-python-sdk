@@ -84,10 +84,23 @@ from rine.admission_words import (
     group_admission_skip_sentence,
     mls_admission_skip_sentence,
 )
+from rine.control_frames import (
+    HIDDEN_CONTROL_FRAME_READ,
+    OPERATOR_CONTENT_NOTICE,
+    OPERATOR_HISTORY_NOTICE,
+    UNTRUSTED_CONTENT_NOTICE,
+    control_frame_reply_refusal,
+    group_invite_notice,
+    is_control_frame_type,
+    is_group_invite,
+    is_hidden_from_model,
+    without_hidden_frames,
+)
 from rine.errors import (
     GROUP_EVICTED_CODE,
     MLS_RESYNC_UNAVAILABLE_CODE,
     SENDER_KEY_UNAVAILABLE_CODE,
+    SENDER_KEY_UNDELIVERED_CODE,
     WELCOME_REFUSED_CODE,
     AgentIdMismatchError,
     APIConnectionError,
@@ -115,6 +128,7 @@ from rine.errors import (
     RevokedScope,
     RineApiError,
     RineError,
+    SenderKeyUndeliveredError,
     SenderMismatchError,
     ServiceUnavailableError,
     SignatureVerificationError,
@@ -133,6 +147,10 @@ from rine.group_admission import (
     GroupInviteReport,
     OutstandingFilter,
 )
+from rine.group_postable import (
+    GroupPostingRefusedError,
+    unreadable_by_orgs_sentence,
+)
 from rine.group_removal import GroupRemovalEncryption, GroupRemovalResult
 from rine.group_words import (
     ACTING_AGENT_SPELLING,
@@ -145,7 +163,41 @@ from rine.group_words import (
     not_a_member_message,
     own_agents_clause,
 )
+from rine.holds import HoldCode, PrincipalHeldError, hold_of
 from rine.key_scope_words import GROUPS_KEY_SCOPE
+from rine.operator_classify import (
+    UNOPENED_VERDICT,
+    ClassReason,
+    OperatorContext,
+    OperatorRowInput,
+    OperatorVerdict,
+    SenderClass,
+    classify_operator_row,
+)
+from rine.operator_frame import frame_row, notice_for_class
+from rine.operator_message import classify_message
+from rine.operator_pin import (
+    OperatorPin,
+    clean_handle,
+    looks_like_seat,
+    pin_matches_key,
+    pin_matches_sender,
+)
+from rine.operator_quote import (
+    NEUTRALISED_NOTICE,
+    neutralise_notices,
+    random_delimiter,
+    wrap_third_party_text,
+)
+from rine.operator_statement import (
+    OPERATOR_COMMAND_PURPOSE,
+    OPERATOR_FUTURE_SKEW_MS,
+    OPERATOR_STATEMENT_KEY,
+    OPERATOR_WINDOW_MS,
+    OperatorStatement,
+    parse_operator_statement,
+    strip_operator_statement,
+)
 from rine.sender_key_words import SENDER_KEY_UNAVAILABLE_PREVIEW, SenderKeyRefusal
 from rine.thread_words import TRANSCRIPT_REFERENCE_REQUIRED, not_a_conversation_uuid
 from rine.types import (
@@ -177,6 +229,7 @@ from rine.types import (
     OrgRead,
     PendingJoinResult,
     PollTokenResponse,
+    PostingRefusal,
     QuotaEntry,
     RegistrationResult,
     SendAndWaitResult,
@@ -327,6 +380,46 @@ __all__ = [
     # Build one ``SenderKeyRefusal`` per render, ask it for each row's text.
     "SENDER_KEY_UNAVAILABLE_PREVIEW",
     "SenderKeyRefusal",
+    # The words a model-facing surface says about control frames and about rine
+    # text in general (twin of ``rine-core``'s ``control-frames``), so hermes and
+    # the other wrappers filter and frame with one set of bytes.
+    "HIDDEN_CONTROL_FRAME_READ",
+    "OPERATOR_CONTENT_NOTICE",
+    "OPERATOR_HISTORY_NOTICE",
+    "UNTRUSTED_CONTENT_NOTICE",
+    "control_frame_reply_refusal",
+    "group_invite_notice",
+    "is_group_invite",
+    "is_control_frame_type",
+    "is_hidden_from_model",
+    # Operator authority for console messages (twin of ``rine-core``'s ``operator-*``).
+    "NEUTRALISED_NOTICE",
+    "OPERATOR_COMMAND_PURPOSE",
+    "OPERATOR_FUTURE_SKEW_MS",
+    "OPERATOR_STATEMENT_KEY",
+    "OPERATOR_WINDOW_MS",
+    "UNOPENED_VERDICT",
+    "ClassReason",
+    "OperatorContext",
+    "OperatorPin",
+    "OperatorRowInput",
+    "OperatorStatement",
+    "OperatorVerdict",
+    "SenderClass",
+    "classify_message",
+    "classify_operator_row",
+    "clean_handle",
+    "frame_row",
+    "looks_like_seat",
+    "neutralise_notices",
+    "notice_for_class",
+    "parse_operator_statement",
+    "pin_matches_key",
+    "pin_matches_sender",
+    "random_delimiter",
+    "strip_operator_statement",
+    "wrap_third_party_text",
+    "without_hidden_frames",
     # How a transcript names what it reads, for the three wrappers that each
     # expose ``rine_thread`` and would otherwise retype these two sentences —
     # which is exactly what happened to ``INVITE_TARGET_REQUIRED``. A wrapper
@@ -357,6 +450,8 @@ __all__ = [
     "GroupAdmissionEntry",
     "GroupAdmissionReport",
     "GroupAdmissionSkipReason",
+    "GroupPostingRefusedError",
+    "PostingRefusal",
     # What a read did to a closed group's local MLS state. Public because it
     # rides on `DecryptedMessage`, which every receive surface hands back.
     "GroupCatchUp",
@@ -416,6 +511,7 @@ __all__ = [
     "admitted_agent_ids",
     "describe_admission_entry",
     "group_admission_skip_sentence",
+    "unreadable_by_orgs_sentence",
     # The MLS half of admission: whether a leaf actually landed. A roster
     # invites; the Welcome is what decides whether an invitee can read a word,
     # and the voucher counts cannot say so.
@@ -470,6 +566,12 @@ __all__ = [
     # ``err.scope`` (``RevokedScope``), never on the message.
     "PrincipalRevokedError",
     "RevokedScope",
+    # The token mint refused the caller because its agent, branch or organisation is held
+    # (suspended or frozen); the credentials are fine. Branch on ``err.hold`` (``HoldCode``)
+    # or read any failed response with ``hold_of``, never on the message.
+    "HoldCode",
+    "PrincipalHeldError",
+    "hold_of",
     "AuthorizationError",
     "ConfigError",
     "ConflictError",
@@ -521,6 +623,10 @@ __all__ = [
     # the row as ``decrypt_error_code`` and travels with it into a connector.
     "SENDER_KEY_UNAVAILABLE_CODE",
     "NoSenderKeyStateError",
+    # A group post refused before it sealed: no other member could be given the
+    # sender key, so no one could have opened it. Retryable.
+    "SENDER_KEY_UNDELIVERED_CODE",
+    "SenderKeyUndeliveredError",
     # A group send refused before the sender-key fan-out: the acting agent
     # holds no seat, so the key was never distributed and nothing was sent.
     "NotAGroupMemberError",

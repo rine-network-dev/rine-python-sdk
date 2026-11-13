@@ -152,6 +152,24 @@ def cache_token(config_dir: str, principal: str, token: str, expires_in: float) 
     save_token_cache(config_dir, cache)
 
 
+def drop_cached_token(config_dir: str, principal: str, token: str) -> None:
+    """Remove *token* from the cache, unless another process has since cached a different one.
+
+    A 401 says the token the client sent is dead. Left on disk, the next ``fresh_token`` would
+    adopt it again and the client would send it until it aged out.
+
+    Args:
+        config_dir: Path to the directory holding the cache.
+        principal: Principal string the token was issued to (the cache key).
+        token: The access token the server refused.
+    """
+    cache = load_token_cache(config_dir)
+    entry = cache.get(principal)
+    if entry and entry.get("access_token") == token:
+        del cache[principal]
+        save_token_cache(config_dir, cache)
+
+
 def token_is_fresh(expires_at: float, margin: float, now: float) -> bool:
     """Whether a token with this expiry is still usable, given the refresh margin.
 

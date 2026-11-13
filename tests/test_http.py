@@ -55,6 +55,13 @@ class TestParseErrorDetail:
         resp = httpx.Response(500, text="Internal Server Error")
         assert "Internal Server Error" in _parse_error_detail(resp)
 
+    def test_rfc6749_error_description_wins_over_the_reason_phrase(self):
+        resp = httpx.Response(
+            400,
+            json={"error": "unauthorized_client", "error_description": "The agent is suspended."},
+        )
+        assert _parse_error_detail(resp) == "The agent is suspended."
+
 
 class TestCheckResponse:
     def test_204_returns_none(self):
@@ -117,6 +124,26 @@ class TestFetchOauthToken:
             _assertion_claims(_posted_form(call.request), agent_id)["jti"] for call in route.calls
         ]
         assert jtis[0] != jtis[1]
+
+
+class TestFetchOauthTokenRefusal:
+    @respx.mock
+    def test_fetch_oauth_token_when_a_hold_refuses_then_the_error_names_the_explanation(
+        self, agent_id
+    ):
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(
+                400,
+                json={
+                    "error": "unauthorized_client",
+                    "reason": "agent_suspended",
+                    "error_description": "The agent is suspended.",
+                },
+            )
+        )
+        with httpx.Client() as http, pytest.raises(AuthenticationError) as caught:
+            _fetch_oauth_token(http, API_URL, _signer(agent_id))
+        assert "The agent is suspended." in caught.value.detail
 
 
 class TestFetchOauthTokenAsync:

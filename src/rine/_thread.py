@@ -11,8 +11,11 @@ import json
 from typing import TYPE_CHECKING
 
 from rine.a2a_cleartext import with_a2a_cleartext_notice
+from rine.operator_message import classify_message
+from rine.operator_statement import strip_operator_statement
 
 if TYPE_CHECKING:
+    from rine.operator_classify import OperatorContext
     from rine.sender_key_words import SenderKeyRefusal
     from rine.types import DecryptedMessage, ThreadEntry
 
@@ -62,7 +65,23 @@ def _render_parsed(value: object, *, fallback: str) -> str:
         return fallback
 
 
-def to_thread_entry(msg: DecryptedMessage, refusal: SenderKeyRefusal) -> ThreadEntry:
+def _without_statement(plaintext: object) -> object:
+    """``plaintext`` without a sender's own ``rine.operator`` field, so no turn carries one."""
+    if not isinstance(plaintext, str):
+        return strip_operator_statement(plaintext)
+    try:
+        parsed = json.loads(plaintext)
+    except (ValueError, TypeError):
+        return plaintext
+    stripped = strip_operator_statement(parsed)
+    return plaintext if stripped is parsed else stripped
+
+
+def to_thread_entry(
+    msg: DecryptedMessage,
+    refusal: SenderKeyRefusal,
+    operator: OperatorContext | None = None,
+) -> ThreadEntry:
     """Map a decrypted message to a role-tagged :class:`ThreadEntry`.
 
     ``refusal`` is one render's "explain once, then mark" state and is required
@@ -75,6 +94,10 @@ def to_thread_entry(msg: DecryptedMessage, refusal: SenderKeyRefusal) -> ThreadE
     Args:
         msg: The decrypted (or refused) row.
         refusal: This render's sender-key refusal state.
+        operator: The operator classifier's context. With one, a received direct turn the
+            operator sent is ``"operator"`` (or ``"operator_history"`` once its statement has
+            been rendered); without one, every turn is ``"other"``. A thread shows the turn's
+            text to a model, so classifying it uses up the statement.
 
     Returns:
         The rendered turn.
@@ -87,10 +110,17 @@ def to_thread_entry(msg: DecryptedMessage, refusal: SenderKeyRefusal) -> ThreadE
         # the operator to make says which move, on the first row that has it.
         text = refusal.text_for(msg) or UNAVAILABLE
     else:
-        text = with_a2a_cleartext_notice(msg, render_text(msg.plaintext, msg.content_type))
+        text = with_a2a_cleartext_notice(
+            msg, render_text(_without_statement(msg.plaintext), msg.content_type)
+        )
+    sender_class = (
+        classify_message(operator, msg, renders_text=True).sender_class if operator else "other"
+    )
     return ThreadEntry(
         direction=msg.direction or "received",
         sender_handle=msg.sender_handle,
+        from_agent_id=str(msg.from_agent_id) if msg.from_agent_id else None,
+        sender_class=sender_class,
         text=text,
         a2a_cleartext=readable and msg.a2a_cleartext,
         verification_status=msg.verification_status,

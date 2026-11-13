@@ -31,7 +31,6 @@ if TYPE_CHECKING:
     from rine.group_admission import (
         GroupAdmissionEntry,
         GroupAdmissionReport,
-        GroupAdmissionSkipReason,
     )
 
 #: Why one requested agent was not invited, as a clause rather than a token.
@@ -48,7 +47,7 @@ if TYPE_CHECKING:
 #: knew they were reached printed "skipped". The server's own note is the
 #: authority — ``not_applicable`` means "this group needs no voucher", not "we
 #: did not look" (``src/rine/api/group_admission.py``).
-_GROUP_ADMISSION_SENTENCES: dict[GroupAdmissionSkipReason, str] = {
+_GROUP_ADMISSION_SENTENCES: dict[str, str] = {
     "agent_not_found": "no agent with that id exists here",
     "agent_revoked": "that agent's identity is revoked, so it can join nothing",
     "already_a_member": "already a member of this group",
@@ -63,10 +62,14 @@ _GROUP_ADMISSION_SENTENCES: dict[GroupAdmissionSkipReason, str] = {
         "this group takes open enrolment, so it mints no invitation because none is "
         "needed — the agent may join whenever it likes"
     ),
+    "org_rule": (
+        "refused by an organisation's group rule: the group's organisation, the "
+        "inviter's or the agent's own does not allow this agent in this group"
+    ),
 }
 
 
-def group_admission_skip_sentence(reason: GroupAdmissionSkipReason | None) -> str:
+def group_admission_skip_sentence(reason: str | None) -> str:
     """Why an agent named in a roster or a plural invite was not invited.
 
     Reads as a clause, so a caller puts it wherever it renders the id:
@@ -75,12 +78,9 @@ def group_admission_skip_sentence(reason: GroupAdmissionSkipReason | None) -> st
 
     The twin is ``groupAdmissionSkipSentence`` in
     ``rine-core/src/group-admission.ts``, over the same tokens with the same
-    words. It differs in one respect, and only because the languages do: the
-    TypeScript one takes a bare ``string`` and quotes an unrecognised token
-    back, because a client that does not validate the wire must not throw while
-    rendering. Python validates first — an unknown reason fails
-    :class:`GroupAdmissionReport` at ``model_validate``, long before anything is
-    rendered — so this one takes the literal and cannot be handed a surprise.
+    words, and like it this takes a bare string and quotes an unrecognised token
+    back: a route that gains a reason (``org_rule`` was one) must not make an
+    older client raise while it renders a report.
 
     Args:
         reason: The reason an entry carries, or ``None`` for an entry that
@@ -89,9 +89,11 @@ def group_admission_skip_sentence(reason: GroupAdmissionSkipReason | None) -> st
     Returns:
         A lower-case clause, ready to follow a colon.
     """
-    if reason is None:
+    if not reason:
         return "no reason given"
-    return _GROUP_ADMISSION_SENTENCES[reason]
+    return _GROUP_ADMISSION_SENTENCES.get(
+        reason, f"reason not recognised by this client: {reason}"
+    )
 
 
 def describe_admission_entry(entry: GroupAdmissionEntry) -> str:

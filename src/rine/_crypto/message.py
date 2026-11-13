@@ -94,6 +94,10 @@ class EncryptResult:
 class DecryptResult:
     """Result of decrypting a message.
 
+    ``verifying_key`` is the full Ed25519 public key whose signature checked out,
+    ``None`` unless ``verified``. A caller deciding authority from a pinned key
+    compares this, and never a fingerprint or a handle.
+
     ``key_changed`` carries the sender's key rotation when verification found
     one, so every receive surface can pass it on instead of dropping it.
 
@@ -115,6 +119,7 @@ class DecryptResult:
         "sender_kid",
         "verified",
         "verification_status",
+        "verifying_key",
     )
 
     def __init__(
@@ -123,6 +128,7 @@ class DecryptResult:
         sender_kid: str,
         verified: bool,
         verification_status: VerificationStatus,
+        verifying_key: bytes | None,
         key_changed: SenderKeyChange | None = None,
         catch_up: MlsSyncResult | None = None,
     ) -> None:
@@ -130,6 +136,7 @@ class DecryptResult:
         self.sender_kid = sender_kid
         self.verified = verified
         self.verification_status = verification_status
+        self.verifying_key = verifying_key
         self.key_changed = key_changed
         self.catch_up = catch_up
 
@@ -147,6 +154,7 @@ class DecryptResult:
             self.sender_kid,
             self.verified,
             self.verification_status,
+            self.verifying_key,
             self.key_changed,
         )
 
@@ -242,6 +250,7 @@ def decrypt_message_sync(
         decoded.kid,
         verification.verified,
         verification.verification_status,
+        verification.verifying_key,
         verification.key_changed,
     )
 
@@ -303,6 +312,7 @@ async def decrypt_message_async(
         decoded.kid,
         verification.verified,
         verification.verification_status,
+        verification.verifying_key,
         verification.key_changed,
     )
 
@@ -553,6 +563,7 @@ def _group_result(decoded: Any, verification: Any) -> DecryptResult:
         decoded.kid,
         verification.verified,
         verification.verification_status,
+        verification.verifying_key,
         verification.key_changed,
     )
 

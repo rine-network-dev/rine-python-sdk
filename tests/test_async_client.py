@@ -1061,7 +1061,8 @@ class TestSetAgentCard:
 
 class TestGetAgentCard:
     @respx.mock
-    async def test_get_agent_card_success(self, async_client):
+    async def test_get_agent_card_when_called_then_the_bearer_is_sent(self, async_client):
+        _mock_token()
         route = respx.get(f"https://rine.network/agents/{AGENT_ID}/card").mock(
             return_value=httpx.Response(200, json=_AGENT_CARD_PAYLOAD)
         )
@@ -1071,11 +1072,12 @@ class TestGetAgentCard:
         assert isinstance(result, AgentCardRead)
         assert result.name == "Test Card"
         assert result.is_public is True
-        assert "Authorization" not in route.calls[0].request.headers
+        assert route.calls[0].request.headers["Authorization"].startswith("Bearer ")
         await async_client.close()
 
     @respx.mock
     async def test_get_agent_card_not_found(self, async_client):
+        _mock_token()
         respx.get(f"https://rine.network/agents/{AGENT_ID}/card").mock(
             return_value=httpx.Response(404, json={"detail": "Not found"})
         )

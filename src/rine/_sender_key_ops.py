@@ -33,6 +33,7 @@ from rine._crypto.sender_keys_store import (
 )
 from rine._logging import logger
 from rine._utils import to_base64url
+from rine.sender_key_words import sender_key_undelivered
 
 
 def distribute_sender_key_sync(
@@ -195,11 +196,23 @@ def get_or_create_sender_key_sync(
         if distributed_set and not distributed_set.issubset(current_set | {sender_agent_id}):
             should_rotate = True
 
+        # Top-up arm: a post needs at least one current member holding the key.
+        if (
+            not should_rotate
+            and member_ids
+            and not set(own_state.distributed_to) & set(member_ids)
+        ):
+            raise sender_key_undelivered(group_id)
+
     if should_rotate:
         new_state = generate_sender_key(group_id, sender_agent_id)
         succeeded, _ = distribute_sender_key_sync(
             client, config_dir, sender_agent_id, new_state, group_id, member_ids
         )
+        # Before the fresh-read save below: nobody was reached, so a post sealed
+        # under this key would ratchet the chain away and open for no one.
+        if member_ids and not succeeded:
+            raise sender_key_undelivered(group_id)
         new_state.distributed_to = succeeded
 
         # Replace or append state.
@@ -413,7 +426,7 @@ def delete_sender_key(config_dir: str, agent_id: str, group_id: str) -> None:
     The wipe alone was point-in-time, so it no longer travels alone. Every peer
     key it deletes still sits in this agent's inbox as a
     ``rine.v1.sender_key_distribution`` DM and used to be re-ingested by the next
-    group read that missed (``rine._sync_client._fetch_pending_sk_distributions``).
+    group read that missed (``rine._sync_client._scan_pending_sk_distributions``).
     So this also writes a RETIREMENT MARKER
     (:func:`rine._crypto.sender_keys_helpers.mark_sender_keys_retired`) and every
     later ingest of a sender key for this group is refused. The marker is written

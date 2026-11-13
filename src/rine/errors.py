@@ -275,6 +275,31 @@ class NoSenderKeyStateError(CryptoError):
         self.sender_key_id = sender_key_id
 
 
+#: The stable code a refused-for-no-holder group post carries, shared
+#: byte-for-byte with ``rine-core``'s ``SENDER_KEY_UNDELIVERED_CODE``.
+SENDER_KEY_UNDELIVERED_CODE = "sender_key_undelivered"
+
+
+class SenderKeyUndeliveredError(CryptoError):
+    """A group post refused because no other member could be given the sender key.
+
+    Raised before any state is saved or the chain ratchets, so a retry after the
+    members recover seals under the same key position. Retryable. Its words are
+    :data:`rine.sender_key_words.SENDER_KEY_UNDELIVERED_REFUSAL`.
+
+    Args:
+        message: The refusal an operator reads.
+        group_id: The group the post was for.
+    """
+
+    code = SENDER_KEY_UNDELIVERED_CODE
+
+    def __init__(self, message: str, group_id: str) -> None:
+        """Refuse a send for want of any holder of the key, naming the group."""
+        super().__init__(message)
+        self.group_id = group_id
+
+
 class UnpersistedSenderKeyStateError(CryptoError):
     """A group send was handed a sender key that is on no disk this agent owns.
 

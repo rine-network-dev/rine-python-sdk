@@ -150,7 +150,7 @@ def _peer_key(config_dir: str) -> SenderKeyState:
     """A peer's key as the reader receives it, appended to what is already there.
 
     The write is the distribution ingest's own shape
-    (``rine._sync_client._fetch_pending_sk_distributions``): load the whole array,
+    (``rine._sync_client._scan_pending_sk_distributions``): load the whole array,
     append, save — with no lock of its own.
     """
     arriving = generate_sender_key(GROUP_ID, PEER_ID)

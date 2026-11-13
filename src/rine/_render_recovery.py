@@ -1,7 +1,7 @@
 """One render's single chance to go looking for a missing sender key.
 
 A transcript render carries N rows and the recovery it may need is **one**
-untargeted scan: :meth:`rine._sync_client.SyncRineClient._fetch_pending_sk_distributions`
+untargeted scan: :meth:`rine._sync_client.SyncRineClient._scan_pending_sk_distributions`
 lists every pending ``rine.v1.sender_key_distribution`` for the acting agent and
 ingests all of them, so a second scan in the same render can only re-read what
 the first one already installed. Spending it once per *failing row* would turn a

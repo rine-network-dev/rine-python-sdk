@@ -37,6 +37,7 @@ from rine.errors import (
     raise_for_status,
     revoked_error,
 )
+from rine.holds import held_mint_error
 
 if TYPE_CHECKING:
     from rine._crypto._key_pins import KeyPins
@@ -58,10 +59,14 @@ def _backoff_delay(attempt: int, base: float = 0.5, max_delay: float = 8.0) -> f
 
 
 def _parse_error_detail(response: httpx.Response) -> str:
-    """Extract error detail from response body."""
+    """Extract the error text from the response body.
+
+    The token endpoint answers RFC 6749 errors, whose explanation is ``error_description``;
+    every other route sends ``detail``.
+    """
     try:
         body = response.json()
-        detail = body.get("detail", "")
+        detail = body.get("error_description") or body.get("detail", "")
         if isinstance(detail, list):
             return "; ".join(
                 d.get("msg", str(d)) if isinstance(d, dict) else str(d) for d in detail
@@ -148,10 +153,17 @@ def _token_error(resp: httpx.Response) -> AuthenticationError:
     """Build the hard-failure error for a non-success token response.
 
     A refusal that names a revoked principal comes back as the typed
-    :class:`PrincipalRevokedError`, so a caller can tell it from a bad credential.
+    :class:`PrincipalRevokedError`, and one that names a hold as :class:`PrincipalHeldError`
+    carrying the server's own sentence, so a caller can tell either from a bad credential.
     """
-    detail = f"Token fetch failed: {_parse_error_detail(resp)}"
-    return revoked_error(resp.status_code, detail, resp.text) or AuthenticationError(detail=detail, raw=resp.text)
+    explanation = _parse_error_detail(resp)
+    held = held_mint_error(resp.status_code, explanation, resp.text)
+    if held is not None:
+        return held
+    detail = f"Token fetch failed: {explanation}"
+    return revoked_error(resp.status_code, detail, resp.text) or AuthenticationError(
+        detail=detail, raw=resp.text
+    )
 
 
 def _check_response(response: httpx.Response) -> Any:
@@ -531,6 +543,10 @@ class SyncHttpClient:
 
         Yields:
             Tuples of (event_type, event_data, event_id).
+
+        Raises:
+            RineApiError: The server refused the stream (non-success status). Reading
+                lines from a refusal's body would otherwise end as a clean, empty stream.
         """
         url = path if path.startswith("http") else f"{self._api_url}{path}"
         token = self._get_token()
@@ -538,6 +554,12 @@ class SyncHttpClient:
         headers["Authorization"] = f"Bearer {token}"
 
         with self._http.stream("GET", url, headers=headers, timeout=None) as resp:
+            if not resp.is_success:
+                resp.read()
+                if resp.status_code == 401:
+                    # The next attempt mints; a held, revoked or aged token must not be re-sent.
+                    self._invalidate_token()
+                _check_response(resp)
             event_type = ""
             event_data = ""
             event_id: str | None = None
@@ -942,6 +964,10 @@ class AsyncHttpClient:
 
         Yields:
             Tuples of (event_type, event_data, event_id).
+
+        Raises:
+            RineApiError: The server refused the stream (non-success status). Reading
+                lines from a refusal's body would otherwise end as a clean, empty stream.
         """
         url = path if path.startswith("http") else f"{self._api_url}{path}"
         token = await self._get_token()
@@ -949,6 +975,12 @@ class AsyncHttpClient:
         headers["Authorization"] = f"Bearer {token}"
 
         async with self._http.stream("GET", url, headers=headers, timeout=None) as resp:
+            if not resp.is_success:
+                await resp.aread()
+                if resp.status_code == 401:
+                    # The next attempt mints; a held, revoked or aged token must not be re-sent.
+                    self._invalidate_token()
+                _check_response(resp)
             event_type = ""
             event_data = ""
             event_id: str | None = None

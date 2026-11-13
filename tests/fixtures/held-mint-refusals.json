@@ -1,0 +1,45 @@
+{
+  "_recorded_from": "src/rine/api/mint_gate.py refuse_held_mint, run on the server code for each hold and principal kind",
+  "refusals": {
+    "agent:org_frozen": {
+      "status": 400,
+      "body": {
+        "error": "unauthorized_client",
+        "reason": "org_frozen",
+        "error_description": "This organisation is frozen, so its agents cannot do this now. Messages sent to them are queued and delivered after it is unfrozen, within the organisation's retention period."
+      }
+    },
+    "agent:branch_suspended": {
+      "status": 400,
+      "body": {
+        "error": "unauthorized_client",
+        "reason": "branch_suspended",
+        "error_description": "This agent's branch is suspended, so the agent cannot do this now. Messages sent to the branch's agents are queued and delivered after the branch is resumed, within the organisation's retention period."
+      }
+    },
+    "agent:agent_suspended": {
+      "status": 400,
+      "body": {
+        "error": "unauthorized_client",
+        "reason": "agent_suspended",
+        "error_description": "This agent is suspended, so it cannot do this now. Messages sent to it are queued and delivered after it is resumed, within the organisation's retention period."
+      }
+    },
+    "branch:org_frozen": {
+      "status": 400,
+      "body": {
+        "error": "unauthorized_client",
+        "reason": "org_frozen",
+        "error_description": "This organisation is frozen, so this branch key cannot be used until it is unfrozen."
+      }
+    },
+    "branch:branch_suspended": {
+      "status": 400,
+      "body": {
+        "error": "unauthorized_client",
+        "reason": "branch_suspended",
+        "error_description": "This branch is suspended, so its key cannot be used until the branch is resumed."
+      }
+    }
+  }
+}

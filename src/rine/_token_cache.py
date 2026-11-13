@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from rine._config import cache_token, get_cached_token_entry, token_is_fresh
+from rine._config import cache_token, drop_cached_token, get_cached_token_entry, token_is_fresh
 from rine._logging import logger
 
 if TYPE_CHECKING:
@@ -136,8 +136,14 @@ class TokenCache:
         """Forget the token, its deadline and its clamped margin together.
 
         Clearing the token but leaving the deadline behind would leave a stale
-        one attached to whatever token is fetched next.
+        one attached to whatever token is fetched next. The held token also leaves the
+        shared disk cache, or the next lookup would adopt it again.
         """
+        if self.token:
+            try:
+                drop_cached_token(self._config_dir, self._principal, self.token)
+            except Exception:
+                logger.warning("Failed to drop the refused token from the cache", exc_info=True)
         self.token = None
         self.expires_at = 0.0
         self._token_margin = self._margin

@@ -170,6 +170,33 @@ def _isolated_owner_dir(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("RINE_OWNER_DIR", str(tmp_path_factory.mktemp("owner")))
 
 
+@pytest.fixture(autouse=True)
+def _empty_sender_key_negative_cache():
+    """The negative sender-key cache is process-wide, and these tests reuse the same ids.
+
+    An entry one test records would otherwise stop the next test's read from scanning.
+    """
+    from rine._sk_negative_cache import SENDER_KEY_NEGATIVE_CACHE, SENDER_KEY_ROW_FAILURES
+
+    SENDER_KEY_NEGATIVE_CACHE._expiries.clear()
+    SENDER_KEY_ROW_FAILURES._streaks.clear()
+    yield
+    SENDER_KEY_NEGATIVE_CACHE._expiries.clear()
+    SENDER_KEY_ROW_FAILURES._streaks.clear()
+
+
+@pytest.fixture
+def foreign_config_dir(tmp_path):
+    """A config dir that is NOT the reader's, where the other agents hold their keys.
+
+    Sealing and signing need the SENDER's private keys, and putting them in the
+    reader's own dir would let a probe pass on material no attacker has.
+    """
+    path = tmp_path / "foreign"
+    path.mkdir()
+    return str(path)
+
+
 @pytest.fixture
 def tmp_config_dir(tmp_path):
     """Provide a temporary config directory."""

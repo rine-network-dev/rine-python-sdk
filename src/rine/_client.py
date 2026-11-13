@@ -6,18 +6,21 @@ proper connection lifecycle management.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
-
-import httpx
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
     from uuid import UUID
 
+    import httpx
+
     from rine._crypto.message import DecryptResult
     from rine._mls import MlsCutoverResult
+    from rine._org_certs import ExposureArg
+    from rine.operator_classify import OperatorContext
 
 
 from rine._actor import ResolvedActor, normalize_actor, refuse_if_not_addressee
@@ -85,6 +88,11 @@ from rine._resolve import (
 from rine._resources.group_ops import unwrap_items
 from rine._resources.groups import AsyncGroups
 from rine._resources.webhooks import AsyncWebhooks
+from rine._sk_negative_cache import (
+    SENDER_KEY_NEGATIVE_CACHE,
+    SENDER_KEY_ROW_FAILURES,
+    missing_sender_key,
+)
 from rine._thread import to_thread_entry
 from rine._utils import apply_cleartext_fields
 from rine._verify import async_verify_identity as _async_verify_identity
@@ -1064,6 +1072,7 @@ class RineClient(BaseRineClient):
         # A sender that rotated past this client's cached key is reported, not
         # quietly absorbed — the caller decides what a rotation means to it.
         msg.key_changed = result.key_changed
+        msg.verifying_key = result.verifying_key
         msg.catch_up = self._reported_catch_up(result)
         return msg
 
@@ -1120,10 +1129,15 @@ class RineClient(BaseRineClient):
         try:
             if await self._retirement_blocks_read(agent_id, msg.group_id):
                 return self._apply_decrypt_failure(msg, error)
+            missing = missing_sender_key(agent_id, msg, error)
+            if missing is not None and SENDER_KEY_NEGATIVE_CACHE.is_cached(missing):
+                return self._apply_decrypt_failure(msg, error)
             if scanned is None or agent_id not in scanned:
-                await self._fetch_pending_sk_distributions(agent_id)
+                scan = await self._scan_pending_sk_distributions(agent_id)
                 if scanned is not None:
                     scanned.add(agent_id)
+                if missing is not None and scan.ingested == 0 and scan.complete:
+                    SENDER_KEY_NEGATIVE_CACHE.record_missing(missing)
             return await self._decrypt_message(agent_id, msg)
         except Exception as e:  # noqa: BLE001 — degrade, never raise (inbox is best-effort)
             return self._apply_decrypt_failure(msg, e)
@@ -1156,23 +1170,11 @@ class RineClient(BaseRineClient):
         members = (str(m["agent_id"]) for m in items)
         return not lift_retirement_if_member(self._config_dir, agent_id, gid, members)
 
-    async def _fetch_pending_sk_distributions(self, agent_id: str) -> int:
-        """Ingest what one page of the distribution inbox holds, and count it.
-
-        🔴 Returns an ``int`` and stays an ``int``. Every read path in this SDK
-        calls it, so widening it is a breaking change on the hottest path there
-        is. The one caller that needs more than the count, the sync verb, calls
-        :meth:`_scan_pending_sk_distributions` instead; this is that method with
-        the second number dropped, never a second implementation of it.
-        """
-        return (await self._scan_pending_sk_distributions(agent_id)).ingested
-
     async def _scan_pending_sk_distributions(self, agent_id: str) -> SenderKeyScan:
         """The same pass, reporting what it did not reach as well as what it installed.
 
-        The whole of the scan lives here and
-        :meth:`_fetch_pending_sk_distributions` is one line over it, so the two
-        cannot come to disagree about what a pass does.
+        The whole of the scan lives here, so the self-heal's cached miss and the
+        sync verb cannot come to disagree about what a pass does.
         """
         from rine._crypto.keys import agent_id_from_kid
         from rine._crypto.message import decrypt_message_async
@@ -1192,8 +1194,12 @@ class RineClient(BaseRineClient):
         # is exactly what the listing holds beyond it.
         unscanned = unscanned_beyond_page(data, len(items))
         ingested = 0
+        opened_ids: list[str] = []
+        failed_ids: list[str] = []
 
         for raw in items:
+            row_id = str(raw["id"])
+            opened_ids.append(row_id)
             try:
                 # Peeked, then marked here once the row is settled: a
                 # distribution this agent cannot open yet stays new for the next scan.
@@ -1285,9 +1291,12 @@ class RineClient(BaseRineClient):
                     states.append(new_state)
                     save_sender_key_state(self._config_dir, agent_id, group_id, states)
                 ingested += 1
+                SENDER_KEY_NEGATIVE_CACHE.clear_sender(agent_id, new_state.sender_agent_id)
             except Exception:
+                failed_ids.append(row_id)
                 logger.debug("SK ingestion failed", exc_info=True)
-        return SenderKeyScan(ingested=ingested, unscanned=unscanned)
+        failed = SENDER_KEY_ROW_FAILURES.settle(agent_id, opened_ids, failed_ids)
+        return SenderKeyScan(ingested=ingested, unscanned=unscanned, failed=failed)
 
     async def reply(
         self,
@@ -1654,6 +1663,7 @@ class RineClient(BaseRineClient):
         unlisted: bool = False,
         verify_identity: bool = False,
         svid: str | None = None,
+        exposure: ExposureArg | None = None,
     ) -> AgentRead:
         """Create a new agent with generated keypairs.
 
@@ -1663,6 +1673,8 @@ class RineClient(BaseRineClient):
             unlisted: Whether agent is unlisted in directory.
             verify_identity: Run SPIFFE identity verification after creation.
             svid: Caller-supplied JWT-SVID for verification (implies verify).
+            exposure: A preset name (``private``, ``findable``, ``listed``) or the four
+                switches; sent only when set. Needs a server with per-agent exposure.
 
         Returns:
             Created AgentRead. When verification runs, ``identity`` (success) or
@@ -1683,6 +1695,7 @@ class RineClient(BaseRineClient):
                 unlisted,
                 verify_identity=verify_identity,
                 svid=svid,
+                exposure=exposure,
             ),
         )
 
@@ -2062,6 +2075,7 @@ class RineClient(BaseRineClient):
         group: str | None = None,
         agent: str | None = None,
         limit: int | None = None,
+        operator: OperatorContext | None = None,
     ) -> list[ThreadEntry]:
         """Get the both-sided, role-tagged transcript of a conversation or a group.
 
@@ -2103,6 +2117,8 @@ class RineClient(BaseRineClient):
             group: Group handle (``#name@org``), bare name, or UUID.
             agent: Agent to read as.
             limit: Max turns (most-recent window).
+            operator: The operator classifier's context; each received direct turn then
+                carries its ``sender_class``. Omitted, every turn is ``"other"``.
 
         Returns:
             List of ThreadEntry, ordered oldest→newest.
@@ -2122,7 +2138,10 @@ class RineClient(BaseRineClient):
         messages = await self._transcript_rows(
             path, agent=agent, limit=limit, refusal=refusal, recovery=RenderRecovery()
         )
-        return [to_thread_entry(m, refusal) for m in messages]
+        # Classifying a turn consults the operator ledger, whose lock wait must not stop this loop.
+        return await asyncio.to_thread(
+            lambda: [to_thread_entry(m, refusal, operator) for m in messages]
+        )
 
     # --- Agent Cards ---
 
@@ -2180,7 +2199,8 @@ class RineClient(BaseRineClient):
     async def get_agent_card(self, agent_id: str) -> AgentCardRead:
         """Get an agent's directory card.
 
-        This is a public endpoint — no authentication required.
+        The read carries this client's bearer: an agent whose card switch is off still
+        answers its own organisation, and everyone else gets not found.
 
         Args:
             agent_id: Agent UUID.
@@ -2191,7 +2211,7 @@ class RineClient(BaseRineClient):
         Raises:
             NotFoundError: If card not found.
         """
-        data = await self._http.get(f"/agents/{agent_id}/card", authenticated=False)
+        data = await self._http.get(f"/agents/{agent_id}/card")
         return AgentCardRead.model_validate(data)
 
     async def delete_agent_card(self, agent_id: str) -> None:
@@ -2335,37 +2355,14 @@ class RineClient(BaseRineClient):
 
         Yields:
             Event objects from the SSE stream.
+
+        Raises:
+            RineApiError: The server refused the stream, for instance
+                :class:`~rine.errors.PrincipalRevokedError` for a revoked agent.
         """
         agent_id = await self._resolve_agent_id(agent)
-        token = await self._http._get_token()
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "rine-python",
-            **(self._with_peek(self._actor_header_dict(agent_id), peek=peek) or {}),
-        }
-
-        async with (
-            httpx.AsyncClient() as http,
-            http.stream(
-                "GET",
-                f"{self._api_url}/agents/{agent_id}/stream",
-                headers=headers,
-                timeout=None,
-            ) as resp,
+        extra = self._with_peek(self._actor_header_dict(agent_id), peek=peek)
+        async for event_type, event_data, event_id in self._http.stream_sse(
+            f"/agents/{agent_id}/stream", extra_headers=extra
         ):
-            event_type = ""
-            event_data = ""
-            event_id: str | None = None
-
-            async for line in resp.aiter_lines():
-                if line.startswith("event:"):
-                    event_type = line[6:].strip()
-                elif line.startswith("data:"):
-                    event_data = line[5:].strip()
-                elif line.startswith("id:"):
-                    event_id = line[3:].strip()
-                elif line == "" and (event_type or event_data):
-                    yield Event(event=event_type, data=event_data, id=event_id)
-                    event_type = ""
-                    event_data = ""
-                    event_id = None
+            yield Event(event=event_type, data=event_data, id=event_id)

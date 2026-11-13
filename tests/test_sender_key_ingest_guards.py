@@ -67,18 +67,6 @@ UNRELATED_KEY_ID = "12345678-1234-4234-8234-123456789abc"
 SHADOW_CHAIN_KEY = bytes(range(32))
 
 
-@pytest.fixture
-def foreign_config_dir(tmp_path):
-    """A config dir that is NOT the reader's, where the other agents hold their keys.
-
-    Sealing and signing need the SENDER's private keys, and putting them in the
-    reader's own dir would let a probe pass on material no attacker has.
-    """
-    path = tmp_path / "foreign"
-    path.mkdir()
-    return str(path)
-
-
 @dataclass(frozen=True)
 class HonestKey:
     """Member A's genuine key: the DM that distributes it and one post sealed under it."""

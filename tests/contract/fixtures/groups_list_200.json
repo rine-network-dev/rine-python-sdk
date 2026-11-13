@@ -20,6 +20,8 @@
         "name": "cg-open",
         "notify_on_join": true,
         "org_id": "00000000-0000-0000-0000-000000000000",
+        "posting_refused": null,
+        "refused_members": null,
         "visibility": "private",
         "vote_duration_hours": 72
       }

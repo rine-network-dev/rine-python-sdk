@@ -44,6 +44,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal
 
 from rine._seat_words import RECOVERY_EVICTED, seat_update_line
+from rine.types import PostingRefusal
 
 if TYPE_CHECKING:
     from rine._group_recovery import (
@@ -230,6 +231,24 @@ _ENCRYPTION_WORDS: dict[GroupEncryption, str] = {
         "filter, not by cryptography."
     ),
 }
+
+
+def group_posting_line(g: GroupRead) -> str | None:
+    """The line a group inspect prints when our org's posts there are refused, else ``None``.
+
+    The count is the refused members the group fetch names. A refusal a newer
+    server added is not worded here, so it prints nothing and the server's own
+    403 speaks when a post is tried.
+    """
+    reason = PostingRefusal.known(g.posting_refused)
+    if reason is PostingRefusal.FOREIGN_OPEN_GROUP:
+        return "Posting: refused, this is an open group owned by another organisation."
+    if reason is not PostingRefusal.REFUSED_MEMBERS:
+        return None
+    return (
+        f"Posting: refused, {len(g.refused_members or [])} members are from "
+        "organisations outside your list."
+    )
 
 
 def group_encryption(g: GroupRead) -> GroupEncryption:
@@ -868,6 +887,7 @@ __all__ = [
     "group_is_mls",
     "group_mls_init_in_flight",
     "group_mls_never_founded",
+    "group_posting_line",
     "key_package_top_up_line",
     "mls_never_founded_sync",
     "unfounded_group_note",

@@ -92,7 +92,7 @@ class SenderKeyScan:
 
     ingested: int
     """Sender keys newly installed by this pass. What every read path reads, and
-    the number ``_fetch_pending_sk_distributions`` hands back."""
+    the number a read path's self-heal reads off the pass."""
 
     unscanned: int
     """How many distribution DMs the server counts for this agent BEYOND the page
@@ -110,6 +110,21 @@ class SenderKeyScan:
     that key, so the rows of its own page after that break are unopened too and
     are counted here as well. No scan on this stack takes a target, so the page
     is always read to the end and the two definitions agree."""
+
+    failed: int = 0
+    """How many opened rows raised (a GET or a decrypt that threw), so installed
+    nothing though the key may sit behind them. A row that has raised on
+    ``ROW_FAILURE_LIMIT`` scans in a row is no longer counted: it is a permanent
+    failure, and counting it would keep the negative cache off for good. The
+    TypeScript twin is ``failed``."""
+
+    @property
+    def complete(self) -> bool:
+        """Whether this pass covered the inbox and lost no row to an error.
+
+        Only a complete pass that installed nothing may say a key is not waiting,
+        which is the claim the negative cache makes for 15 minutes."""
+        return self.unscanned == 0 and self.failed == 0
 
 
 def unscanned_beyond_page(listing: object, opened: int) -> int:

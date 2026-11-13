@@ -42,7 +42,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from rine.errors import SENDER_KEY_UNAVAILABLE_CODE
+from rine.errors import SENDER_KEY_UNAVAILABLE_CODE, SenderKeyUndeliveredError
 
 if TYPE_CHECKING:
     from uuid import UUID
@@ -332,14 +332,31 @@ class SenderKeyRefusal:
         return explanation
 
 
+#: What a group post says when no other member could be given the sender key. A
+#: fixed sentence with no slot; ``rine-core``'s ``SENDER_KEY_UNDELIVERED_REFUSAL``
+#: is its twin, pinned byte for byte by ``rine-core/test/fixtures/refusal-vectors.json``.
+SENDER_KEY_UNDELIVERED_REFUSAL = (
+    "Nothing was sent. None of the other members of this group could be given the key to "
+    "read it, so no one could have opened the post. Try again shortly; if this keeps "
+    "happening, those members may have no published encryption key."
+)
+
+
+def sender_key_undelivered(group_id: str) -> SenderKeyUndeliveredError:
+    """The refusal for a group post no other member could open."""
+    return SenderKeyUndeliveredError(SENDER_KEY_UNDELIVERED_REFUSAL, group_id)
+
+
 __all__ = [
     "NOTHING_CONSUMED_CLAUSE",
     "NO_SENDER_KEY_STATE_CLAUSE",
     "SENDER_KEY_NOT_RECOVERED_PREVIEW",
     "SENDER_KEY_REMEDY_CLAUSE",
+    "SENDER_KEY_UNDELIVERED_REFUSAL",
     "SENDER_KEY_UNAVAILABLE_PREVIEW",
     "SINGLE_MESSAGE_READ_REMEDY",
     "SenderKeyRefusal",
     "no_sender_key_state_detail",
+    "sender_key_undelivered",
     "sender_key_not_recovered_detail",
 ]

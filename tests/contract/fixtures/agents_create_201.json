@@ -7,6 +7,12 @@
       "kty": "OKP",
       "x": "2td2idV-KtXwDQYC-CpBbaHjLozEtaJ1jBtd3WkD86M"
     },
+    "exposure": {
+      "a2a": false,
+      "card": true,
+      "did": true,
+      "directory": true
+    },
     "handle": "contract-agent@corg-root.rine.network",
     "human_oversight": true,
     "id": "00000000-0000-0000-0000-000000000000",
@@ -16,6 +22,7 @@
     "org_id": "00000000-0000-0000-0000-000000000000",
     "outgoing_policy": "send_all",
     "poll_url": "<poll_url>",
+    "preset": "listed",
     "provisioned_by": null,
     "revoked_at": null,
     "signing_public_key": {

@@ -1,6 +1,7 @@
 {
   "body": {
     "content_type": "application/json",
+    "context_only": null,
     "conversation_id": "00000000-0000-0000-0000-000000000000",
     "created_at": "2020-01-01T00:00:00Z",
     "delivered_at": null,

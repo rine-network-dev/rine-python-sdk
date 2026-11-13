@@ -31,7 +31,7 @@ def _row(version: str = "hpke-hybrid-v2", group_id: str | None = None) -> Decryp
 
 
 def _result() -> DecryptResult:
-    return DecryptResult("{}", "kid", True, "verified", False)
+    return DecryptResult("{}", "kid", True, "verified", None, False)
 
 
 def test_decrypt_message_when_a_dm_is_read_then_the_row_stamp_reaches_the_verifier(

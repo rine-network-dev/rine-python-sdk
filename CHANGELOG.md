@@ -5,6 +5,52 @@ All notable changes to the `rine` Python SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.16.0] - 2026-11-12
+
+A connector can tell its operator's console instructions from every other message.
+
+**What you will see differently:**
+
+- `classify_message(ctx, message, renders_text=...)` returns the operator verdict for a
+  `DecryptedMessage`, through the same six-condition classifier the other surfaces run.
+- `DecryptedMessage.verifying_key` holds the full public key that verified the signature. It is
+  never read from the wire, never printed and never part of a dump.
+- `ThreadEntry` gains `from_agent_id` and `sender_class`. `thread(operator=...)` fills the class
+  of each received direct turn; without a context every turn is `"other"`, as before.
+- A turn's text no longer carries the sender's own `rine.operator` field.
+- `OperatorPin` takes an optional `handle`, the seat's handle, and `looks_like_seat(pin, handle)`
+  says whether a sender handle is written like the seat's: it equals the pinned handle (any case)
+  or its local part is `ops`. Both handles are first cleaned by `clean_handle`, which `rine` exports
+  (characters outside the handle set become `_`, cut at 128), so a long or unusual seat handle
+  still matches. It is a display check only; authority still compares the agent id and the full key.
+
+A suspension or freeze no longer leaves an always-on consumer waiting out its old token.
+
+**What you will see differently:**
+
+- A `401` on `stream()` (both clients) drops the token the server refused, from memory and from the
+  shared token cache, so the next attempt mints a new one. Before, the reconnect after a lift sent
+  the pre-hold token until it aged out, which took up to about 15 minutes. A mint the server still
+  refuses (the hold has not lifted) raises as before, so your own reconnect backoff keeps its pace.
+  The token lifetime is unchanged at 900 seconds. A token another process cached since is kept and
+  used.
+- A message the server marks `context_only` (a hold was involved: `held`, `sender_held`,
+  `recipient_held`, or a value a newer server adds) classifies as `operator_history` with reason
+  `context_only`, never as a live operator command, however old it is. Its nonce is still spent,
+  so a replay of the same statement after the resume is refused. `MessageRead` carries the mark as
+  `context_only`.
+- A token request the server refuses shows the server's own explanation (`error_description`), for
+  instance why a held agent cannot sign in, where it showed only the reason phrase.
+
+A client held by its organisation is told so, not that its credentials failed.
+
+**What you will see differently:**
+
+- A token request the server refuses because the agent is suspended, its branch is suspended or its organisation is frozen raises `PrincipalHeldError` (a subclass of `AuthenticationError`, so existing handlers still catch it). Its `hold` is a `HoldCode` (`agent_suspended`, `branch_suspended`, `org_frozen`) and its `detail` is the server's own sentence, with no "Token fetch failed" prefix. Before, it was a plain `AuthenticationError`, indistinguishable from a bad key.
+- `hold_of(status, raw)` reads the hold from any failed response: the token request's refusal, or the 403 a bearer route sends (`err.status`, `err.raw`). It returns a `HoldCode` or `None`.
+
 ## [0.15.0] - 2026-11-04
 
 **What you will see differently:**

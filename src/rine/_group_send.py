@@ -29,6 +29,7 @@ from rine._resources.group_ops import unwrap_items
 from rine._sender_key_ops import get_or_create_sender_key_sync
 from rine.errors import NotAGroupMemberError
 from rine.format import group_accepts_mls_send_only
+from rine.group_postable import assert_group_postable
 from rine.group_words import (
     ACTING_AGENT_SPELLING,
     NO_SEAT_TO_ACT_AS,
@@ -124,6 +125,11 @@ def encrypt_for_group_sync(
     # the branch guards nothing. There is no fallback and no sender-key retry: a
     # server contradicting this agent's own MLS state is refused outright.
     assert_no_mls_downgrade(config_dir, agent_id, group_id, server_says_mls)
+    # Right after it, still before the branch: the sender-key branch fans this
+    # agent's key out to every member before the server could refuse the post,
+    # so a group whose posts our org's rule refuses is stopped here, with the
+    # server's own sentence, before a key or an MLS commit leaves the machine.
+    assert_group_postable(group)
 
     if server_says_mls:
         from rine._mls.messages import encrypt_mls_group_message

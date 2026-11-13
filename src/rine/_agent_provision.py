@@ -16,7 +16,7 @@ from rine._crypto._agent_keys import fetch_verified_keys_sync
 from rine._crypto.certs import ChainError
 from rine._crypto.keys import held_key_gen, save_agent_keys
 from rine._custody import load_custody
-from rine._org_certs import agent_create_request, agent_rotate_request
+from rine._org_certs import ExposureArg, agent_create_request, agent_rotate_request
 from rine._principal import agent_principal
 from rine._profiles import DEFAULT_PROFILE, add_profile_if_absent
 from rine._types import Profile
@@ -42,6 +42,7 @@ def create_agent(
     profile: str = DEFAULT_PROFILE,
     verify_identity: bool = False,
     svid: str | None = None,
+    exposure: ExposureArg | None = None,
     log: Callable[[str], None] | None = None,
 ) -> AgentRead:
     """Create an agent under ``branch`` with keys derived from the org root.
@@ -63,6 +64,8 @@ def create_agent(
         verify_identity: Run SPIFFE identity verification after creation.
         svid: Caller-supplied JWT-SVID for the verification step. Supplying it
             implies verification even when ``verify_identity`` is False.
+        exposure: A preset name (``private``, ``findable``, ``listed``) or the four switches
+            (``directory``, ``card``, ``a2a``, ``did``); sent only when set.
         log: Optional sink for verification diagnostics.
 
     Returns:
@@ -78,7 +81,12 @@ def create_agent(
     custody = load_custody(config_dir, owner_dir, branch)
     minted_id = str(uuid.uuid4())
     request = agent_create_request(
-        custody, minted_id, name, human_oversight=human_oversight, unlisted=unlisted
+        custody,
+        minted_id,
+        name,
+        human_oversight=human_oversight,
+        unlisted=unlisted,
+        exposure=exposure,
     )
     agent = AgentRead.model_validate(client.post("/agents", json_body=request.body))
     agent_id = str(agent.id)
